@@ -736,7 +736,7 @@ export function planProduction(req: PlanRequest, data: GameDataIndex, effects: T
   - Proliferator Mk.III extra on Processor (as in DS): 3.2 Mk.I assemblers exact, input rates 1.6/1.6, power 675 kW/machine; `proliferatorPerSecond > 0` and a slot with role `'proliferator'`.
 - [ ] **Step 2:** Implement `proliferator.ts` with its unit tests (`proliferator.test.ts`: Mk.III sprays 75; Mk.I extra multiplier 1.125; nonProductive falls back to speed).
 - [ ] **Step 3:** Implement `lp.ts` (a thin wrapper `solveLP(model): Promise<{status, values}>` over glpk.js). Implement `plan.ts`. Run the tests until they pass.
-- [ ] **Step 4:** `power.test.ts`: the Processor plan's productionWorkW = 4 machines·270 kW·utilization 1 + …; stationChargeW for ILS = 60 MW. Implement `power.ts`.
+- [ ] **Step 4:** `power.test.ts`: for a plan with a single stage of 4 Mk.I assemblers at utilization 1 and no proliferator, productionWorkW = 4·270000 W and productionIdleW = 0; with utilization 0.5 (exactMachines 2 of 4), productionWorkW = 540000 and productionIdleW = 2·12000; ILS stationChargeW = 60e6 per station. Implement `power.ts`.
 - [ ] **Step 5:** Commit `feat(calc): LP production planner with proliferator and power estimate`.
 
 ### Task 12: UI shell, configuration and plan view
