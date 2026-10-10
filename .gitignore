@@ -13,3 +13,6 @@ __pycache__/
 *.egg-info/
 
 .DS_Store
+
+# Third-party raw research downloads (no/unclear license; used locally only)
+docs/research/datasets/
