@@ -1,0 +1,15 @@
+# npm cache
+npm-cache/
+node_modules/
+dist/
+
+# Local game-derived artifacts (never commit)
+local/
+app/public/icons/
+
+# Python
+__pycache__/
+.venv/
+*.egg-info/
+
+.DS_Store
