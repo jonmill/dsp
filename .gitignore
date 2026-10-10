@@ -16,3 +16,6 @@ __pycache__/
 
 # Third-party raw research downloads (no/unclear license; used locally only)
 docs/research/datasets/
+
+# SDD workspace
+.superpowers/
