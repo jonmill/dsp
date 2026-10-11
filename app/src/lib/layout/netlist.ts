@@ -33,7 +33,11 @@
 // The window ends are floats from running sums, so spans closer than `EPS` count as touching.
 //
 // Stations. Each net that starts or ends at a station uses one port of it. Slots are handed out in the order target,
-// imports by rate, proliferator, by-products; a station is full at `maxItemKinds` slots or 12 ports.
+// imports by rate, proliferator, by-products; a station is full at `maxItemKinds` slots or 12 ports. An item that is
+// imported and made keeps the nets that end at the station on the same stations as the nets that start there (a
+// station's stock of it only drains through its own output ports): its nets are dealt into groups that each hold at
+// least one import net, and if the sink nets need more stations than there are import nets, the import is cut into
+// more nets (consumers of the import are split between them).
 import type { ItemRate, ProductionPlan, StationSlotDemand } from '../calc';
 import type { GameDataIndex, TechEffects } from '../data';
 import type { StationSlotConfig } from '../geometry';
@@ -303,6 +307,53 @@ function cutWindows(producers: Span[], consumers: Span[], total: number, capacit
   return windows;
 }
 
+/**
+ * Splits windows of the rate axis until there are `count` of them: the widest window that has a consumer machine end
+ * strictly inside it is cut at the end nearest its middle (no consumer is split); when no window has one, the widest is
+ * cut in the middle (a consumer is split, as an over-capacity consumer is). Changes `windows` in place.
+ */
+function splitWindows(windows: Cut[], consumers: Span[], count: number): void {
+  while (windows.length > 0 && windows.length < count) {
+    const inside = (w: Cut): Span[] => consumers.filter((c) => c.machineId !== 0 && c.hi > w.from + EPS && c.hi < w.to - EPS);
+    const widest = (xs: Cut[]): number => xs.reduce((best, w, i) => (w.to - w.from > xs[best].to - xs[best].from ? i : best), 0);
+    const clean = windows.map((w, i) => ({ w, i })).filter(({ w }) => inside(w).length > 0);
+    const at = clean.length > 0 ? clean[widest(clean.map(({ w }) => w))].i : widest(windows);
+    const w = windows[at];
+    const middle = (w.from + w.to) / 2;
+    const ends = inside(w).map((c) => c.hi);
+    const cut = ends.length > 0 ? ends.reduce((best, x) => (Math.abs(x - middle) < Math.abs(best - middle) ? x : best)) : middle;
+    windows.splice(at, 1, { from: w.from, to: cut }, { from: cut, to: w.to });
+  }
+}
+
+/**
+ * Deals the nets of an item that is imported and made among stations. A station that takes the producers' nets ends
+ * them in the item's slot, which only drains through an output port of the same station; so each group gets import
+ * nets and sink nets together. As few groups as the 12 ports allow, import nets dealt in runs of near-equal size, each
+ * sink net to the group with the most import rate left over its sink rate that still has a free port.
+ */
+function groupPooledNets(imports: BeltNet[], sinks: BeltNet[]): BeltNet[][] {
+  const groups = Math.max(1, Math.ceil((imports.length + sinks.length) / STATION_PORTS));
+  const dealt: BeltNet[][] = Array.from({ length: groups }, () => []);
+  let next = 0;
+  for (let g = 0; g < groups; g++) {
+    const size = Math.floor(imports.length / groups) + (g < imports.length % groups ? 1 : 0);
+    dealt[g] = imports.slice(next, next + size);
+    next += size;
+  }
+  const spare = dealt.map((list) => list.reduce((n, net) => n + net.rate, 0));
+  for (const sink of sinks) {
+    let best = -1;
+    for (let g = 0; g < groups; g++) {
+      if (dealt[g].length >= STATION_PORTS) continue;
+      if (best < 0 || spare[g] > spare[best]) best = g;
+    }
+    dealt[best].push(sink);
+    spare[best] -= sink.rate;
+  }
+  return dealt;
+}
+
 /** Slot demands in the order stations are filled: target, imports by rate, proliferator, by-products. */
 function slotOrder(plan: ProductionPlan): StationSlotDemand[] {
   const left = new Map(plan.stationSlots.map((s) => [s.itemId, s]));
@@ -422,9 +473,8 @@ export function buildNetlist(
     machineIdsOfStage.push(ids);
   });
 
-  // nets
-  const nets: BeltNet[] = [];
-  for (const spec of collectSpecs(plan)) {
+  // nets: first every spec's windows, then the nets, so that the windows of an item can be adjusted to its stations
+  const planned = collectSpecs(plan).map((spec) => {
     const producerPieces = spec.stationSourced ? [] : expand(spec.producers, machineIdsOfStage);
     const consumerPieces = expand(spec.consumers, machineIdsOfStage);
     if (spec.exportRate > EPS) consumerPieces.push({ machineId: 0, rate: spec.exportRate });
@@ -432,9 +482,21 @@ export function buildNetlist(
     const consumers = toSpans(consumerPieces);
     const total = consumers.length > 0 ? consumers[consumers.length - 1].hi : 0;
     const capacity = netCapacity(beltTierItemId, spec.stationSourced, effects, data);
-    const stack = netStack(spec.stationSourced, effects);
+    const windows = cutWindows(producers, consumers, total, capacity, maxTaps);
+    return { spec, producers, consumers, stack: netStack(spec.stationSourced, effects), windows };
+  });
+  // An item that is imported and made: each station that takes the producers' nets also needs an import net of the item
+  // to drain it (see `groupPooledNets`), and a station has 12 ports, so there must be at least one import net per 11
+  // sink nets.
+  for (const made of planned) {
+    const imported = planned.find((p) => p.spec.stationSourced && p.spec.itemId === made.spec.itemId);
+    if (made.spec.stationSourced || !imported) continue;
+    splitWindows(imported.windows, imported.consumers, Math.ceil(made.windows.length / (STATION_PORTS - 1)));
+  }
 
-    for (const cut of cutWindows(producers, consumers, total, capacity, maxTaps)) {
+  const nets: BeltNet[] = [];
+  for (const { spec, producers, consumers, stack, windows } of planned) {
+    for (const cut of windows) {
       const taps: NetTap[] = [];
       const tap = (s: Span, dir: NetTap['dir']): void => {
         const rate = overlap(s, cut);
@@ -524,22 +586,29 @@ export function buildNetlist(
       max: stationSpec.maxItemCount,
     };
     const itemNets = netsOfItem.get(itemId) ?? [];
-    let placed = 0;
-    do {
-      // as many of the item's ports as one station takes; a new station when slot or ports would overflow
-      const want = Math.min(itemNets.length - placed, STATION_PORTS);
-      if (!current || current.slots.length >= stationSpec.maxItemKinds || current.portsNeeded + want > STATION_PORTS) {
+    const imports = itemNets.filter((n) => n.source.kind === 'station');
+    const sinks = itemNets.filter((n) => n.source.kind !== 'station');
+    // groups of nets that go to one station together: an imported and made item keeps its sinks with its imports
+    const groups: BeltNet[][] = [];
+    if (imports.length > 0 && sinks.length > 0) {
+      groups.push(...groupPooledNets(imports, sinks));
+    } else {
+      for (let at = 0; at < itemNets.length; at += STATION_PORTS) groups.push(itemNets.slice(at, at + STATION_PORTS));
+      if (groups.length === 0) groups.push([]);
+    }
+    for (const group of groups) {
+      // a new station when the slot or the ports would overflow
+      if (!current || current.slots.length >= stationSpec.maxItemKinds || current.portsNeeded + group.length > STATION_PORTS) {
         current = newStation();
       }
       current.slots.push({ ...slot });
       const stationIdx = stations.length - 1;
-      for (const net of itemNets.slice(placed, placed + want)) {
+      for (const net of group) {
         if (net.source.kind === 'station') net.source = { kind: 'station', stationIdx };
         else net.sink = { kind: 'station', stationIdx };
       }
-      current.portsNeeded += want;
-      placed += want;
-    } while (placed < itemNets.length);
+      current.portsNeeded += group.length;
+    }
   }
   while (stations.length < plan.stationsNeeded) newStation();
   if (stations.length > plan.stationsNeeded) {

@@ -78,7 +78,7 @@ const BASE_TIER_BY_TYPE: Record<string, number> = {
   RESEARCH: 2901,
 };
 
-/** 1 Quantum Chip/s on base-tier machines: 19 stages, 231 machines, 70 nets. */
+/** 1 Quantum Chip/s on base-tier machines: 19 stages, 231 machines, 56 nets. */
 export async function quantumNetlist(): Promise<Netlist> {
   const request: PlanRequest = {
     targetItemId: 1305,

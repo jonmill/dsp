@@ -157,12 +157,13 @@ describe('runSimulation: the warm-up', () => {
     expect(run(500, { warmupTicks: 7200 }).measuredTargetRate).toBeLessThan(sim.measuredTargetRate - 0.5);
   });
 
-  it('stops after the first window of 3600 (the minimum) when it makes the provisioned rate', () => {
-    const sim = run(20, undefined, 3); // the belt carries 6/s, 3/s is provisioned
-    expect(sim.warmupTicksUsed).toBe(3600);
+  it('needs two consecutive windows at the provisioned rate, so it never stops before 7200 ticks', () => {
+    const sim = run(20, undefined, 3); // the belt carries 6/s, 3/s is provisioned: the first window already makes it
+    expect(sim.warmupTicksUsed).toBe(7200);
     expect(sim.measuredTargetRate).toBeGreaterThan(5.9);
-    // at 6/s provisioned the first window, which spends ~400 ticks filling the belt, is not enough
-    expect(run(20).warmupTicksUsed).toBe(7200);
+    // at 6/s provisioned the first window, which spends ~400 ticks filling the belt, falls short (5.3/s); the second makes
+    // it, but one window is not enough: it ends with the third
+    expect(run(20).warmupTicksUsed).toBe(10800);
   });
 
   it('stops once two consecutive windows agree within 1 %, though the provisioned rate is never reached', () => {

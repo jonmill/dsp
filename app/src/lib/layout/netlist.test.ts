@@ -239,6 +239,13 @@ function expectSound(nl: Netlist, plan: ProductionPlan, effects: TechEffects, ma
     if (!supplied.has(net.itemId) || net.source.kind !== 'taps') continue;
     expect(net.taps.every((t) => t.dir === 'out'), `net ${net.id} of item ${net.itemId}`).toBe(true);
     expect(net.sink.kind).toBe('station');
+    // ... and the station it ends at also supplies the item, or its stock only fills up and blocks the producers
+    const sink = net.sink;
+    if (sink.kind !== 'station') throw new Error('unreachable');
+    expect(
+      nl.nets.some((n) => n.itemId === net.itemId && n.source.kind === 'station' && n.source.stationIdx === sink.stationIdx),
+      `net ${net.id} of item ${net.itemId} ends at station ${sink.stationIdx}, which has no import net of it`,
+    ).toBe(true);
   }
 
   // every machine gets and gives exactly what its stage says, across all its taps
@@ -806,6 +813,61 @@ describe('buildNetlist: stations', () => {
       expect(sum(imported.map((n) => n.rate))).toBeCloseTo(demand, 7);
       expectSound(nl, plan, effects);
     }
+  });
+
+  it.each([
+    ['best belts', allEffects],
+    ['Mk.I belts', MK1],
+  ])('Hydrogen: every station that receives the refineries\' output also supplies Hydrogen, at Quantum x4 and x8 on %s', async (_name, effects) => {
+    for (const perSecond of [4, 8]) {
+      const plan = await planOf(quantumRequest({ quantity: { kind: 'rate', perSecond } }));
+      const nl = buildNetlist(plan, data, effects);
+      expectSound(nl, plan, effects);
+      const hydrogen = netsOf(nl, HYDROGEN);
+      const sinkStations = new Set(
+        hydrogen.flatMap((n) => (n.source.kind === 'taps' && n.sink.kind === 'station' ? [n.sink.stationIdx] : [])),
+      );
+      const importStations = new Set(
+        hydrogen.flatMap((n) => (n.source.kind === 'station' ? [n.source.stationIdx] : [])),
+      );
+      expect(sinkStations.size).toBeGreaterThan(0);
+      for (const idx of sinkStations) expect(importStations.has(idx), `x${perSecond}: station ${idx}`).toBe(true);
+      // each station holds Hydrogen once, with at most 12 ports in all
+      for (const st of nl.stations) {
+        expect(st.slots.filter((x) => x.itemId === HYDROGEN).length).toBeLessThanOrEqual(1);
+        expect(st.portsNeeded).toBeLessThanOrEqual(12);
+      }
+      expect(buildNetlist(plan, data, effects)).toEqual(nl);
+    }
+  });
+
+  it('splits the import of an item that is also made into more nets when its sinks need more stations than it has nets', () => {
+    // 30 producers of 1/s with at most 2 taps per net: 15 sink nets. One 33/s import net (stack 4 carries 114/s) would
+    // leave the second station that the 16 ports need with a sink and no import of its own.
+    const X = IRON_INGOT;
+    const plan = synthPlan({
+      stages: [
+        { machines: 3, inputs: [{ itemId: X, perSecond: 33 }], outputs: [{ itemId: GEAR, perSecond: 1 }] },
+        { machines: 30, inputs: [], outputs: [{ itemId: X, perSecond: 30 }] },
+      ],
+      flows: [
+        { itemId: X, from: 'import', to: 0, perSecond: 3 },
+        { itemId: X, from: 1, to: 0, perSecond: 30 },
+        { itemId: GEAR, from: 0, to: 'export', perSecond: 1 },
+      ],
+      imports: [{ itemId: X, perSecond: 3 }],
+      exports: [{ itemId: GEAR, perSecond: 1 }],
+    });
+    const piled = { ...allEffects, stationPilerLevel: 4 };
+    const nl = buildNetlist(plan, data, piled, { maxMachinesPerNet: 2 });
+    const imports = netsOf(nl, X).filter((n) => n.source.kind === 'station');
+    const sinks = netsOf(nl, X).filter((n) => n.source.kind === 'taps');
+    expect(sinks).toHaveLength(15);
+    expect(imports).toHaveLength(2);
+    expect(sum(imports.map((n) => n.rate))).toBeCloseTo(33, 9);
+    expect(new Set(imports.map((n) => (n.source.kind === 'station' ? n.source.stationIdx : -1))).size).toBe(2);
+    for (const st of nl.stations) expect(st.portsNeeded).toBeLessThanOrEqual(12);
+    expectSound(nl, plan, piled, 2);
   });
 
   it('pads to the stations the plan asked for', () => {

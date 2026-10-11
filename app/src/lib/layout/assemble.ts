@@ -16,6 +16,7 @@
 import type { ProductionPlan } from '../calc';
 import type { GameDataIndex } from '../data';
 import type { BeltPath, Endpoint, Layout, PlacedBuilding, Sorter, StationConfig } from '../geometry';
+import { provisionedRate } from '../validate/sim/run';
 import type { BeltNet, Netlist } from './netlist';
 import { placementBuildingIdOf, stationBuildingId } from './placement';
 import type { Placement } from './placement';
@@ -23,16 +24,6 @@ import type { RoutedNet } from './router';
 import type { TapAssignment } from './taps';
 
 const STATION_PORTS = 12;
-
-/**
- * The target rate the plan provisions: its export of the target item (what the user asked for), else the requested
- * rate, else the capacity of the final stage. The same as the validator's judge of the simulated output.
- */
-function provisionedRate(plan: ProductionPlan): number {
-  const exported = plan.exports.find((e) => e.itemId === plan.request.targetItemId)?.perSecond;
-  if (exported !== undefined) return exported;
-  return plan.request.quantity.kind === 'rate' ? plan.request.quantity.perSecond : plan.actualTargetRate;
-}
 
 function stationConfig(
   netlist: Netlist,
