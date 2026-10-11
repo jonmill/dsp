@@ -7,18 +7,30 @@
 // Which nets an item gets. An item that flows out of the station (`from: 'import'`) gets a station-sourced net whose
 // taps are its consumers. An item made by stages gets a taps-sourced net: the producers' taps, then the consumers'
 // taps, ending at a station port when part of it is exported and dead-ending otherwise. An item that is both
-// imported and made (Hydrogen from Plasma Refining) gets one of each; its consumers tap both. The proliferator
-// import has no flows (spray coaters take it), so it gets a station slot here but no net; Task 28 adds that net.
+// imported and made (Hydrogen from Plasma Refining) gets the station-sourced net(s) for ALL its consumers, at their
+// full rate, and a taps-sourced net(s) that carries every producer's output and ends at the station: a consumer
+// never taps a belt a producer feeds. (Otherwise consumers fill from the import belt, which the always-full station
+// keeps full, and the producers' belt backs up and blocks them.) A station input port takes any item of a configured
+// slot whatever the slot's logic, so the slot keeps the import role the plan gave it and the station pools both
+// sources. The proliferator import has no flows (spray coaters take it), so it gets a station slot here but no net;
+// Task 28 adds that net.
 //
 // Splitting by rate. A net is cut into several when it carries more than `NET_LOAD` of its belt, or has more than
 // `maxMachinesPerNet` taps. Think of the producers laid end to end along a rate axis [0, R) in id order, and of the
 // consumers (then the station sink, if any) laid end to end on the same axis. A sub-net is a window [a, b) of that
 // axis: it takes the consumers inside the window and the producers whose span overlaps it, so every sub-net's supply
-// equals its demand. A producer whose span crosses a cut gets a tap in each sub-net, its rate divided. Windows are
-// made as wide as the capacity and the tap limit allow, but a cut is moved back to the nearest consumer boundary,
-// so a consumer stays whole unless it alone does not fit (one machine asking for more than a belt carries, or more
-// producers than the tap limit allows). The window ends are floats from running sums, so spans closer than `EPS`
-// count as touching.
+// equals its demand. A producer whose span crosses a cut would get a tap, and a planned share, in each sub-net, and
+// output sorters cannot enforce a share: one grabs everything and the other net starves. A consumer split the same way
+// shares its input between two belts. So windows are made as wide as the capacity allows, and a cut is placed, in this
+// order of preference, at
+//  1. the latest producer end that cuts no consumer machine (the station sink is a port on each net it spans, not a
+//     machine, so it may be cut), if the net then also has at most `maxMachinesPerNet` taps;
+//  2. else the latest such point within the capacity alone: the producers stay whole and the net holds more taps than
+//     `maxMachinesPerNet`, which a warning says;
+//  3. else the latest producer end within the capacity, within the tap limit if one is: a consumer is split;
+//  4. else no producer ends within the capacity, because one machine makes more than a belt carries: the cut is at the
+//     capacity or the tap limit, moved back to a consumer end, and that producer is split (a warning names it).
+// The window ends are floats from running sums, so spans closer than `EPS` count as touching.
 //
 // Stations. Each net that starts or ends at a station uses one port of it. Slots are handed out in the order target,
 // imports by rate, proliferator, by-products; a station is full at `maxItemKinds` slots or 12 ports.
@@ -55,7 +67,10 @@ export interface BeltNet {
   rate: number;
   /** Import belts start at a station port; intermediate belts start at the first producer tap. */
   source: { kind: 'station'; stationIdx: number } | { kind: 'taps' };
-  /** Exports and by-products end at a station port; feed belts dead-end. */
+  /**
+   * Exports, by-products and what is made of an item the station also supplies end at a station port; feed belts
+   * dead-end.
+   */
   sink: { kind: 'station'; stationIdx: number } | { kind: 'deadEnd' };
   /** Producers (`out`) first, then consumers (`in`), each in machine id order. */
   taps: NetTap[];
@@ -203,6 +218,15 @@ function collectSpecs(plan: ProductionPlan): NetSpec[] {
     if (flow.to === 'export') spec.exportRate += flow.perSecond;
     else add(spec.consumers, flow.to, flow.perSecond);
   }
+  // An item that is imported and made: every consumer takes from the station, every producer feeds the station.
+  for (const spec of specs.values()) {
+    if (spec.stationSourced) continue;
+    const imported = specs.get(`${spec.itemId}/true`);
+    if (!imported) continue;
+    for (const [stage, rate] of spec.consumers) add(imported.consumers, stage, rate);
+    spec.consumers.clear();
+    spec.exportRate = [...spec.producers.values()].reduce((n, r) => n + r, 0);
+  }
   return [...specs.values()].sort((a, b) => Number(b.stationSourced) - Number(a.stationSourced) || a.itemId - b.itemId);
 }
 
@@ -232,30 +256,47 @@ function toSpans(pieces: Piece[]): Span[] {
 const overlap = (s: Span, w: Cut): number => Math.min(s.hi, w.to) - Math.max(s.lo, w.from);
 
 /**
- * Cuts the rate axis into windows of at most `capacity` items/s and `maxTaps` taps, as wide as possible and ending
- * at a consumer boundary where one fits. `taps` are the spans that take a tap (the station sink does not).
+ * Cuts the rate axis into windows of at most `capacity` items/s, as wide as possible, without splitting a producer (see
+ * the file comment for the order of preference). `producers` are the producers' spans (none for a station-sourced
+ * net), `consumers` the consumers' spans with the station sink (`machineId` 0) last; it takes no tap.
  */
-function cutWindows(taps: Span[], consumers: Span[], total: number, capacity: number, maxTaps: number): Cut[] {
+function cutWindows(producers: Span[], consumers: Span[], total: number, capacity: number, maxTaps: number): Cut[] {
+  const machineConsumers = consumers.filter((c) => c.machineId !== 0);
+  const taps = [...producers, ...machineConsumers];
+  // with no producers the ends of the consumers are the candidate cuts
+  const producerEnds = producers.length > 0 ? producers.map((p) => p.hi) : machineConsumers.map((c) => c.hi);
+  // a cut at `x` splits no consumer machine (the station sink is not one: it is a port on every net it spans)
+  const clean = (x: number): boolean => !machineConsumers.some((c) => c.lo + EPS < x && x < c.hi - EPS);
   const windows: Cut[] = [];
   let from = 0;
   while (from < total - EPS) {
-    const open = taps.filter((s) => s.lo <= from + EPS && s.hi > from + EPS).length;
-    const starts = taps
-      .filter((s) => s.lo > from + EPS)
-      .map((s) => s.lo)
+    const reach = Math.min(from + capacity * (1 + REL_EPS), total);
+    const tapsUpTo = (to: number): number =>
+      taps.filter((s) => Math.min(s.hi, to) - Math.max(s.lo, from) > EPS).length;
+    const ends = [...new Set(producerEnds.map((x) => Math.min(x, total)))]
+      .filter((x) => x > from + EPS && x <= reach + EPS)
       .sort((a, b) => a - b);
-    let to = Math.min(from + capacity * (1 + REL_EPS), total);
-    // `open` taps plus the starts before `to` must stay within `maxTaps`
-    const tapLimit = starts[maxTaps - open];
-    if (tapLimit !== undefined) to = Math.min(to, tapLimit);
-    if (to >= total - EPS) {
-      to = total;
-    } else {
-      // prefer ending where a consumer ends, so it keeps one tap
-      let snapped = from;
-      for (const c of consumers) if (c.hi > snapped && c.hi <= to + EPS) snapped = c.hi;
-      if (snapped > from + EPS) to = snapped;
+    const fits = (x: number): boolean => tapsUpTo(x) <= maxTaps;
+    const latest = (xs: number[]): number | undefined => xs[xs.length - 1];
+    const cleanEnds = ends.filter(clean);
+    let to = latest(cleanEnds.filter(fits)) ?? latest(cleanEnds) ?? latest(ends.filter(fits)) ?? latest(ends);
+    if (to === undefined) {
+      // one producer makes more than a belt carries: cut at the capacity, or the tap limit, back to a consumer end
+      to = reach;
+      const starts = taps
+        .filter((s) => s.lo > from + EPS)
+        .map((s) => s.lo)
+        .sort((a, b) => a - b);
+      const open = taps.filter((s) => s.lo <= from + EPS && s.hi > from + EPS).length;
+      const tapLimit = starts[maxTaps - open];
+      if (tapLimit !== undefined) to = Math.min(to, tapLimit);
+      if (to < total - EPS) {
+        let snapped = from;
+        for (const c of machineConsumers) if (c.hi > snapped && c.hi <= to + EPS) snapped = c.hi;
+        if (snapped > from + EPS) to = snapped;
+      }
     }
+    if (to >= total - EPS) to = total;
     windows.push({ from, to });
     from = to;
   }
@@ -279,6 +320,64 @@ function slotOrder(plan: ProductionPlan): StationSlotDemand[] {
   for (const { itemId } of plan.exports) take(itemId);
   for (const itemId of [...left.keys()]) take(itemId);
   return ordered;
+}
+
+/**
+ * Checks what the cuts promise and warns about what they gave up. Throws if a producer machine has `out` taps for one
+ * item on several nets although it makes no more than a belt carries, or if a consumer taps a belt a producer of an
+ * item that the station also supplies feeds (both are bugs). Warns about each producer that has to be split because
+ * it makes more than one belt carries, and about each net that holds more taps than `maxTaps` so that a producer
+ * stays whole.
+ */
+function checkProducers(
+  nets: BeltNet[],
+  machines: Netlist['machines'],
+  importedItems: Set<number>,
+  beltTierItemId: number,
+  maxTaps: number,
+  effects: TechEffects,
+  data: GameDataIndex,
+  warnings: string[],
+): void {
+  const outOf = new Map<string, { machineId: number; itemId: number; nets: number; rate: number }>();
+  for (const net of nets) {
+    if (importedItems.has(net.itemId) && net.source.kind === 'taps' && net.taps.some((t) => t.dir === 'in')) {
+      throw new Error(
+        `netlist: net ${net.id} of ${itemName(data, net.itemId)} has producers and consumers, ` +
+          `but the station also supplies ${itemName(data, net.itemId)} (a split bug)`,
+      );
+    }
+    if (net.taps.length > maxTaps) {
+      warnings.push(
+        `net ${net.id} (${itemName(data, net.itemId)}) has ${net.taps.length} taps, more than the ${maxTaps} of ` +
+          `maxMachinesPerNet: no cut keeps every producer whole within the belt capacity and the limit`,
+      );
+    }
+    for (const t of net.taps) {
+      if (t.dir !== 'out') continue;
+      const key = `${t.machineId}/${t.itemId}`;
+      const entry = outOf.get(key) ?? { machineId: t.machineId, itemId: t.itemId, nets: 0, rate: 0 };
+      entry.nets++;
+      entry.rate += t.rate;
+      outOf.set(key, entry);
+    }
+  }
+  for (const { machineId, itemId, nets: count, rate } of outOf.values()) {
+    if (count < 2) continue;
+    const capacity = netCapacity(beltTierItemId, false, effects, data);
+    const machine = machines[machineId - 1];
+    const name = `machine ${machineId} (${data.building(machine.buildingItemId)?.name ?? `item ${machine.buildingItemId}`})`;
+    if (rate <= capacity * (1 - 1e-6)) {
+      throw new Error(
+        `netlist: ${name} makes ${rate} ${itemName(data, itemId)}/s, which one belt carries, ` +
+          `but its output is on ${count} nets (a split bug)`,
+      );
+    }
+    warnings.push(
+      `${name} makes ${+rate.toFixed(3)} ${itemName(data, itemId)}/s, more than one belt carries ` +
+        `(${+capacity.toFixed(3)}/s), so its output is split over ${count} belts`,
+    );
+  }
 }
 
 /**
@@ -334,9 +433,8 @@ export function buildNetlist(
     const total = consumers.length > 0 ? consumers[consumers.length - 1].hi : 0;
     const capacity = netCapacity(beltTierItemId, spec.stationSourced, effects, data);
     const stack = netStack(spec.stationSourced, effects);
-    const tapSpans = [...producers, ...consumers.filter((c) => c.machineId !== 0)];
 
-    for (const cut of cutWindows(tapSpans, consumers, total, capacity, maxTaps)) {
+    for (const cut of cutWindows(producers, consumers, total, capacity, maxTaps)) {
       const taps: NetTap[] = [];
       const tap = (s: Span, dir: NetTap['dir']): void => {
         const rate = overlap(s, cut);
@@ -367,6 +465,9 @@ export function buildNetlist(
       nets.push(net);
     }
   }
+  const importedItems = new Set(nets.filter((n) => n.source.kind === 'station').map((n) => n.itemId));
+  checkProducers(nets, machines, importedItems, beltTierItemId, maxTaps, effects, data, warnings);
+
   // sorters: the belt tier is already the best, so a tap that needs too many is a warning, not a tier change
   for (const net of nets) {
     const heavy = net.taps.filter((t) => t.sorters > MAX_SORTERS_PER_TAP);
@@ -400,7 +501,9 @@ export function buildNetlist(
     if (role === undefined) {
       throw new Error(`netlist: the plan has no station slot for ${itemName(data, net.itemId)} (${net.itemId})`);
     }
-    if (imported === (role === 'export')) {
+    // what a producer of an imported item makes goes back to the station: its slot keeps the import role
+    const pooled = !imported && importedItems.has(net.itemId) && role === 'import';
+    if (!pooled && imported === (role === 'export')) {
       throw new Error(
         `netlist: ${itemName(data, net.itemId)} (${net.itemId}) is ${imported ? 'imported' : 'exported'} ` +
           `but its station slot is ${role}`,

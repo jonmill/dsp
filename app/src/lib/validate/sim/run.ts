@@ -20,7 +20,12 @@ import { World } from './world';
 import type { SimEntity } from './world';
 
 export interface SimOptions {
-  /** Ticks to run before measuring. Default 7200 (2 game minutes). */
+  /**
+   * Ticks to run before measuring, used exactly. Omitted: adaptive. The warm-up then runs in windows of 3600 ticks and
+   * stops after the first window in which the target item reaches 99.9 % of the provisioned rate, or once two
+   * consecutive windows (both above zero) agree within 1 %: whichever comes first, but never before one window and
+   * never after 72000 ticks (20 game minutes). `SimResult.warmupTicksUsed` says how long it ran.
+   */
   warmupTicks?: number;
   /** Ticks measured. Default 18000 (5 game minutes). */
   measureTicks?: number;
@@ -72,11 +77,20 @@ export interface SimResult {
   };
   /** The length of the measurement window, in seconds. */
   measureSeconds: number;
+  /** The ticks run before the window: `SimOptions.warmupTicks` as given, else what the adaptive warm-up needed. */
+  warmupTicksUsed: number;
   /** Things the simulator saw in the layout that make it act differently from what was meant (mis-wired ports...). */
   warnings: string[];
 }
 
-const DEFAULT_WARMUP_TICKS = 7200;
+/** The adaptive warm-up runs in windows of this many ticks (1 game minute) and always runs at least one. */
+const WARMUP_WINDOW_TICKS = 3600;
+/** The adaptive warm-up gives up on a steady state after this many ticks (20 game minutes). */
+const MAX_WARMUP_TICKS = 72000;
+/** Two consecutive warm-up windows agree when their rates differ by at most this share of the larger one. */
+const WARMUP_AGREEMENT = 0.01;
+/** A warm-up window that makes this share of the provisioned rate ends the adaptive warm-up. */
+const WARMUP_REACHED = 0.999;
 const DEFAULT_MEASURE_TICKS = 18000;
 /** Consecutive measured ticks without progress that make a deadlock. */
 export const DEADLOCK_TICKS = 600;
@@ -112,9 +126,22 @@ const recipeOrNull = (data: GameDataIndex, recipeId: number): Recipe | null => {
 const buildingName = (data: GameDataIndex, b: PlacedBuilding): string => data.building(b.itemId)?.name ?? `item ${b.itemId}`;
 
 /**
- * Simulate `layout` for `warmupTicks + measureTicks` ticks and report what the measurement window saw. Throws for a
- * layout the simulator cannot even build (a sorter or belt end that names a missing building or belt, a belt tier
- * that is not a belt, a window that is not a positive whole number of ticks); the geometry checks catch those first.
+ * The target rate the plan provisions: its export of the target item, which is what the user asked for. Not
+ * `actualTargetRate`, which is the rounded-up capacity of the final stage and can exceed it when an upstream stage
+ * limits the chain (Gear at 1/s on two Mk.I assemblers has capacity 1.5/s but one Arc Smelter feeds only 1/s).
+ * Falls back to the requested rate, or to the capacity when the request is in buildings and exports are missing.
+ */
+export function provisionedRate(plan: ProductionPlan): number {
+  const exported = plan.exports.find((e) => e.itemId === plan.request.targetItemId)?.perSecond;
+  if (exported !== undefined) return exported;
+  return plan.request.quantity.kind === 'rate' ? plan.request.quantity.perSecond : plan.actualTargetRate;
+}
+
+/**
+ * Simulate `layout` for a warm-up (`opts.warmupTicks`, else adaptive: see `SimOptions`) and `measureTicks` more ticks,
+ * and report what the measurement window saw. Throws for a layout the simulator cannot even build (a sorter or belt
+ * end that names a missing building or belt, a belt tier that is not a belt, a window that is not a positive whole
+ * number of ticks); the geometry checks catch those first.
  */
 export function runSimulation(
   layout: Layout,
@@ -123,9 +150,10 @@ export function runSimulation(
   effects: TechEffects,
   opts: SimOptions = {},
 ): SimResult {
-  const warmupTicks = opts.warmupTicks ?? DEFAULT_WARMUP_TICKS;
   const measureTicks = opts.measureTicks ?? DEFAULT_MEASURE_TICKS;
-  if (!Number.isInteger(warmupTicks) || warmupTicks < 0) throw new RangeError(`warmupTicks ${warmupTicks} must be a whole number of at least 0`);
+  if (opts.warmupTicks !== undefined && (!Number.isInteger(opts.warmupTicks) || opts.warmupTicks < 0)) {
+    throw new RangeError(`warmupTicks ${opts.warmupTicks} must be a whole number of at least 0`);
+  }
   if (!Number.isInteger(measureTicks) || measureTicks < 1) throw new RangeError(`measureTicks ${measureTicks} must be a whole number of at least 1`);
   const tps = data.data.constants.ticksPerSecond;
   const measureSeconds = measureTicks / tps;
@@ -184,10 +212,28 @@ export function runSimulation(
     'stationOut',
   );
 
-  for (let t = 0; t < warmupTicks; t++) world.tick();
-  for (const m of machines.list) m.machine.resetStats();
   const exportItems = plan.exports.map((e) => e.itemId);
   const targetItem = plan.request.targetItemId;
+
+  let warmupTicksUsed = 0;
+  if (opts.warmupTicks !== undefined) {
+    for (; warmupTicksUsed < opts.warmupTicks; warmupTicksUsed++) world.tick();
+  } else {
+    // Adaptive: windows of the target's rate until it is steady (or as good as provisioned), at least one, at most 72000 ticks.
+    const wanted = provisionedRate(plan);
+    let previous = 0;
+    while (warmupTicksUsed < MAX_WARMUP_TICKS) {
+      const before = received(targetItem);
+      for (let t = 0; t < WARMUP_WINDOW_TICKS; t++) world.tick();
+      warmupTicksUsed += WARMUP_WINDOW_TICKS;
+      const windowRate = (received(targetItem) - before) / (WARMUP_WINDOW_TICKS / tps);
+      if (wanted > 0 && windowRate >= WARMUP_REACHED * wanted) break;
+      // a rate of zero twice is not steady: a long belt or a deep chain has not delivered yet
+      if (previous > 0 && windowRate > 0 && Math.abs(windowRate - previous) <= WARMUP_AGREEMENT * Math.max(windowRate, previous)) break;
+      previous = windowRate;
+    }
+  }
+  for (const m of machines.list) m.machine.resetStats();
   const receivedAtStart = new Map<number, number>();
   for (const id of [targetItem, ...exportItems]) receivedAtStart.set(id, received(id));
   measuring = true;
@@ -226,6 +272,7 @@ export function runSimulation(
       stationChargeW,
     },
     measureSeconds,
+    warmupTicksUsed,
     warnings,
   };
 }

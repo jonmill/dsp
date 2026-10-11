@@ -128,6 +128,14 @@ describe('validateLayout', () => {
     const line_ = gearLine();
     const report = validateKit(line_.kit, line_.plan, { warmupTicks: 600, measureTicks: 1200 });
     expect(report.sim!.measureSeconds).toBe(20);
+    expect(report.sim!.warmupTicksUsed).toBe(600);
+  });
+
+  it('warms up adaptively when no warm-up is given', () => {
+    const line_ = gearLine();
+    const report = validateKit(line_.kit, line_.plan, { measureTicks: 1200 });
+    expect(report.sim!.warmupTicksUsed).toBeGreaterThanOrEqual(3600);
+    expect(report.sim!.warmupTicksUsed % 3600).toBe(0);
   });
 
   it('fails the composite fixture in the simulation: its ingots have nowhere to go', () => {
@@ -166,6 +174,7 @@ describe('checkSimulation thresholds', () => {
     deadlocked: false,
     power: { steadyW: 0, idleW: 0, peakW: 0, stationChargeW: 0 },
     measureSeconds: 100,
+    warmupTicksUsed: 7200,
     warnings: [],
     ...over,
   });

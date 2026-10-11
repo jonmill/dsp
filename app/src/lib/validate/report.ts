@@ -6,7 +6,7 @@ import type { GameDataIndex, TechEffects } from '../data';
 import type { Layout } from '../geometry';
 import { checkCapacity } from './capacity';
 import { checkGeometry } from './geometry-checks';
-import { runSimulation } from './sim/run';
+import { provisionedRate, runSimulation } from './sim/run';
 import type { SimResult } from './sim/run';
 import type { Violation, ViolationEntity } from './types';
 
@@ -24,6 +24,7 @@ export interface ValidationReport {
 export interface ValidateOptions {
   /** Run the tick simulation after the static checks. Default true. */
   simulate?: boolean;
+  /** Ticks before the measurement, used exactly. Omitted: the simulation warms up adaptively (see `SimOptions`). */
   warmupTicks?: number;
   measureTicks?: number;
 }
@@ -42,18 +43,6 @@ function itemName(data: GameDataIndex, itemId: number): string {
   } catch {
     return `item ${itemId}`;
   }
-}
-
-/**
- * The target rate the plan provisions: its export of the target item, which is what the user asked for. Not
- * `actualTargetRate`, which is the rounded-up capacity of the final stage and can exceed it when an upstream stage
- * limits the chain (Gear at 1/s on two Mk.I assemblers has capacity 1.5/s but one Arc Smelter feeds only 1/s).
- * Falls back to the requested rate, or to the capacity when the request is in buildings and exports are missing.
- */
-function provisionedRate(plan: ProductionPlan): number {
-  const exported = plan.exports.find((e) => e.itemId === plan.request.targetItemId)?.perSecond;
-  if (exported !== undefined) return exported;
-  return plan.request.quantity.kind === 'rate' ? plan.request.quantity.perSecond : plan.actualTargetRate;
 }
 
 /**

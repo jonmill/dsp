@@ -13,14 +13,16 @@ const simulate = (row: { kit: LayoutKit; plan: Parameters<typeof runSimulation>[
   runSimulation(row.kit.layout(), row.plan, fixtureData, fixtureEffects, opts);
 
 describe('runSimulation: a smelter row', () => {
-  it('(a) 3 smelters deliver 3 ingots/s from an ILS to an ILS over the default 2 + 5 minutes, and log the speed', () => {
+  it('(a) 3 smelters deliver 3 ingots/s from an ILS to an ILS over the adaptive warm-up + 5 minutes, and log the speed', () => {
     const row = smelterRowLayout(3);
     const started = performance.now();
     const sim = simulate(row);
     const ms = performance.now() - started;
-    const ticks = (7200 + 18000);
+    const ticks = sim.warmupTicksUsed + 18000;
     console.log(`run.test (a): ${ticks} ticks in ${ms.toFixed(0)} ms = ${Math.round((ticks / ms) * 1000)} ticks/s`);
     expect(ms).toBeLessThan(3000);
+    expect(sim.warmupTicksUsed).toBeGreaterThanOrEqual(3600);
+    expect(sim.warmupTicksUsed).toBeLessThan(18000); // a 28-node block settles in a window or two
 
     expect(sim.measuredTargetRate).toBeGreaterThanOrEqual(2.97);
     expect(sim.measuredTargetRate).toBeLessThan(3.03);
@@ -111,6 +113,78 @@ describe('runSimulation: a smelter row', () => {
     expect(() => simulate(row, { measureTicks: 0 })).toThrow(/measureTicks/);
     expect(() => simulate(row, { warmupTicks: -1 })).toThrow(/warmupTicks/);
     expect(() => simulate(row, { measureTicks: 1.5 })).toThrow(/measureTicks/);
+  });
+});
+
+describe('runSimulation: the warm-up', () => {
+  /** A station feeds a Mk.I belt of `nodes` nodes (20 ticks each) into another station: nothing arrives for `nodes * 20` ticks. */
+  function longBelt(nodes: number, provisioned: number): { layout: Layout; plan: Parameters<typeof runSimulation>[1] } {
+    const { kit } = stationPairLayout(1, nodes);
+    const base = planOf([]);
+    const plan = {
+      ...base,
+      actualTargetRate: provisioned,
+      request: { ...base.request, targetItemId: 1001, quantity: { kind: 'rate' as const, perSecond: provisioned } },
+    };
+    return { layout: kit.layout(), plan };
+  }
+  /** The belt carries 6/s; `provisioned` is what the plan asks of it. */
+  const run = (nodes: number, opts?: Parameters<typeof runSimulation>[4], provisioned = 6): SimResult => {
+    const { layout, plan } = longBelt(nodes, provisioned);
+    return runSimulation(layout, plan, fixtureData, fixtureEffects, opts);
+  };
+
+  it('uses exactly the ticks it is given, and reports them', () => {
+    const row = smelterRowLayout(3);
+    for (const warmupTicks of [0, 1234, 7200, 9000]) {
+      const sim = simulate(row, { warmupTicks, measureTicks: 600 });
+      expect(sim.warmupTicksUsed).toBe(warmupTicks);
+    }
+    // an explicit warm-up is not extended even when the block is still ramping up
+    const short = run(500, { warmupTicks: 7200, measureTicks: 18000 });
+    expect(short.warmupTicksUsed).toBe(7200);
+    expect(short.measuredTargetRate).toBeLessThan(5.5); // the first item lands at tick ~10000, inside the window
+  });
+
+  it('with no warm-up given runs windows of 3600 ticks until the ramp-up is over: a 500-node belt takes over 7200', () => {
+    const sim = run(500);
+    expect(sim.warmupTicksUsed).toBeGreaterThan(7200);
+    expect(sim.warmupTicksUsed).toBeLessThanOrEqual(72000);
+    expect(sim.warmupTicksUsed % 3600).toBe(0);
+    expect(sim.measuredTargetRate).toBeGreaterThan(5.9);
+    expect(sim.measuredTargetRate).toBeLessThan(6.1);
+    // the fixed 7200 ticks the simulator used to run measure the ramp-up instead
+    expect(run(500, { warmupTicks: 7200 }).measuredTargetRate).toBeLessThan(sim.measuredTargetRate - 0.5);
+  });
+
+  it('stops after the first window of 3600 (the minimum) when it makes the provisioned rate', () => {
+    const sim = run(20, undefined, 3); // the belt carries 6/s, 3/s is provisioned
+    expect(sim.warmupTicksUsed).toBe(3600);
+    expect(sim.measuredTargetRate).toBeGreaterThan(5.9);
+    // at 6/s provisioned the first window, which spends ~400 ticks filling the belt, is not enough
+    expect(run(20).warmupTicksUsed).toBe(7200);
+  });
+
+  it('stops once two consecutive windows agree within 1 %, though the provisioned rate is never reached', () => {
+    const row = smelterRowLayout(3);
+    row.plan.exports = [{ itemId: 1101, perSecond: 5 }]; // the row makes 3/s
+    const sim = simulate(row, { measureTicks: 3600 });
+    expect(sim.warmupTicksUsed).toBeGreaterThanOrEqual(7200);
+    expect(sim.warmupTicksUsed).toBeLessThan(18000);
+    expect(Math.abs(sim.measuredTargetRate - 3)).toBeLessThan(0.05);
+  });
+
+  it('does not take two windows without any output as agreeing: a block that makes nothing runs to the 72000-tick cap', () => {
+    const row = smelterRowLayout(3);
+    row.ore.source = undefined; // no ore ever enters
+    const sim = simulate(row, { measureTicks: 600 });
+    expect(sim.warmupTicksUsed).toBe(72000);
+    expect(sim.measuredTargetRate).toBe(0);
+    expect(sim.deadlocked).toBe(true);
+  });
+
+  it('is the same on every run', () => {
+    expect(run(500)).toEqual(run(500));
   });
 });
 

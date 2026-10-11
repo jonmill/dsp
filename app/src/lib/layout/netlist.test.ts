@@ -14,6 +14,7 @@ const everything = allTechs(parsed);
 const allEffects = computeTechEffects(parsed, everything);
 
 const ASSEMBLER_MK1 = 2303;
+const ASSEMBLER_MK3 = 2305;
 const ARC_SMELTER = 2302;
 const CHEMICAL_PLANT = 2309;
 const REFINERY = 2308;
@@ -169,6 +170,14 @@ const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);
 const netsOf = (nl: Netlist, itemId: number): BeltNet[] => nl.nets.filter((n) => n.itemId === itemId);
 const outRate = (net: BeltNet): number => sum(net.taps.filter((t) => t.dir === 'out').map((t) => t.rate));
 const inRate = (net: BeltNet): number => sum(net.taps.filter((t) => t.dir === 'in').map((t) => t.rate));
+/** `machine/item` of every producer that has `out` taps for one item on more than one net. */
+function splitProducers(nl: Netlist): string[] {
+  const count = new Map<string, number>();
+  for (const net of nl.nets) {
+    for (const t of net.taps) if (t.dir === 'out') count.set(`${t.machineId}/${t.itemId}`, (count.get(`${t.machineId}/${t.itemId}`) ?? 0) + 1);
+  }
+  return [...count].filter(([, n]) => n > 1).map(([key]) => key);
+}
 const stationNets = (nl: Netlist): BeltNet[] => nl.nets.filter((n) => n.source.kind === 'station' || n.sink.kind === 'station');
 
 /** Everything every netlist must satisfy, whatever the plan. */
@@ -187,7 +196,8 @@ function expectSound(nl: Netlist, plan: ProductionPlan, effects: TechEffects, ma
     // capacity, tap count, balance
     expect(net.tierItemId).toBe(nl.beltTierItemId);
     expect(net.rate).toBeLessThanOrEqual(netCapacity(net.tierItemId, stationSourced, effects, data) * (1 + 1e-9));
-    expect(net.taps.length).toBeLessThanOrEqual(maxTaps);
+    // the tap limit gives way to keeping a producer whole, and the netlist says which net it let grow
+    if (net.taps.length > maxTaps) expect(nl.warnings.some((w) => w.startsWith(`net ${net.id} (`) && /taps/.test(w))).toBe(true);
     expect(net.taps.length).toBeGreaterThan(0);
     for (const t of net.taps) {
       expect(t.itemId).toBe(net.itemId);
@@ -203,6 +213,32 @@ function expectSound(nl: Netlist, plan: ProductionPlan, effects: TechEffects, ma
       if (net.sink.kind === 'deadEnd') expect(outRate(net)).toBeCloseTo(inRate(net), 7);
       else expect(outRate(net)).toBeGreaterThan(inRate(net) + 1e-9); // the rest goes to the station
     }
+  }
+
+  // a producer machine puts an item on one net, unless it alone makes more than a belt carries (then a warning names it)
+  const outs = new Map<string, { nets: number; rate: number }>();
+  for (const net of nl.nets) {
+    for (const t of net.taps) {
+      if (t.dir !== 'out') continue;
+      const key = `${t.machineId}/${t.itemId}`;
+      const entry = outs.get(key) ?? { nets: 0, rate: 0 };
+      outs.set(key, { nets: entry.nets + 1, rate: entry.rate + t.rate });
+    }
+  }
+  for (const [key, { nets, rate }] of outs) {
+    if (nets < 2) continue;
+    const [machineId] = key.split('/').map(Number);
+    expect(rate, `machine ${key} is split over ${nets} nets`).toBeGreaterThan(
+      netCapacity(nl.beltTierItemId, false, effects, data),
+    );
+    expect(nl.warnings.some((w) => w.startsWith(`machine ${machineId} (`))).toBe(true);
+  }
+  // an item the station supplies is not also tapped off a belt that producers feed
+  const supplied = new Set(nl.nets.filter((n) => n.source.kind === 'station').map((n) => n.itemId));
+  for (const net of nl.nets) {
+    if (!supplied.has(net.itemId) || net.source.kind !== 'taps') continue;
+    expect(net.taps.every((t) => t.dir === 'out'), `net ${net.id} of item ${net.itemId}`).toBe(true);
+    expect(net.sink.kind).toBe('station');
   }
 
   // every machine gets and gives exactly what its stage says, across all its taps
@@ -308,10 +344,16 @@ describe('buildNetlist: Processor chain on Mk.I', () => {
     const nl = buildNetlist(plan, data, MK1);
     const silicon = netsOf(nl, HIGH_PURITY_SILICON); // 8 smelters feed 6 assemblers
     expect(silicon).toHaveLength(2);
+    expect(nl.warnings).toEqual([]);
     expectSound(nl, plan, MK1);
+    // a limit of 4: where no cut keeps the producers whole within it, a net grows past it and the netlist warns
     const tight = buildNetlist(plan, data, MK1, { maxMachinesPerNet: 4 });
     expectSound(tight, plan, MK1, 4);
     expect(tight.nets.length).toBeGreaterThan(nl.nets.length);
+    const over = tight.nets.filter((n) => n.taps.length > 4);
+    expect(over.length).toBeGreaterThan(0);
+    for (const net of over) expect(tight.warnings.filter((w) => w.startsWith(`net ${net.id} (`))).toHaveLength(1);
+    expect(tight.warnings).toHaveLength(over.length);
   });
 
   it('is deterministic and does not change the plan', async () => {
@@ -358,30 +400,133 @@ describe('buildNetlist: tiers', () => {
 });
 
 describe('buildNetlist: splitting by rate', () => {
-  it('splits a taps-sourced 20/s net on Mk.I (5.7/s) into 4, each with supply >= demand', () => {
+  it('splits a taps-sourced 20/s net on Mk.I (5.7/s) into 5 at producer boundaries, each with supply >= demand', () => {
     const plan = ingotPlan();
     const nl = buildNetlist(plan, data, MK1);
     const ingots = netsOf(nl, IRON_INGOT);
-    expect(ingots).toHaveLength(4);
     expect(netCapacity(2001, false, MK1, data)).toBeCloseTo(0.95 * beltCapacity(2001, 1, data), 12);
+    // Producers (4/s) and consumers (2.5/s) only meet at 20/s, past one belt, so there is no cut that splits neither:
+    // every producer stays whole on its own net and the consumers a cut falls inside get a tap on both sides.
+    expect(ingots).toHaveLength(5);
     for (const net of ingots) {
       expect(net.source).toEqual({ kind: 'taps' });
       expect(net.sink).toEqual({ kind: 'deadEnd' });
       expect(net.rate).toBeLessThanOrEqual(0.95 * 6 + 1e-9);
+      expect(net.taps.filter((t) => t.dir === 'out')).toHaveLength(1);
+      expect(outRate(net)).toBeCloseTo(4, 9);
       expect(outRate(net) + 1e-9).toBeGreaterThanOrEqual(inRate(net));
-      expect(inRate(net)).toBeCloseTo(5, 9); // two 2.5/s assemblers per net
+      expect(inRate(net)).toBeCloseTo(4, 9);
     }
-    // the consumers (id order) stay whole: 2 per net
-    expect(ingots.map((n) => n.taps.filter((t) => t.dir === 'in').map((t) => t.machineId))).toEqual([
-      [1, 2],
-      [3, 4],
-      [5, 6],
-      [7, 8],
+    expect(ingots.map((n) => n.taps.filter((t) => t.dir === 'out').map((t) => t.machineId))).toEqual([
+      [9],
+      [10],
+      [11],
+      [12],
+      [13],
     ]);
-    // a producer (4/s) that straddles two nets gets a tap in each, the rate divided
-    const producer = (id: number) => ingots.flatMap((n) => n.taps.filter((t) => t.dir === 'out' && t.machineId === id));
-    for (let id = 9; id <= 13; id++) expect(sum(producer(id).map((t) => t.rate))).toBeCloseTo(4, 9);
-    expect(producer(10).map((t) => t.rate)).toEqual([expect.closeTo(1, 9), expect.closeTo(3, 9)]);
+    expect(ingots.map((n) => n.taps.filter((t) => t.dir === 'in').map((t) => [t.machineId, +t.rate.toFixed(9)]))).toEqual([
+      [[1, 2.5], [2, 1.5]],
+      [[2, 1], [3, 2.5], [4, 0.5]],
+      [[4, 2], [5, 2]],
+      [[5, 0.5], [6, 2.5], [7, 1]],
+      [[7, 1.5], [8, 2.5]],
+    ]);
+    expect(nl.warnings).toEqual([]);
+    expectSound(nl, plan, MK1);
+  });
+
+  it('cuts where a producer end and a consumer end coincide, not at the later consumer end the belt could carry', () => {
+    // 2 producers of 4/s and 8 consumers of 1/s: a belt (5.7/s) could end at the consumer end 5, which would split the
+    // second producer; the cut goes to 4, where the first producer ends too
+    const plan = synthPlan({
+      stages: [
+        { machines: 8, inputs: [{ itemId: IRON_INGOT, perSecond: 8 }], outputs: [{ itemId: GEAR, perSecond: 1 }] },
+        { machines: 2, inputs: [], outputs: [{ itemId: IRON_INGOT, perSecond: 8 }] },
+      ],
+      flows: [
+        { itemId: IRON_INGOT, from: 1, to: 0, perSecond: 8 },
+        { itemId: GEAR, from: 0, to: 'export', perSecond: 1 },
+      ],
+      exports: [{ itemId: GEAR, perSecond: 1 }],
+    });
+    const nl = buildNetlist(plan, data, MK1);
+    const ingots = netsOf(nl, IRON_INGOT);
+    expect(ingots).toHaveLength(2);
+    expect(ingots.map((n) => n.taps.filter((t) => t.dir === 'out').map((t) => t.machineId))).toEqual([[9], [10]]);
+    expect(ingots.map((n) => n.taps.filter((t) => t.dir === 'in').map((t) => t.machineId))).toEqual([
+      [1, 2, 3, 4],
+      [5, 6, 7, 8],
+    ]);
+    expect(splitProducers(nl)).toEqual([]);
+    expect(nl.warnings).toEqual([]);
+    expectSound(nl, plan, MK1);
+  });
+
+  it('splits no producer in Processor x6, on the best belts and on Mk.II belts', async () => {
+    const plan = await planOf(
+      processorRequest({
+        quantity: { kind: 'rate', perSecond: 6 },
+        finalFacilityItemId: ASSEMBLER_MK3,
+        facilityOverrides: { ...PROCESSOR_MK1, 51: ASSEMBLER_MK3, 50: ASSEMBLER_MK3, 53: ASSEMBLER_MK3 },
+      }),
+    );
+    expect(plan.stages.reduce((n, st) => n + st.machines, 0)).toBeGreaterThan(100);
+    for (const effects of [allEffects, withTiers(2002, 2012)]) {
+      const nl = buildNetlist(plan, data, effects);
+      expect(splitProducers(nl)).toEqual([]);
+      expect(nl.warnings).toEqual([]);
+      expectSound(nl, plan, effects);
+    }
+  });
+
+  it('keeps a producer whole on a net over the tap limit when no cut fits, and warns about the net', () => {
+    // one producer of 4/s, four consumers of 1/s, at most 3 taps: the only cut that splits neither is the end, 5 taps
+    const plan = synthPlan({
+      stages: [
+        { machines: 4, inputs: [{ itemId: IRON_INGOT, perSecond: 4 }], outputs: [{ itemId: GEAR, perSecond: 1 }] },
+        { machines: 1, inputs: [], outputs: [{ itemId: IRON_INGOT, perSecond: 4 }] },
+      ],
+      flows: [
+        { itemId: IRON_INGOT, from: 1, to: 0, perSecond: 4 },
+        { itemId: GEAR, from: 0, to: 'export', perSecond: 1 },
+      ],
+      exports: [{ itemId: GEAR, perSecond: 1 }],
+    });
+    const nl = buildNetlist(plan, data, MK1, { maxMachinesPerNet: 3 });
+    const ingots = netsOf(nl, IRON_INGOT);
+    expect(ingots).toHaveLength(1);
+    expect(ingots[0].taps).toHaveLength(5);
+    expect(ingots[0].taps[0]).toMatchObject({ machineId: 5, dir: 'out', rate: expect.closeTo(4, 9) });
+    expect(splitProducers(nl)).toEqual([]);
+    expect(nl.warnings).toHaveLength(1);
+    expect(nl.warnings[0]).toMatch(new RegExp(`^net ${ingots[0].id} \\(Iron Ingot\\) has 5 taps.*3`));
+    expectSound(nl, plan, MK1, 3);
+    // with room for 5 taps nothing is over the limit
+    expect(buildNetlist(plan, data, MK1, { maxMachinesPerNet: 5 }).warnings).toEqual([]);
+  });
+
+  it('splits a producer that alone makes more than a belt carries, and warns naming the machine', () => {
+    const plan = synthPlan({
+      stages: [
+        { machines: 2, inputs: [{ itemId: IRON_INGOT, perSecond: 10 }], outputs: [{ itemId: GEAR, perSecond: 1 }] },
+        { machines: 1, inputs: [], outputs: [{ itemId: IRON_INGOT, perSecond: 10 }] },
+      ],
+      flows: [
+        { itemId: IRON_INGOT, from: 1, to: 0, perSecond: 10 },
+        { itemId: GEAR, from: 0, to: 'export', perSecond: 1 },
+      ],
+      exports: [{ itemId: GEAR, perSecond: 1 }],
+    });
+    const nl = buildNetlist(plan, data, MK1);
+    const ingots = netsOf(nl, IRON_INGOT);
+    expect(ingots).toHaveLength(2);
+    expect(splitProducers(nl)).toEqual(['3/1101']);
+    expect(sum(ingots.flatMap((n) => n.taps.filter((t) => t.machineId === 3).map((t) => t.rate)))).toBeCloseTo(10, 9);
+    // the consumers (5/s each) stay whole
+    expect(ingots.map((n) => n.taps.filter((t) => t.dir === 'in').map((t) => t.machineId))).toEqual([[1], [2]]);
+    const warning = nl.warnings.filter((w) => /machine 3 /.test(w));
+    expect(warning).toHaveLength(1);
+    expect(warning[0]).toMatch(/machine 3 \(Assembling Machine Mk\.I\) makes 10 Iron Ingot\/s, more than one belt carries \(5\.7\/s\)/);
     expectSound(nl, plan, MK1);
   });
 
@@ -443,7 +588,7 @@ describe('buildNetlist: splitting by rate', () => {
     const plan = synthPlan({
       stages: [
         { machines: 1, inputs: [{ itemId: IRON_INGOT, perSecond: 10 }], outputs: [{ itemId: GEAR, perSecond: 1 }] },
-        { machines: 5, inputs: [], outputs: [{ itemId: IRON_INGOT, perSecond: 10 }] },
+        { machines: 2, inputs: [], outputs: [{ itemId: IRON_INGOT, perSecond: 10 }] },
       ],
       flows: [
         { itemId: IRON_INGOT, from: 1, to: 0, perSecond: 10 },
@@ -453,13 +598,15 @@ describe('buildNetlist: splitting by rate', () => {
     });
     const nl = buildNetlist(plan, data, MK1);
     const ingots = netsOf(nl, IRON_INGOT);
+    // the two 5/s producers each fit a belt, so each stays whole on its own net, and the consumer is split between them
     expect(ingots).toHaveLength(2);
+    expect(ingots.map((n) => n.taps.filter((t) => t.dir === 'out').map((t) => t.machineId))).toEqual([[2], [3]]);
     const taps = ingots.flatMap((n) => n.taps.filter((t) => t.dir === 'in'));
     expect(taps.map((t) => t.machineId)).toEqual([1, 1]);
     expect(sum(taps.map((t) => t.rate))).toBeCloseTo(10, 9);
-    // 5.7/s through Mk.I sorters (1.5/s) is 4 sorters, over the limit of 3
-    expect(taps[0].sorters).toBe(4);
-    expect(nl.warnings.filter((w) => /sorter/i.test(w))).toHaveLength(1);
+    // 5/s through Mk.I sorters (1.5/s) is 4 sorters, over the limit of 3
+    expect(taps.map((t) => t.sorters)).toEqual([4, 4]);
+    expect(nl.warnings.filter((w) => /sorter/i.test(w))).toHaveLength(2); // one per net
     expect(nl.warnings.join('\n')).toMatch(/Iron Ingot/);
     expectSound(nl, plan, MK1);
   });
@@ -595,17 +742,70 @@ describe('buildNetlist: stations', () => {
     expect(nl.machines.length).toBeGreaterThan(200);
   });
 
-  it('sources Hydrogen from the station for the imported part and from the refineries for the by-product part', async () => {
+  it('Hydrogen that is both imported and made: all consumers on station-sourced nets, all producers on a station-sink net', async () => {
     const plan = await planOf(quantumRequest());
     const nl = buildNetlist(plan, data, allEffects);
     const hydrogen = netsOf(nl, HYDROGEN);
-    expect(hydrogen.filter((n) => n.source.kind === 'station').length).toBeGreaterThan(0);
-    expect(hydrogen.filter((n) => n.source.kind === 'taps').length).toBeGreaterThan(0);
-    const imported = sum(hydrogen.filter((n) => n.source.kind === 'station').map((n) => n.rate));
-    const made = sum(hydrogen.filter((n) => n.source.kind === 'taps').map((n) => n.rate));
-    expect(imported).toBeCloseTo(17.5, 7);
-    expect(made).toBeCloseTo(6.5, 7);
+    const imported = hydrogen.filter((n) => n.source.kind === 'station');
+    const made = hydrogen.filter((n) => n.source.kind === 'taps');
+    expect(imported.length).toBeGreaterThan(0);
+    expect(made.length).toBeGreaterThan(0);
+    // 17.5/s is imported and 6.5/s made, but the consumers take all 24/s from the station, which the refineries refill
+    expect(sum(imported.map((n) => n.rate))).toBeCloseTo(24, 7);
+    expect(sum(made.map((n) => n.rate))).toBeCloseTo(6.5, 7);
+    expect(sum(imported.map(inRate))).toBeCloseTo(sum(plan.stages.map((st) => st.inputs.find((i) => i.itemId === HYDROGEN)?.perSecond ?? 0)), 7);
+    for (const net of imported) {
+      expect(net.taps.every((t) => t.dir === 'in')).toBe(true);
+      expect(net.sink).toEqual({ kind: 'deadEnd' });
+    }
+    for (const net of made) {
+      expect(net.taps.every((t) => t.dir === 'out')).toBe(true);
+      expect(net.sink.kind).toBe('station');
+    }
     expectSound(nl, plan, allEffects);
+  });
+
+  it('Hydrogen: no net has both producer and consumer taps; producers end at the station; the slot stays one import slot', async () => {
+    const plan = await planOf(quantumRequest());
+    const nl = buildNetlist(plan, data, allEffects);
+    const hydrogen = netsOf(nl, HYDROGEN);
+    expect(hydrogen.filter((n) => n.taps.some((t) => t.dir === 'out') && n.taps.some((t) => t.dir === 'in'))).toEqual([]);
+    const producerNets = hydrogen.filter((n) => n.taps.some((t) => t.dir === 'out'));
+    expect(producerNets.length).toBeGreaterThan(0);
+    for (const net of producerNets) {
+      if (net.sink.kind !== 'station') throw new Error(`net ${net.id} of Hydrogen producers does not end at a station`);
+      const slots = nl.stations[net.sink.stationIdx].slots.filter((s) => s.itemId === HYDROGEN);
+      expect(slots).toEqual([{ itemId: HYDROGEN, localLogic: 2, remoteLogic: 0, max: 5000 }]);
+    }
+    // every station that holds Hydrogen holds it once, as an import (demand logic 2)
+    for (const st of nl.stations) {
+      const slots = st.slots.filter((s) => s.itemId === HYDROGEN);
+      expect(slots.length).toBeLessThanOrEqual(1);
+      for (const slot of slots) expect(slot.localLogic).toBe(2);
+    }
+    // the refineries (stage 12 in the Quantum plan) put nothing on a belt a consumer taps
+    const refineries = new Set(nl.machines.filter((m) => m.outputs.some((o) => o.itemId === HYDROGEN)).map((m) => m.id));
+    expect(refineries.size).toBeGreaterThan(0);
+    for (const net of hydrogen) {
+      for (const t of net.taps) expect(refineries.has(t.machineId)).toBe(t.dir === 'out');
+    }
+  });
+
+  it('Hydrogen: the import belts carry the consumers\' full demand, sized by the station stack', async () => {
+    const plan = await planOf(quantumRequest());
+    const demand = sum(plan.stages.map((st) => st.inputs.find((i) => i.itemId === HYDROGEN)?.perSecond ?? 0));
+    expect(demand).toBeCloseTo(24, 7); // imports 17.5 + by-product 6.5
+    for (const [stack, nets] of [[1, 3], [4, 1]] as const) {
+      const effects = withTiers(2002, 2012, { stationPilerLevel: stack });
+      const nl = buildNetlist(plan, data, effects);
+      const imported = netsOf(nl, HYDROGEN).filter((n) => n.source.kind === 'station');
+      const capacity = netCapacity(2002, true, effects, data);
+      expect(capacity).toBeCloseTo(0.95 * beltCapacity(2002, stack, data), 9);
+      expect(imported).toHaveLength(nets);
+      expect(imported).toHaveLength(Math.ceil(demand / capacity - 1e-9));
+      expect(sum(imported.map((n) => n.rate))).toBeCloseTo(demand, 7);
+      expectSound(nl, plan, effects);
+    }
   });
 
   it('pads to the stations the plan asked for', () => {
