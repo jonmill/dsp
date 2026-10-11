@@ -292,3 +292,114 @@ export function stationPairLayout(tier: 1 | 2 | 3 = 1, nodes = 10, kit: LayoutKi
   });
   return { kit, source, sink, belt };
 }
+
+/** The pieces of `smelterRowLayout`. */
+export interface SmelterRow {
+  kit: LayoutKit;
+  /** Output port 0 supplies iron ore (1001). */
+  source: PlacedBuilding;
+  /** Input port 1 takes iron ingots (1101). */
+  sink: PlacedBuilding;
+  smelters: PlacedBuilding[];
+  /** Station port 0 to a dead end; every smelter has a sorter picking from it. */
+  ore: BeltPath;
+  /** Fed by every smelter's output sorter; ends at the sink's port 1, or dead-ends with `deadEnd`. */
+  ingot: BeltPath;
+  /** One stage (recipe 1 on smelters) and a target of `smelters` ingots/s. */
+  plan: ProductionPlan;
+}
+
+/**
+ * ILS -> ore belt -> `count` smelters -> ingot belt -> ILS, for the simulator: geometry-agnostic (sorter slots are
+ * placeholders, the buildings sit where nothing is checked), but every connection the simulator reads is real.
+ */
+export function smelterRowLayout(count = 3, opts: { deadEnd?: boolean } = {}, kit: LayoutKit = new LayoutKit()): SmelterRow {
+  const source = kit.station(0, 0);
+  const sink = kit.station(80, 0);
+  sink.station!.slots[0].itemId = 1101;
+  sink.station!.ports[1] = { dir: 2, storageIdx: 0 };
+  const nodes = 10 + 4 * count + 6;
+  const ore = kit.belt(1, 1001, line([0, 5], [nodes, 5]), { source: { buildingId: source.id, port: 0 } });
+  const ingot = kit.belt(1, 1101, line([0, 12], [nodes, 12]), {
+    sink: opts.deadEnd ? undefined : { kind: 'port', buildingId: sink.id, port: 1 },
+  });
+  const smelters: PlacedBuilding[] = [];
+  for (let i = 0; i < count; i++) {
+    const node = 10 + 4 * i;
+    const smelter = kit.smelter(node, 8, 0, 1);
+    smelter.role = 'stage:0';
+    smelters.push(smelter);
+    kit.sorter(onNode(ore, node), onSlot(smelter, 0), 1, { filterItemId: 1001 });
+    kit.sorter(onSlot(smelter, 1), onNode(ingot, node), 1, { filterItemId: 1101 });
+  }
+  const stage = planStage(1, {
+    buildingItemId: ITEM.smelter,
+    machines: count,
+    exactMachines: count,
+    craftsPerSecond: count,
+    inputs: [{ itemId: 1001, perSecond: count }],
+    outputs: [{ itemId: 1101, perSecond: count }],
+  });
+  const plan: ProductionPlan = {
+    ...planOf([stage]),
+    actualTargetRate: count,
+    exports: [{ itemId: 1101, perSecond: count }],
+  };
+  return { kit, source, sink, smelters, ore, ingot, plan };
+}
+
+/** The pieces of `refineryLayout`. */
+export interface RefineryRun {
+  kit: LayoutKit;
+  /** Output port 0 supplies crude oil (1007). */
+  source: PlacedBuilding;
+  /** Input port 1 takes refined oil (1114), input port 2 hydrogen (1120). */
+  sink: PlacedBuilding;
+  refinery: PlacedBuilding;
+  /** The plan: Plasma Refining (recipe 16) with refined oil as the target and hydrogen as a by-product export. */
+  plan: ProductionPlan;
+}
+
+/**
+ * ILS -> crude belt -> one Oil Refinery running Plasma Refining -> refined-oil belt -> ILS. The hydrogen by-product
+ * only gets a belt to the ILS with `drainHydrogen`; without it nothing takes the hydrogen away (Review Focus #4).
+ */
+export function refineryLayout(opts: { drainHydrogen?: boolean } = {}, kit: LayoutKit = new LayoutKit()): RefineryRun {
+  const source = kit.station(0, 0);
+  source.station!.slots[0].itemId = 1007;
+  const sink = kit.station(80, 0, 0, ITEM.ils, { station: stationConfig(2) });
+  sink.station!.slots[0].itemId = 1114;
+  sink.station!.slots[1].itemId = 1120;
+  sink.station!.ports[1] = { dir: 2, storageIdx: 0 };
+  sink.station!.ports[2] = { dir: 2, storageIdx: 0 };
+  const refinery = kit.building(2308, 20, 8, 0, { recipeId: 16, role: 'stage:0' });
+  const crude = kit.belt(1, 1007, line([0, 5], [30, 5]), { source: { buildingId: source.id, port: 0 } });
+  const oil = kit.belt(1, 1114, line([0, 12], [30, 12]), { sink: { kind: 'port', buildingId: sink.id, port: 1 } });
+  kit.sorter(onNode(crude, 20), onSlot(refinery, 0), 1, { filterItemId: 1007 });
+  kit.sorter(onSlot(refinery, 1), onNode(oil, 20), 1, { filterItemId: 1114 });
+  if (opts.drainHydrogen) {
+    const hydrogen = kit.belt(1, 1120, line([0, 16], [30, 16]), { sink: { kind: 'port', buildingId: sink.id, port: 2 } });
+    kit.sorter(onSlot(refinery, 2), onNode(hydrogen, 20), 1, { filterItemId: 1120 });
+  }
+  const stage = planStage(16, {
+    buildingItemId: 2308,
+    craftsPerSecond: 0.25,
+    perMachineCraftsPerSecond: 0.25,
+    inputs: [{ itemId: 1007, perSecond: 0.5 }],
+    outputs: [
+      { itemId: 1114, perSecond: 0.5 },
+      { itemId: 1120, perSecond: 0.25 },
+    ],
+  });
+  const base = planOf([stage]);
+  const plan: ProductionPlan = {
+    ...base,
+    request: { ...base.request, targetItemId: 1114 },
+    actualTargetRate: 0.5,
+    exports: [
+      { itemId: 1114, perSecond: 0.5 },
+      { itemId: 1120, perSecond: 0.25 },
+    ],
+  };
+  return { kit, source, sink, refinery, plan };
+}

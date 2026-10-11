@@ -466,3 +466,46 @@ describe('BeltSim against a naive cell model', () => {
     });
   }
 });
+
+describe('BeltSim cargoAt / setIncAt (spray coaters)', () => {
+  it('finds the cargo whose 10 cells cover the cell, and none for a gap', () => {
+    const belt = new BeltSim(100, 1);
+    expect(belt.tryInsert(25, cargo(1001, 2, 0))).toBe(true); // first cell 20, covers 20..29
+    const out: Cargo = { item: 0, stack: 0, inc: 0 };
+    expect(belt.cargoAt(19, out)).toBe(false);
+    expect(belt.cargoAt(20, out)).toBe(true);
+    expect(out).toEqual({ item: 1001, stack: 2, inc: 0 });
+    expect(belt.cargoAt(29, out)).toBe(true);
+    expect(belt.cargoAt(30, out)).toBe(false);
+    expect(belt.cargoAt(-1, out)).toBe(false);
+    expect(belt.cargoAt(100, out)).toBe(false);
+  });
+
+  it('picks the right cargo among neighbours', () => {
+    const belt = new BeltSim(100, 1);
+    expect(belt.tryInsert(15, cargo(1001))).toBe(true); // 10..19
+    expect(belt.tryInsert(25, cargo(1002))).toBe(true); // 20..29
+    const out: Cargo = { item: 0, stack: 0, inc: 0 };
+    expect(belt.cargoAt(19, out) && out.item).toBe(1001);
+    expect(belt.cargoAt(20, out) && out.item).toBe(1002);
+  });
+
+  it('sets the proliferator points of that cargo in place, leaving positions alone', () => {
+    const belt = new BeltSim(100, 1);
+    expect(belt.tryInsert(15, cargo(1001, 3, 0))).toBe(true);
+    expect(belt.tryInsert(25, cargo(1002, 1, 0))).toBe(true);
+    const cells = belt.cargoCells();
+    expect(belt.setIncAt(12, 12)).toBe(true);
+    expect(belt.setIncAt(40, 4)).toBe(false);
+    expect(belt.cargoCells()).toEqual(cells);
+    const out: Cargo = { item: 0, stack: 0, inc: 0 };
+    belt.cargoAt(12, out);
+    expect(out).toEqual({ item: 1001, stack: 3, inc: 12 });
+    belt.cargoAt(25, out);
+    expect(out.inc).toBe(0);
+    // The marked cargo still comes out of the rear with its points.
+    for (let t = 0; t < 200; t++) belt.update();
+    expect(belt.tryPickRear(0)).toEqual({ item: 1002, stack: 1, inc: 0 });
+    expect(belt.tryPick(80, 0)).toEqual({ item: 1001, stack: 3, inc: 12 });
+  });
+});

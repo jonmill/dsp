@@ -142,6 +142,30 @@ export class BeltSim {
     return c;
   }
 
+  /**
+   * Copy the cargo whose 10 cells cover `cellIndex` into `out`; false if the cell is in a gap. Where a spray coater
+   * looks for the cargo passing it. Allocates nothing.
+   */
+  cargoAt(cellIndex: number, out: Cargo): boolean {
+    const k = this.coveringAt(cellIndex);
+    if (k < 0) return false;
+    const c = unpackCargo(this.packed[k]);
+    out.item = c.item;
+    out.stack = c.stack;
+    out.inc = c.inc;
+    return true;
+  }
+
+  /** Set the proliferator points of the cargo covering `cellIndex`, in place; false if the cell is in a gap. */
+  setIncAt(cellIndex: number, inc: number): boolean {
+    const k = this.coveringAt(cellIndex);
+    if (k < 0) return false;
+    const c = unpackCargo(this.packed[k]);
+    c.inc = inc;
+    this.packed[k] = packCargo(c);
+    return true;
+  }
+
   // mirrors: CargoPath.Update
   /**
    * One tick. First a cargo stopped at the rear tries to merge into the output belt; then cargo advances,
@@ -171,6 +195,12 @@ export class BeltSim {
       pos[k] = p;
       limit = p - CARGO_LENGTH;
     }
+  }
+
+  /** Index of the cargo covering `cellIndex` (first cell in `cellIndex - 9 .. cellIndex`), or -1. */
+  private coveringAt(cellIndex: number): number {
+    const k = this.firstAtOrAfter(cellIndex - CARGO_LENGTH + 1);
+    return k < this.count && this.pos[k] <= cellIndex ? k : -1;
   }
 
   /** Index of the first cargo whose position is at least `p`. */
