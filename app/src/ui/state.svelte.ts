@@ -89,7 +89,7 @@ export interface AppState {
 
   setUnlockedTechs(techIds: Iterable<number>): void;
   toggleTech(techId: number): void;
-  /** Adds the tech and everything it needs. */
+  /** Sets the selection to exactly the tech and everything it needs. */
   unlockUpTo(techId: number): void;
   unlockAll(): void;
   selectProfile(name: string): void;
@@ -153,15 +153,26 @@ function isRaw(item: Item): boolean {
   return item.type.toUpperCase() === 'RESOURCE' || EXTRA_RAW_ITEMS.includes(item.id);
 }
 
-/** Unlocked recipes that make the target; if none is unlocked, the plannable ones (to name what is locked). */
-function targetRecipes(index: GameDataIndex, effects: TechEffects, itemId: number): Recipe[] {
+/**
+ * The recipes the target will be made with: the forced one (`recipeOverrides`) if it is unlocked,
+ * else every unlocked recipe that makes it; if none is unlocked, the plannable ones (so the
+ * planner's error can name what is locked).
+ */
+function targetRecipes(index: GameDataIndex, effects: TechEffects, itemId: number, forced: number | undefined): Recipe[] {
   const unlocked = plannableProducers(itemId, index, effects);
+  const pinned = unlocked.filter((r) => r.id === forced);
+  if (pinned.length > 0) return pinned;
   return unlocked.length > 0 ? unlocked : index.recipesProducing(itemId).filter(isPlannableRecipe);
 }
 
 /** The fastest unlocked building for the target's main recipe; failing that the first one to unlock. */
-function defaultFinalFacility(index: GameDataIndex, effects: TechEffects, itemId: number): number {
-  const recipes = targetRecipes(index, effects, itemId);
+function defaultFinalFacility(
+  index: GameDataIndex,
+  effects: TechEffects,
+  itemId: number,
+  forced: number | undefined,
+): number {
+  const recipes = targetRecipes(index, effects, itemId, forced);
   const recipe = recipes.find((r) => !r.explicit) ?? recipes[0];
   if (!recipe) return 0;
   const all = compatibleFacilities(recipe, index);
@@ -169,10 +180,16 @@ function defaultFinalFacility(index: GameDataIndex, effects: TechEffects, itemId
   return (unlocked.at(-1) ?? all[0])?.itemId ?? 0;
 }
 
-/** Can this unlocked building run one of the target's recipes? */
-function finalFacilityFits(index: GameDataIndex, effects: TechEffects, itemId: number, buildingItemId: number): boolean {
+/** Can this unlocked building run one of the recipes the target will be made with? */
+function finalFacilityFits(
+  index: GameDataIndex,
+  effects: TechEffects,
+  itemId: number,
+  forced: number | undefined,
+  buildingItemId: number,
+): boolean {
   if (!effects.availableBuildings.has(buildingItemId)) return false;
-  return plannableProducers(itemId, index, effects).some((r) =>
+  return targetRecipes(index, effects, itemId, forced).some((r) =>
     compatibleFacilities(r, index).some((b) => b.itemId === buildingItemId),
   );
 }
@@ -297,19 +314,28 @@ export function createAppState(data: GameData): AppState {
     writeStorage(ACTIVE_PROFILE_KEY, name);
   }
 
+  /**
+   * The final facility for `req`: the user's pick while it still runs the target's recipe,
+   * else the default (fastest unlocked building for that recipe). Call after anything that can
+   * change the target, its recipe or what is unlocked.
+   */
+  function withFinalFacility(req: PlanRequest, eff: TechEffects): PlanRequest {
+    if (req.targetItemId === 0) return req;
+    const forced = req.recipeOverrides[req.targetItemId];
+    if (finalFacilityPinned && finalFacilityFits(index, eff, req.targetItemId, forced, req.finalFacilityItemId)) {
+      return req;
+    }
+    finalFacilityPinned = false; // a pick that no longer fits is dropped
+    return { ...req, finalFacilityItemId: defaultFinalFacility(index, eff, req.targetItemId, forced) };
+  }
+
   /** Applies a tech selection: effects, the final facility if it stopped fitting, and new leaves. */
   function applyTechs(ids: Iterable<number>, profileName: string): void {
     const unlockedTechs = new Set([...ids].filter((id) => knownTechs.has(id)));
     const nextEffects = computeTechEffects(data, unlockedTechs);
     let next: PlanRequest = { ...request, unlockedTechs };
     if (next.targetItemId !== 0) {
-      if (
-        !finalFacilityPinned ||
-        !finalFacilityFits(index, nextEffects, next.targetItemId, next.finalFacilityItemId)
-      ) {
-        next.finalFacilityItemId = defaultFinalFacility(index, nextEffects, next.targetItemId);
-      }
-      next = withLeavesSupplied(index, nextEffects, next);
+      next = withLeavesSupplied(index, nextEffects, withFinalFacility(next, nextEffects));
     }
     effects = nextEffects;
     setProfileName(profileName);
@@ -321,8 +347,8 @@ export function createAppState(data: GameData): AppState {
     finalFacilityPinned = false;
     const supplied = new Set(request.suppliedItemIds);
     supplied.delete(itemId);
-    const next = withLeavesSupplied(index, effects, { ...request, targetItemId: itemId, suppliedItemIds: supplied });
-    update({ ...next, finalFacilityItemId: defaultFinalFacility(index, effects, itemId) });
+    const next: PlanRequest = { ...request, targetItemId: itemId, suppliedItemIds: supplied };
+    update(withLeavesSupplied(index, effects, withFinalFacility(next, effects)));
   }
 
   function setSupplied(itemId: number, supplied: boolean): void {
@@ -442,7 +468,8 @@ export function createAppState(data: GameData): AppState {
       const overrides = { ...request.recipeOverrides };
       if (recipeId === undefined) delete overrides[itemId];
       else overrides[itemId] = recipeId;
-      update(withLeavesSupplied(index, effects, { ...request, recipeOverrides: overrides }));
+      const next: PlanRequest = { ...request, recipeOverrides: overrides };
+      update(withLeavesSupplied(index, effects, withFinalFacility(next, effects)));
     },
     setSolverBudgetMinutes(minutes) {
       if (Number.isFinite(minutes) && minutes > 0) solverBudgetMinutes = minutes;
@@ -459,7 +486,7 @@ export function createAppState(data: GameData): AppState {
     },
     unlockUpTo(techId) {
       if (!knownTechs.has(techId)) return;
-      applyTechs([...request.unlockedTechs, ...techClosure(data, [techId])], '');
+      applyTechs(techClosure(data, [techId]), '');
     },
     unlockAll() {
       applyTechs(knownTechs, UNLOCK_ALL_PROFILE);

@@ -7,6 +7,8 @@
   let { app }: { app: AppState } = $props();
 
   const result = $derived(app.plan);
+  const plan = $derived(result?.ok ? result.plan : null);
+  const failure = $derived(result && !result.ok ? result.error : null);
   const unit = $derived(app.rateUnit);
 
   const ERROR_TITLES: Record<PlanError['kind'], string> = {
@@ -41,45 +43,48 @@
   }
 </script>
 
-<section class="card" aria-labelledby="plan-title" aria-live="polite">
+<section class="card" aria-labelledby="plan-title">
   <h2 id="plan-title">
     <span class="grow">Production plan</span>
     {#if app.computing}<span class="busy">updating...</span>{/if}
   </h2>
 
-  {#if !app.hasTarget}
-    <p class="hint">Pick a target item to see what it takes to build it.</p>
-  {:else if result === null}
-    <p class="hint">Planning...</p>
-  {:else if !result.ok}
-    {@const error = result.error}
-    {@const itemId = errorItem(error)}
+  <!-- The only live region: the status line is announced when it changes, the tables are not. -->
+  <div aria-live="polite" aria-atomic="true">
+    {#if !app.hasTarget}
+      <p class="hint">Pick a target item to see what it takes to build it.</p>
+    {:else if result === null}
+      <p class="hint">Planning...</p>
+    {:else if plan}
+      <div class="summary">
+        <span>
+          <strong>{formatRate(plan.actualTargetRate, unit)}</strong>
+          {itemName(app.index, plan.request.targetItemId)}
+        </span>
+        <span class="muted">
+          {plan.stages.reduce((n, s) => n + s.machines, 0)} machines,
+          {plan.stationsNeeded} station{plan.stationsNeeded === 1 ? '' : 's'}
+          ({plan.stationSlots.length} item slot{plan.stationSlots.length === 1 ? '' : 's'})
+        </span>
+      </div>
+    {/if}
+  </div>
+
+  {#if failure}
+    {@const itemId = errorItem(failure)}
     <div class="callout error" role="alert">
-      <strong>{ERROR_TITLES[error.kind]}</strong>
+      <strong>{ERROR_TITLES[failure.kind]}</strong>
       {#if itemId !== undefined}
         <div class="subject">
           <ItemIcon index={app.index} itemId={itemId} size={20} />
           <span>{itemName(app.index, itemId)}</span>
         </div>
-      {:else if error.kind === 'facility-unavailable'}
-        <div class="subject">{facilityDetail(error)}</div>
+      {:else if failure.kind === 'facility-unavailable'}
+        <div class="subject">{facilityDetail(failure)}</div>
       {/if}
-      <p>{error.message}</p>
+      <p>{failure.message}</p>
     </div>
-  {:else}
-    {@const plan = result.plan}
-    <div class="summary">
-      <span>
-        <strong>{formatRate(plan.actualTargetRate, unit)}</strong>
-        {itemName(app.index, plan.request.targetItemId)}
-      </span>
-      <span class="muted">
-        {plan.stages.reduce((n, s) => n + s.machines, 0)} machines,
-        {plan.stationsNeeded} station{plan.stationsNeeded === 1 ? '' : 's'}
-        ({plan.stationSlots.length} item slot{plan.stationSlots.length === 1 ? '' : 's'})
-      </span>
-    </div>
-
+  {:else if plan}
     {#if plan.warnings.length > 0}
       <div class="callout warn" role="status">
         <ul>
