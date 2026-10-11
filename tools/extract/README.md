@@ -18,15 +18,18 @@ Everything below runs from the repository root. Python 3.11 or newer is needed (
 ```bash
 # 1. Python and the .NET SDK that ilspycmd needs (ilspycmd 10.x and 11.x target .NET 10)
 sudo dnf install python3 python3-pip dotnet-sdk-10.0
-#    If dnf has no dotnet-sdk-10.0, use Microsoft's installer instead:
+#    If dnf has no dotnet-sdk-10.0, use Microsoft's installer instead (it installs into ~/.dotnet):
 #      curl -sSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
 #      bash dotnet-install.sh --channel 10.0
 
-# 2. ilspycmd, the decompiler
-dotnet tool install -g ilspycmd
-
-# 3. Put the dotnet tools on PATH (add this line to ~/.bashrc or ~/.zshrc, then open a new shell)
+# 2. Make this shell find dotnet and the dotnet tools. Needed BEFORE step 3 when you used dotnet-install.sh
+#    (the script does not touch your PATH); harmless with the dnf package. To keep it for new shells, also
+#    add these two lines to ~/.bashrc or ~/.zshrc.
+export DOTNET_ROOT="$HOME/.dotnet"
 export PATH="$PATH:$HOME/.dotnet:$HOME/.dotnet/tools"
+
+# 3. ilspycmd, the decompiler
+dotnet tool install -g ilspycmd
 
 # 4. The extractor, in a virtual environment
 python3 -m venv tools/extract/.venv
@@ -35,10 +38,12 @@ pip install -e 'tools/extract[game,dev]'
 ```
 
 `dotnet tool install -g` puts `ilspycmd` in `~/.dotnet/tools`, which is usually not on `PATH` in a new shell.
-`dsp-extract` also looks there itself, so it works even before step 3, but add the line anyway if you want to
-run `ilspycmd` by hand. If `ilspycmd` cannot be found at all the extraction still runs: the game version then
-comes from the Steam build id, the code constants keep their (unverified) defaults, and the fingerprints are not
-updated. Without the `game` extra (UnityPy) nothing can be read from the game.
+`dsp-extract` also looks there itself, so it finds `ilspycmd` even without step 2, but `dotnet tool install`
+itself needs `dotnet` on `PATH` (and `DOTNET_ROOT` for a script install), and you need the `PATH` line to run
+`ilspycmd` by hand. If `ilspycmd` cannot be found at all the extraction still runs: the game version then comes
+from the Steam build id, the code constants keep their (unverified) defaults, and the fingerprints are not
+updated. Without the `game` extra (UnityPy and TypeTreeGeneratorAPI) nothing can be read from the game; the
+command checks for them before any slow step and stops at once with the install command if they are missing.
 
 Activate the environment (`source tools/extract/.venv/bin/activate`) in every new shell before running
 `dsp-extract`.
@@ -60,16 +65,19 @@ from inside either. Run it from anywhere inside the repository checkout.
 | Flag | Meaning |
 |---|---|
 | `--game-dir PATH` | The Dyson Sphere Program folder (or its `DSPGAME_Data`). |
-| `--out DIR` | Output folder for `dsp-<gameVersion>.json` and `fingerprints.json` (default `data/`). |
+| `--out DIR` | Output folder for `dsp-<gameVersion>.json` (default `data/`). `data/fingerprints.json` always stays in the repository's `data/` folder. |
 | `--icons` | Export item icons to `app/public/icons/<iconName>.png` (80x80 where the game has it). A failure only warns. |
 | `--copy-blueprints` | Copy your `.txt` blueprints from the Proton prefix to `app/test/fixtures/blueprints/game/`. |
 | `--no-decompile` | Do not run ilspycmd (see above for what that costs). |
 | `--check` | Compare the mirrored game methods with `data/fingerprints.json` and exit 5 if one `changed` or went `missing`. Does not rewrite the fingerprints, so the drift stays visible until you run without `--check`. |
 | `--strict` | Exit 3 after writing if the report has errors (for example a building prefab that could not be read). |
+| `--allow-partial` | Write the GameData even when more than 25% of the buildings could not be read from their prefab. Without it that case exits 3 and writes nothing. |
 | `--report PATH` | Where to write the report (default `local/extract-report.json`). |
 
 Without `--check`, new fingerprints are written after a successful run and any drift is printed with a diff
-against the previous decompile (`local/decompiled.prev/`).
+against the previous decompile (`local/decompiled.prev/`). A decompile only becomes that baseline once a run has
+written its GameData and fingerprints (it is marked with `local/decompiled/.accepted`), so a run that fails, or a
+`--check` run that only reports drift, does not lose the diff: run it again and the same diff is shown.
 
 `dsp-extract fixture --from DIR --out FILE` rebuilds the committed fixture dataset from a dsp-parser dump
 (developer use; needs no game).
@@ -79,7 +87,9 @@ against the previous decompile (`local/decompiled.prev/`).
 The summary prints the game version, the file written, how many buildings have **extracted** geometry and how
 many fell back to **approximate** geometry (the app marks those blueprints "geometry: approximate / unverified"),
 which code constants were read from the game, the fingerprint and drift status, and the number of report errors
-and warnings. A building whose prefab could not be read at all is called out separately.
+and warnings. A building whose prefab could not be read at all is called out separately; if more than a quarter
+of the buildings are in that state the run stops with exit 3 and writes no GameData (`--allow-partial` overrides
+this), listing the first ten with the reason.
 
 ### Exit codes
 
@@ -87,7 +97,7 @@ and warnings. A building whose prefab could not be read at all is called out sep
 |---|---|
 | 0 | GameData written. Some buildings may still use approximate geometry; the summary counts them. |
 | 2 | Dyson Sphere Program not found (the message lists what was searched), or a command line usage error. |
-| 3 | Extraction failed and no GameData was written (the message names the missing class, key or field), an unexpected crash, or `--strict` with errors in the report. |
+| 3 | Extraction failed and no GameData was written: the message names the missing class, key or field, the missing `game` extra, or the buildings that could not be read (more than 25%, see `--allow-partial`). Also `--strict` with errors in the report, and a crash late in the run; in those two cases GameData may already have been written, and the report says so (`output`). |
 | 4 | The extracted data failed schema validation (the first violations are listed); nothing was written. |
 | 5 | `--check` found a mirrored game method that changed or went missing. |
 
@@ -111,6 +121,7 @@ Common messages:
 
 - `UnityPy not installed` / `TypeTreeGeneratorAPI not installed`: `pip install -e 'tools/extract[game,dev]'` in the activated environment.
 - `cannot determine game version`: ilspycmd did not run and no Steam manifest was found (an explicit `--game-dir` outside a Steam library). Install ilspycmd or point `--game-dir` into the library.
+- `N of M buildings ... could not be read from their game prefab`: the reader no longer understands this game version's building prefabs. Nothing was written; send the report (its `per_building_geometry` has the reason for each building).
 - `... is missing key 'X'` or `missing field X`: the game version differs from the one the reader was written against. Send the report.
 
 ## Tests

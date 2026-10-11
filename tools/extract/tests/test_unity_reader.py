@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 from fake_unity import YAW_90, FakeEnv, PrefabBuilder, v3
 
+from dsp_extract import unity_reader
 from dsp_extract.errors import ExtractError
 from dsp_extract.normalize import normalize
 from dsp_extract.raw import RawBundle
@@ -306,6 +307,7 @@ def test_building_whose_model_proto_is_missing_is_still_produced_with_an_error(t
     assert bundle.buildings[0].descs == {} and bundle.buildings[0].colliders is None
     assert any("ModelIndex 65" in e for e in report.errors)
     assert report.sections["per_building_geometry"]["2303"]["status"] == "failed"
+    assert report.sections["per_building_geometry"]["2303"]["unreadable"] is True
 
 
 def test_one_bad_prefab_does_not_stop_the_other_buildings(tmp_path):
@@ -397,6 +399,57 @@ def test_find_protosets_lists_every_protoset_class_with_its_objects():
 def test_read_bundle_requires_the_locale_folder(tmp_path):
     with pytest.raises(ExtractError, match="Locale"):
         read_bundle(make_install(tmp_path, locale=False), Report(), adapter=build_game_env())
+
+
+# ---- the game extra up front ------------------------------------------------------------------------
+
+
+def fake_game_extra(monkeypatch, *, unitypy_version="1.25.4", failures=None):
+    """Make `importlib.import_module` hand out fake UnityPy / TypeTreeGeneratorAPI modules (or raise `failures[name]`)."""
+    failures = failures or {}
+    modules = {"UnityPy": types.SimpleNamespace(__version__=unitypy_version), "TypeTreeGeneratorAPI": types.SimpleNamespace()}
+
+    def fake_import(name, package=None):
+        if name in failures:
+            raise failures[name]
+        return modules[name]
+
+    monkeypatch.setattr(unity_reader.importlib, "import_module", fake_import)
+
+
+def test_check_game_dependencies_passes_when_the_extra_is_installed(monkeypatch):
+    fake_game_extra(monkeypatch)
+    unity_reader.check_game_dependencies()
+
+
+def test_check_game_dependencies_names_a_missing_unitypy_with_the_install_hint(monkeypatch):
+    fake_game_extra(monkeypatch, failures={"UnityPy": ModuleNotFoundError("No module named 'UnityPy'")})
+    with pytest.raises(ExtractError, match="UnityPy not installed.*pip install"):
+        unity_reader.check_game_dependencies()
+
+
+def test_check_game_dependencies_names_a_missing_typetreegeneratorapi(monkeypatch):
+    fake_game_extra(monkeypatch, failures={"TypeTreeGeneratorAPI": ModuleNotFoundError("No module named 'TypeTreeGeneratorAPI'")})
+    with pytest.raises(ExtractError, match="TypeTreeGeneratorAPI not installed.*pip install"):
+        unity_reader.check_game_dependencies()
+
+
+def test_check_game_dependencies_reports_a_native_library_that_cannot_load(monkeypatch):
+    fake_game_extra(monkeypatch, failures={"TypeTreeGeneratorAPI": OSError("libTypeTreeGenerator.so: cannot open shared object file")})
+    with pytest.raises(ExtractError, match="cannot be loaded.*cannot open shared object file"):
+        unity_reader.check_game_dependencies()
+
+
+def test_check_game_dependencies_rejects_an_old_unitypy(monkeypatch):
+    fake_game_extra(monkeypatch, unitypy_version="1.20.3")
+    with pytest.raises(ExtractError, match="1.25 or newer"):
+        unity_reader.check_game_dependencies()
+
+
+def test_check_game_dependencies_works_against_the_real_import_machinery(monkeypatch):
+    monkeypatch.setitem(sys.modules, "UnityPy", None)  # `import UnityPy` raises ImportError
+    with pytest.raises(ExtractError, match="UnityPy not installed"):
+        unity_reader.check_game_dependencies()
 
 
 # ---- lazy UnityPy import ----------------------------------------------------------------------

@@ -674,3 +674,45 @@ def test_the_container_sample_is_kept_from_the_first_miss_only():
     env.container_map["z/y/x"] = ptr(2)
     read_building(env, MODEL, {**ITEM, "ID": 2304}, report)
     assert report.sections["container_sample"] == first
+
+
+# ---- which buildings count as unreadable (the partial-data guard reads this) --------------------
+
+
+def test_an_unreadable_prefab_is_flagged_unreadable():
+    report = Report()
+    read_building(FakeEnv(), MODEL, ITEM, report)
+    record = report.sections["per_building_geometry"]["2303"]
+    assert record["status"] == "failed" and record["unreadable"] is True
+
+
+def test_a_building_that_lost_a_core_descriptor_is_flagged_unreadable():
+    env, b, root = build_assembler()
+    assembler = next(o for o in env.objects.values() if o.script == "AssemblerDesc")
+    env.tree_errors[assembler.path_id] = AssertionError("failed to dump nodes raw")
+    report = Report()
+    read_building(env, MODEL, ITEM, report)
+    record = report.sections["per_building_geometry"]["2303"]
+    assert record["unreadable"] is True
+    assert record["status"] == "extracted"  # the geometry itself was fine
+
+
+def test_warnings_only_never_flag_a_building_unreadable():
+    env, b, root = build_assembler()
+    cfg = next(o for o in env.objects.values() if o.script == "SlotConfig")
+    del cfg.tree["insertPoses"]  # warning: slots not extracted
+    b.mono(root, "SomeDesc", x=1)
+    env.tree_errors[max(env.objects)] = AssertionError("non-core descriptor cannot be built")  # warning only
+    report = Report()
+    read_building(env, MODEL, ITEM, report)
+    assert report.warnings
+    assert "unreadable" not in report.sections["per_building_geometry"]["2303"]
+
+    env2 = FakeEnv()
+    b2 = PrefabBuilder(env2)
+    root2 = b2.game_object("thing")
+    b2.mono(root2, "SlotConfig", slotPoses=[], insertPoses=[])
+    b2.publish(root2, "Entities/Prefabs/Assembler-MK-1")  # no colliders: approximate geometry, not unreadable
+    report2 = Report()
+    read_building(env2, MODEL, ITEM, report2)
+    assert "unreadable" not in report2.sections["per_building_geometry"]["2303"]

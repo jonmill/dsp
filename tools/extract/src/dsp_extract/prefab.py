@@ -547,6 +547,10 @@ def read_building(
 
     def problem(level: str, message: str) -> None:
         record["problems"].append(message)
+        if level == "error":
+            # An error here means lost descriptors (the unreadable prefab, a core descriptor, a crash): the
+            # normalizer will write this building as a different kind. The CLI's partial-data guard counts these.
+            record["unreadable"] = True
         getattr(report, level)(f"{label}: {message}", item_id=item_id)
 
     try:

@@ -20,6 +20,7 @@ Verified against UnityPy 1.25.4 and TypeTreeGeneratorAPI 0.0.10 (source read, no
 
 from __future__ import annotations
 
+import importlib
 import re
 from collections.abc import Iterable, Mapping
 from typing import Any, Protocol
@@ -35,6 +36,7 @@ __all__ = [
     "EnvAdapter",
     "ExtractError",
     "UnityEnvAdapter",
+    "check_game_dependencies",
     "collect_protosets",
     "find_protosets",
     "read_bundle",
@@ -314,6 +316,30 @@ class UnityEnvAdapter:
         return next((o for o in assets_file.objects.values() if o.type.name == type_name), None)
 
 
+def check_game_dependencies() -> None:
+    """Fail fast, before any slow work, when the `game` extra is missing, too old or its native library will not load.
+
+    Raises `ExtractError` carrying the install hint. UnityPy and TypeTreeGeneratorAPI are imported lazily everywhere
+    else, so without this a missing extra would only show up after the decompile step (minutes into the run).
+    """
+    try:
+        unitypy = importlib.import_module("UnityPy")
+    except ImportError as exc:
+        raise ExtractError(f"UnityPy not installed: {INSTALL_HINT}") from exc
+    except Exception as exc:
+        raise ExtractError(f"UnityPy is installed but cannot be imported ({type(exc).__name__}: {exc})") from exc
+    _check_unitypy_version(getattr(unitypy, "__version__", ""), Report())  # raises when too old; warnings come later
+    try:
+        importlib.import_module("TypeTreeGeneratorAPI")
+    except ImportError as exc:
+        raise ExtractError(f"TypeTreeGeneratorAPI not installed: {INSTALL_HINT}") from exc
+    except Exception as exc:  # the native library failing to load: OSError, RuntimeError, ...
+        raise ExtractError(
+            f"TypeTreeGeneratorAPI is installed but cannot be loaded ({type(exc).__name__}: {exc}); "
+            f"reinstall it: {INSTALL_HINT}"
+        ) from exc
+
+
 def _check_unitypy_version(version: str, report: Report) -> None:
     match = re.match(r"(\d+)\.(\d+)", version or "")
     if not match:
@@ -507,7 +533,10 @@ def read_bundle(
                 "no descriptors or geometry",
                 item_id=item_id,
             )
-            report.set_building(item_id, {"name_key": item.get("Name"), "model_index": model_index, "status": "failed"})
+            report.set_building(
+                item_id,
+                {"name_key": item.get("Name"), "model_index": model_index, "status": "failed", "unreadable": True},
+            )
             buildings.append(RawBuilding(item_id=item_id, model_index=model_index, descs={}))
             continue
         buildings.append(read_building(adapter, model, item, report, classify=classify))

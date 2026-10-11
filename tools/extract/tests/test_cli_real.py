@@ -24,6 +24,13 @@ from dsp_extract.schema_check import validate_against_schema
 SCHEMA = REAL_REPO / "data" / "schema" / "gamedata.schema.json"
 
 
+@pytest.fixture(autouse=True)
+def synthetic_type_trees(monkeypatch):
+    """The real TypeTreeGeneratorAPI needs the game's DLLs and is replaced by SynthGenerator (see test_unity_real),
+    so the up-front check for it is skipped; UnityPy itself is real (the module-level importorskip)."""
+    monkeypatch.setattr(cli, "check_game_dependencies", lambda: None)
+
+
 def load_report(repo_root):
     return json.loads((repo_root / "local" / "extract-report.json").read_text(encoding="utf-8"))
 

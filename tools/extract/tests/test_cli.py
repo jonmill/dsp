@@ -78,6 +78,7 @@ def no_real_tools(monkeypatch, install):
     """By default: the game is `install`, ilspycmd is not installed, and the mirrored set is the small test one."""
     monkeypatch.setattr(cli, "locate_game", lambda game_dir, home, platform: install)
     monkeypatch.setattr(cli, "find_ilspycmd", lambda: None)
+    monkeypatch.setattr(cli, "check_game_dependencies", lambda: None)  # UnityPy is not needed: read_bundle is faked
     monkeypatch.setattr(cli, "MIRRORED", dict(TEST_MIRRORED))
 
 
@@ -343,9 +344,10 @@ def test_read_bundle_receives_the_decompiled_sources(repo, monkeypatch):
     assert "gameVersion" in calls[0]["decompiled"]["GameConfig"]
 
 
-def test_decompile_rotates_the_previous_run_first_and_drift_shows_the_diff(repo, monkeypatch, capsys):
+def test_decompile_rotates_the_previous_accepted_run_first_and_drift_shows_the_diff(repo, monkeypatch, capsys):
     (repo / "local" / "decompiled").mkdir(parents=True)
     (repo / "local" / "decompiled" / "CargoPath.cs").write_text(CARGO_PATH_V1, encoding="utf-8")
+    (repo / "local" / "decompiled" / ".accepted").write_text("0.10.1.1\n", encoding="utf-8")
     committed_fingerprints(repo, {"CargoPath": CARGO_PATH_V1, "StationComponent": STATION})
     patch_read_bundle(monkeypatch)
     patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V2, "StationComponent": STATION})
@@ -504,14 +506,98 @@ def test_a_corrupt_committed_fingerprints_file_is_left_alone_with_a_warning(repo
     assert any("fingerprints.json" in w for w in warnings)
 
 
-def test_fingerprints_go_next_to_the_output_when_out_is_given(repo, monkeypatch, tmp_path):
+def test_fingerprints_stay_in_the_repo_data_folder_whatever_out_is(repo, monkeypatch, tmp_path):
+    committed = committed_fingerprints(repo, {"CargoPath": CARGO_PATH_V1})
     patch_read_bundle(monkeypatch)
-    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V1})
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V2})
     other = tmp_path / "elsewhere"
     assert run("--out", str(other)) == 0
-    assert (other / f"dsp-{VERSION}.json").is_file() and (other / "fingerprints.json").is_file()
-    assert fingerprints(repo) == {}
+    assert (other / f"dsp-{VERSION}.json").is_file()
+    assert not (other / "fingerprints.json").exists()
     assert not output_file(repo).exists()
+    # the baseline was the committed repo file (so the drift was seen) and it is the file that was updated
+    assert load_report(repo)["drift"][0]["status"] == "changed"
+    expected = build_fingerprints(VERSION, {"CargoPath": CARGO_PATH_V2}, TEST_MIRRORED)["methods"]["CargoPath.Update"]
+    assert fingerprints(repo)["methods"]["CargoPath.Update"] == expected != committed["methods"]["CargoPath.Update"]
+
+
+def test_check_with_out_still_compares_against_the_repo_fingerprints(repo, monkeypatch, tmp_path):
+    committed_fingerprints(repo, {"CargoPath": CARGO_PATH_V1, "StationComponent": STATION})
+    patch_read_bundle(monkeypatch)
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V2, "StationComponent": STATION})
+    assert run("--check", "--out", str(tmp_path / "elsewhere")) == 5
+
+
+# ---- the diff baseline survives a failed run ----------------------------------------------------
+
+
+def fail_after_decompile(monkeypatch, message="RecipeProtoSet not found among 3 ProtoSet objects"):
+    def fails(install, report, *, decompiled=None, **kwargs):
+        raise ExtractError(message)
+
+    monkeypatch.setattr(cli, "read_bundle", fails)
+
+
+def test_a_failed_run_after_a_patch_does_not_lose_the_diff_baseline(repo, monkeypatch, capsys):
+    # run 1: the accepted baseline (V1 sources, fingerprints written)
+    patch_read_bundle(monkeypatch)
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V1, "StationComponent": STATION})
+    assert run() == 0
+    accepted = fingerprints(repo)
+    assert (repo / "local" / "decompiled" / ".accepted").is_file()
+
+    # run 2: the game was patched (V2), decompiled fine, but the run fails before anything is accepted
+    fail_after_decompile(monkeypatch)
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V2, "StationComponent": STATION})
+    assert run() == 3
+    assert fingerprints(repo) == accepted
+    assert (repo / "local" / "decompiled.prev" / "CargoPath.cs").read_text(encoding="utf-8") == CARGO_PATH_V1
+
+    # run 3: fixed; the diff must still be V1 against V2, not V2 against V2
+    patch_read_bundle(monkeypatch)
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V2, "StationComponent": STATION})
+    capsys.readouterr()
+    assert run() == 0
+    out = capsys.readouterr().out
+    assert "speed = 1;" in out and "speed = 2;" in out
+    (entry,) = load_report(repo)["drift"]
+    assert entry["status"] == "changed" and "speed = 1;" in entry["diff"] and "speed = 2;" in entry["diff"]
+    assert (repo / "local" / "decompiled.prev" / "CargoPath.cs").read_text(encoding="utf-8") == CARGO_PATH_V1
+
+    # run 4: V2 is accepted now, so it becomes the previous one
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V2, "StationComponent": STATION})
+    assert run() == 0
+    assert (repo / "local" / "decompiled.prev" / "CargoPath.cs").read_text(encoding="utf-8") == CARGO_PATH_V2
+    assert load_report(repo)["drift"] == []
+
+
+def test_a_failed_first_run_leaves_no_baseline_to_lose(repo, monkeypatch):
+    fail_after_decompile(monkeypatch)
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V1})
+    assert run() == 3
+    assert not (repo / "local" / "decompiled" / ".accepted").exists()
+    patch_read_bundle(monkeypatch)
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V2})
+    assert run() == 0  # no .prev, no baseline: nothing to diff, nothing to fail on
+    assert not (repo / "local" / "decompiled.prev").exists()
+
+
+def test_a_check_run_that_finds_drift_does_not_accept_it(repo, monkeypatch, capsys):
+    committed_fingerprints(repo, {"CargoPath": CARGO_PATH_V1, "StationComponent": STATION})
+    (repo / "local" / "decompiled").mkdir(parents=True)
+    (repo / "local" / "decompiled" / "CargoPath.cs").write_text(CARGO_PATH_V1, encoding="utf-8")
+    (repo / "local" / "decompiled" / ".accepted").write_text("0.10.1.1\n", encoding="utf-8")
+    patch_read_bundle(monkeypatch)
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V2, "StationComponent": STATION})
+    assert run("--check") == 5
+    assert not (repo / "local" / "decompiled" / ".accepted").exists()
+    capsys.readouterr()
+    assert run("--check") == 5  # the second look still has the V1 baseline
+    out = capsys.readouterr().out
+    assert "speed = 1;" in out and "speed = 2;" in out
+    assert run() == 0  # accepted now
+    assert (repo / "local" / "decompiled" / ".accepted").is_file()
+    assert (repo / "local" / "decompiled.prev" / "CargoPath.cs").read_text(encoding="utf-8") == CARGO_PATH_V1
 
 
 # ---- exit codes, strict, report in every outcome ----------------------------------------------
@@ -556,7 +642,7 @@ def test_buildings_whose_prefab_could_not_be_read_are_called_out(repo, monkeypat
         return make_bundle()
 
     monkeypatch.setattr(cli, "read_bundle", lossy)
-    assert run() == 0
+    assert run("--allow-partial") == 0  # 1 of 2 buildings is over the partial-data limit
     out = capsys.readouterr().out
     result = out.split("== dsp-extract result ==")[1]
     assert "1 building" in result and "could not be read" in result and "2304" in result
@@ -660,6 +746,19 @@ def test_an_unexpected_exception_is_caught_recorded_with_its_traceback_and_exits
     assert "explodes" in report["traceback"] and "KeyError" in report["traceback"]
     error = next(e for e in report["entries"] if e["level"] == "error")
     assert "KeyError" in error["message"]
+
+
+def test_when_the_report_cannot_be_written_the_traceback_goes_to_stderr(repo, monkeypatch, capsys):
+    def explodes(install, report, *, decompiled=None, **kwargs):
+        return {}["no such key"]
+
+    monkeypatch.setattr(cli, "read_bundle", explodes)
+    blocker = repo / "blocker"
+    blocker.write_text("a file, not a folder", encoding="utf-8")
+    assert run("--report", str(blocker / "report.json")) == 3
+    err = capsys.readouterr().err
+    assert "could not write the report" in err.lower()
+    assert "Traceback (most recent call last)" in err and "explodes" in err and "KeyError" in err
 
 
 def test_a_custom_report_path_is_used(repo, monkeypatch, tmp_path):
@@ -863,6 +962,155 @@ def test_inspect_with_an_unreadable_asset_set_exits_3_and_keeps_what_it_saw(repo
     assert load_report(repo)["files_loaded"][0]["error"] == "bad header"
 
 
+# ---- the game extra is checked before the slow work ------------------------------------------------
+
+
+def test_a_missing_game_extra_fails_fast_before_decompiling(repo, monkeypatch, capsys):
+    def missing():
+        raise ExtractError("UnityPy not installed: pip install 'dsp-extract[game]'")
+
+    monkeypatch.setattr(cli, "check_game_dependencies", missing)
+    decompile_calls = patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V1})
+    monkeypatch.setattr(cli, "read_bundle", lambda *a, **k: pytest.fail("read_bundle ran without UnityPy"))
+    assert run() == 3
+    assert decompile_calls == []  # nothing slow ran
+    err = capsys.readouterr().err
+    assert "UnityPy not installed" in err and "pip install" in err
+    assert any("UnityPy not installed" in e["message"] for e in load_report(repo)["entries"] if e["level"] == "error")
+    assert not output_file(repo).exists()
+
+
+def test_the_game_extra_is_checked_for_no_decompile_and_inspect_too(repo, monkeypatch):
+    calls = []
+
+    def missing():
+        calls.append(1)
+        raise ExtractError("TypeTreeGeneratorAPI not installed: pip install 'dsp-extract[game]'")
+
+    monkeypatch.setattr(cli, "check_game_dependencies", missing)
+    assert run("--no-decompile") == 3
+    assert run("inspect") == 3
+    assert len(calls) == 2
+
+
+# ---- the partial-data guard (Review Focus 1) --------------------------------------------------------
+
+
+def bundle_with_buildings(count: int) -> RawBundle:
+    bundle = make_bundle()
+    bundle.items = [bundle.items[0]] + [
+        {"id": 2300 + i, "name": f"组装机{i}", "type": "PRODUCTION", "stackSize": 50, "gridIndex": 2200 + i, "canBuild": True, "modelIndex": 5}
+        for i in range(count)
+    ]
+    bundle.locale = {"铁块": "Iron Ingot", **{f"组装机{i}": f"Assembler {i}" for i in range(count)}}
+    bundle.buildings = [assembler(2300 + i, extracted=True) for i in range(count)]
+    return bundle
+
+
+def patch_unreadable(monkeypatch, count: int, bad: set[int], *, flag: str = "status") -> None:
+    """`count` buildings; those whose index is in `bad` were recorded as unreadable (status 'failed' or the flag)."""
+    template = bundle_with_buildings(count)
+
+    def fake(install, report, *, decompiled=None, **kwargs):
+        for i in range(count):
+            record = {"name_key": f"组装机{i}", "model_index": 5, "status": "extracted", "problems": []}
+            if i in bad:
+                record["problems"] = [f"prefab 'Entities/Prefabs/b{i}' unreadable, descriptors and geometry lost: boom {i}"]
+                if flag == "status":
+                    record["status"] = "failed"
+                else:
+                    record["status"] = "partial"
+                    record["unreadable"] = True
+                report.error(f"building {2300 + i}: " + record["problems"][0], item_id=2300 + i)
+            report.set_building(2300 + i, record)
+        return copy.deepcopy(template)
+
+    monkeypatch.setattr(cli, "read_bundle", fake)
+
+
+def test_exactly_a_quarter_unreadable_is_still_written(repo, monkeypatch, capsys):
+    patch_unreadable(monkeypatch, 8, {0, 1})
+    assert run() == 0
+    assert output_file(repo).is_file()
+    assert "2 buildings could not be read" in capsys.readouterr().out
+
+
+def test_more_than_a_quarter_unreadable_exits_3_and_writes_no_game_data(repo, monkeypatch, capsys):
+    patch_unreadable(monkeypatch, 8, {0, 1, 2})
+    committed = committed_fingerprints(repo, {"CargoPath": CARGO_PATH_V1})
+    patch_decompile(monkeypatch, {"CargoPath": CARGO_PATH_V2})
+    assert run() == 3
+    assert not output_file(repo).exists()
+    assert fingerprints(repo) == committed  # nothing in the repo was touched
+    err = capsys.readouterr().err
+    assert "3 of 8 buildings" in err and "--allow-partial" in err
+    assert "Assembler 0" in err and "boom 0" in err  # which ones, and why
+    assert "No GameData was written" in err
+    assert str(repo / "local" / "extract-report.json") in err
+    report = load_report(repo)  # the report is written, with the per-building records
+    assert report["per_building_geometry"]["2300"]["status"] == "failed"
+    assert any("3 of 8 buildings" in e["message"] for e in report["entries"] if e["level"] == "error")
+    assert "output" not in report
+
+
+def test_the_failed_buildings_listing_stops_at_ten(repo, monkeypatch, capsys):
+    patch_unreadable(monkeypatch, 20, set(range(14)))
+    assert run() == 3
+    err = capsys.readouterr().err
+    assert "14 of 20 buildings" in err
+    assert "Assembler 9" in err and "Assembler 10" not in err
+    assert "4 more" in err
+
+
+def test_allow_partial_writes_the_game_data_anyway_and_says_so(repo, monkeypatch, capsys):
+    patch_unreadable(monkeypatch, 8, {0, 1, 2})
+    assert run("--allow-partial") == 0
+    assert output_file(repo).is_file()
+    out = capsys.readouterr().out
+    assert "3 buildings could not be read" in out
+    warnings = [e["message"] for e in load_report(repo)["entries"] if e["level"] == "warn"]
+    assert any("--allow-partial" in w and "3 of 8" in w for w in warnings)
+
+
+def test_buildings_that_lost_a_core_descriptor_count_even_though_the_prefab_was_found(repo, monkeypatch, capsys):
+    patch_unreadable(monkeypatch, 4, {0, 1}, flag="unreadable")
+    assert run() == 3
+    assert "2 of 4 buildings" in capsys.readouterr().err
+    assert not output_file(repo).exists()
+
+
+def test_the_guard_applies_before_a_schema_or_normalize_failure_can_hide_it(repo, monkeypatch, capsys):
+    patch_unreadable(monkeypatch, 4, {0, 1, 2})
+    assert run() == 3  # and not 4/3 for some later reason
+    assert "--allow-partial" in capsys.readouterr().err
+
+
+def test_the_guard_works_through_the_real_reader_when_a_prefab_is_missing(repo, monkeypatch, capsys):
+    env = build_game_env()
+    for obj in env.objects.values():
+        if obj.script == "ItemProtoSet":
+            obj.tree["dataArray"].append(
+                {"ID": 2011, "Name": "分拣器", "Type": 5, "StackSize": 50, "GridIndex": 1, "CanBuild": True, "ModelIndex": 41}
+            )
+        if obj.script == "ModelProtoSet":
+            obj.tree["dataArray"].append({"ID": 41, "Name": "分拣器", "PrefabPath": "Entities/Prefabs/missing"})
+    game = make_install(repo.parent)
+    monkeypatch.setattr(cli, "locate_game", lambda *a: game)
+    monkeypatch.setattr(cli, "read_bundle", lambda inst, report, **kw: unity_reader.read_bundle(inst, report, adapter=env, **kw))
+
+    assert run() == 3  # one of the two buildings has no prefab
+    err = capsys.readouterr().err
+    assert "1 of 2 buildings" in err and "2011" in err and "missing" in err
+    assert not any(p.name.startswith("dsp-") for p in (repo / "data").iterdir())
+    assert load_report(repo)["per_building_geometry"]["2011"]["unreadable"] is True
+
+
+def test_strict_still_fails_after_writing_when_partial_data_was_allowed(repo, monkeypatch):
+    patch_unreadable(monkeypatch, 8, {0})
+    assert run("--strict") == 3
+    assert output_file(repo).is_file()
+
+
 # ---- packaging --------------------------------------------------------------------------------
 
 
@@ -880,7 +1128,7 @@ def test_help_lists_the_flags_and_exit_codes(capsys):
         cli.main(["--help"])
     assert excinfo.value.code == 0
     out = capsys.readouterr().out
-    for flag in ("--game-dir", "--out", "--copy-blueprints", "--icons", "--no-decompile", "--check", "--strict", "--report"):
+    for flag in ("--game-dir", "--out", "--copy-blueprints", "--icons", "--no-decompile", "--check", "--strict", "--allow-partial", "--report"):
         assert flag in out
     for word in ("inspect", "fixture", "exit"):
         assert word in out

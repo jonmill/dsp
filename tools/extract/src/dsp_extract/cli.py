@@ -46,10 +46,11 @@ from .icons import export_icons
 from .mirrored_methods import MIRRORED
 from .normalize import NormalizeError, normalize
 from .prefab import describe_prefab
+from .raw import RawBundle
 from .report import Report
 from .schema_check import SchemaError, validate_against_schema
 from .steam import GameInstall, GameNotFoundError, locate_game
-from .unity_reader import UnityEnvAdapter, find_protosets, read_bundle
+from .unity_reader import UnityEnvAdapter, check_game_dependencies, find_protosets, read_bundle
 from .writer import dumps_json, write_atomic
 
 EXIT_OK = 0
@@ -63,7 +64,8 @@ EXIT_CODES_HELP = """\
 exit codes:
   0  GameData written (some buildings may use approximate geometry; the summary says how many)
   2  Dyson Sphere Program not found (also what argparse uses for a command line usage error)
-  3  extraction failed, no GameData written (or --strict and the report has errors)
+  3  extraction failed and no GameData written (including too many unreadable buildings, see --allow-partial);
+     also --strict with report errors, or a crash after the data was written
   4  the extracted GameData failed schema validation, nothing written
   5  --check and a mirrored game method changed or went missing
 
@@ -72,6 +74,9 @@ Every run writes local/extract-report.json (or --report PATH); send it back when
 
 SCHEMA_RELATIVE = Path("data") / "schema" / "gamedata.schema.json"
 FINGERPRINTS_FILE = "fingerprints.json"
+ACCEPTED_MARKER = ".accepted"  # in local/decompiled: that decompile's run wrote its GameData and fingerprints
+PARTIAL_LIMIT = 0.25  # more unreadable buildings than this share of all buildings: no GameData without --allow-partial
+MAX_FAILED_LISTED = 10
 MAX_DIFF_LINES = 30  # per drift entry on the terminal; the report keeps the whole diff
 MAX_APPROXIMATE_LISTED = 10
 
@@ -89,6 +94,10 @@ INSPECT_ENTRIES = 3
 
 class RepoNotFoundError(Exception):
     """The repository root (the folder holding data/schema/gamedata.schema.json) cannot be found."""
+
+
+class PartialDataError(ExtractError):
+    """Too many buildings could not be read from their prefab for the GameData to be trusted."""
 
 
 def find_repo_root(start: Path | None = None, package_file: Path | None = None) -> Path:
@@ -260,6 +269,10 @@ def _print_failure(failure: Failure, report: Report, report_path: Path | None, *
         print(report.summary(), file=err)
     print(failure.message, file=err)
     if report_path is None:
+        # Nowhere to put the diagnosis, so the terminal gets it.
+        trace = report.get("traceback")
+        if failure.unexpected and trace:
+            print(trace, file=err)
         return
     if failure.unexpected:
         print(
@@ -287,8 +300,13 @@ def _decompile(install: GameInstall, paths: RepoPaths, report: Report) -> tuple[
         )
         return {}, {}
     out_dir = paths.local / "decompiled"
-    if any(out_dir.glob("*.cs")):  # never replace the last good run with an empty folder from a failed one
+    if (out_dir / ACCEPTED_MARKER).is_file() and any(out_dir.glob("*.cs")):
+        # The last decompile was accepted (its GameData and fingerprints were written): it becomes the baseline.
         rotate_previous(out_dir)
+    elif any(out_dir.glob("*.cs")):
+        # It comes from a run that failed or was only checked, so decompiled.prev still holds the accepted baseline
+        # and must not be replaced by it (the next diff would compare the new code with itself).
+        report.info("local/decompiled is from a run that was not accepted; keeping local/decompiled.prev as the baseline")
     previous = load_sources(out_dir.with_name(out_dir.name + ".prev"))
     say(f"decompiling {len(TYPES_TO_DECOMPILE)} game types with {ilspy} (a few minutes) ...")
     try:
@@ -336,9 +354,9 @@ def _merge_fingerprints(old: dict, new: dict, sources: dict[str, str]) -> dict:
 
 
 def _plan_fingerprints(
-    bundle_version: str, sources: dict[str, str], previous: dict[str, str], out_dir: Path, report: Report
+    bundle_version: str, sources: dict[str, str], previous: dict[str, str], data_dir: Path, report: Report
 ) -> FingerprintPlan:
-    path = out_dir / FINGERPRINTS_FILE
+    path = data_dir / FINGERPRINTS_FILE
     if not sources:
         return FingerprintPlan(path, None, [], "not written (nothing was decompiled)")
     old, problem = _read_fingerprints(path)
@@ -386,6 +404,53 @@ def _drift_lines(drift: list[DriftEntry]) -> list[str]:
     return lines
 
 
+def _unreadable_buildings(report: Report) -> list[tuple[str, dict]]:
+    """`(item id, record)` of buildings whose prefab or core descriptors could not be read (written as kind 'other')."""
+    records = report.get("per_building_geometry") or {}
+    return [(i, r) for i, r in records.items() if r.get("unreadable") or r.get("status") == "failed"]
+
+
+def _building_label(item_id: str, record: dict, locale: dict[str, str]) -> str:
+    key = record.get("name_key") or "?"
+    return f"{locale.get(key, key)} ({item_id})"
+
+
+def _guard_partial_data(bundle: RawBundle, report: Report, *, allow_partial: bool) -> None:
+    """Refuse to go on when more than `PARTIAL_LIMIT` of the buildings could not be read, unless `allow_partial`."""
+    bad = _unreadable_buildings(report)
+    total = len(bundle.buildings)
+    if not bad or total == 0 or len(bad) / total <= PARTIAL_LIMIT:
+        return
+    share = f"{len(bad)} of {total} buildings ({100 * len(bad) // total}%)"
+    if allow_partial:
+        report.warn(
+            f"--allow-partial: {share} could not be read from their game prefab and are written anyway, as kind "
+            "'other' with no descriptors and approximate geometry"
+        )
+        return
+    listed = []
+    for item_id, record in bad[:MAX_FAILED_LISTED]:
+        problems = record.get("problems") or []
+        reason = f": {problems[0][:200]}" if problems else ""
+        listed.append(f"  - {_building_label(item_id, record, bundle.locale)}{reason}")
+    if len(bad) > MAX_FAILED_LISTED:
+        listed.append(f"  ... and {len(bad) - MAX_FAILED_LISTED} more (per_building_geometry in the report lists them all)")
+    raise PartialDataError(
+        f"{share} could not be read from their game prefab (the limit is {int(PARTIAL_LIMIT * 100)}%), so the "
+        "GameData would be mostly wrong:\n"
+        + "\n".join(listed)
+        + "\nFix the cause (see the report), or pass --allow-partial to write the data anyway; those buildings "
+        "would get kind 'other', no descriptors and approximate geometry."
+    )
+
+
+def _mark_accepted(paths: RepoPaths, game_version: str, report: Report) -> None:
+    try:
+        (paths.local / "decompiled" / ACCEPTED_MARKER).write_text(f"{game_version}\n", encoding="utf-8")
+    except OSError as exc:
+        report.warn(f"cannot mark local/decompiled as accepted ({exc}); the next diff may compare against this decompile")
+
+
 def _copy_blueprints(install: GameInstall, dest: Path, report: Report) -> int:
     try:
         source = install.compatdata_blueprint_dir()
@@ -420,6 +485,7 @@ def run_extract(args: argparse.Namespace, report: Report, paths: RepoPaths, repo
         },
     )
     say(f"found {install.root}")
+    check_game_dependencies()  # before the multi-minute decompile: UnityPy and TypeTreeGeneratorAPI must be there
     out_dir = Path(args.out).expanduser() if args.out else paths.data
 
     sources: dict[str, str] = {}
@@ -432,13 +498,14 @@ def run_extract(args: argparse.Namespace, report: Report, paths: RepoPaths, repo
     say("reading the Unity assets (this can take a minute) ...")
     bundle = read_bundle(install, report, decompiled=sources or None)
     report.set("game_version", bundle.game_version)
+    _guard_partial_data(bundle, report, allow_partial=args.allow_partial)
 
     values, origins = parse_constants(sources, report)
     bundle.constants.update(values)
     bundle.constant_sources.update(origins)
     report.set("code_constants", {"read_from_game_code": origins})
 
-    plan = _plan_fingerprints(bundle.game_version, sources, previous, out_dir, report)
+    plan = _plan_fingerprints(bundle.game_version, sources, previous, paths.data, report)
     _record_drift(plan.drift, report)
 
     say("normalizing and validating ...")
@@ -461,15 +528,20 @@ def run_extract(args: argparse.Namespace, report: Report, paths: RepoPaths, repo
     say(f"wrote {target}")
 
     fingerprint_note = plan.note
+    accepted = False  # the repo now holds this run's GameData and fingerprints: its decompile is the next baseline
     if plan.document is not None:
         old, _ = _read_fingerprints(plan.path)
-        if args.check:
-            fingerprint_note = "not written (--check never accepts new hashes)"
-        elif plan.document == old:
+        if plan.document == old:
             fingerprint_note = f"up to date ({len(plan.document['methods'])} methods)"
+            accepted = True
+        elif args.check:
+            fingerprint_note = "not written (--check never accepts new hashes)"
         else:
             write_atomic(plan.path, plan.document, dumps=dumps_json)
             fingerprint_note = f"written ({len(plan.document['methods'])} methods)"
+            accepted = True
+    if accepted and sources:
+        _mark_accepted(paths, bundle.game_version, report)
 
     icons_exported = None
     if args.icons:
@@ -516,9 +588,9 @@ def _finish(
         names = ", ".join(f"{b['name']} ({b['itemId']})" for b in approximate[:MAX_APPROXIMATE_LISTED])
         more = f", and {len(approximate) - MAX_APPROXIMATE_LISTED} more" if len(approximate) > MAX_APPROXIMATE_LISTED else ""
         lines.append(f"  approximate: {names}{more} (details per building in the report)")
-    failed = [(i, r) for i, r in (report.get("per_building_geometry") or {}).items() if r.get("status") == "failed"]
+    failed = _unreadable_buildings(report)
     if failed:
-        names = ", ".join(f"{r.get('name_key') or '?'} ({i})" for i, r in failed[:MAX_APPROXIMATE_LISTED])
+        names = ", ".join(_building_label(i, r, {}) for i, r in failed[:MAX_APPROXIMATE_LISTED])
         lines.append(
             f"WARNING: {plural(len(failed), 'building')} could not be read from the game prefab and "
             f"{'was' if len(failed) == 1 else 'were'} written with kind 'other', no descriptors and approximate geometry: "
@@ -600,7 +672,9 @@ def _prefab_walks(adapter: Any, items: list[dict], models: list[dict], report: R
 def run_inspect(args: argparse.Namespace, report: Report, paths: RepoPaths, report_path: Path) -> int:
     say("looking for Dyson Sphere Program ...")
     install = locate_game(args.game_dir, Path.home(), sys.platform)
-    say(f"found {install.root}; loading the Unity assets (this can take a minute) ...")
+    say(f"found {install.root}")
+    check_game_dependencies()
+    say("loading the Unity assets (this can take a minute) ...")
     adapter = open_adapter(install, report)
     found = find_protosets(adapter, report)
 
@@ -671,6 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-decompile", action="store_true", help="do not run ilspycmd (game version from the Steam build id, default code constants, fingerprints untouched)")
     parser.add_argument("--check", action="store_true", help="exit 5 if a mirrored game method changed or went missing; does not rewrite fingerprints.json")
     parser.add_argument("--strict", action="store_true", help="exit 3 after writing if the report has errors (for example buildings that fell back from a failed prefab read)")
+    parser.add_argument("--allow-partial", action="store_true", help="write the GameData even if more than 25%% of the buildings could not be read from their prefab (otherwise exit 3 and write nothing)")
     parser.add_argument("--report", type=Path, metavar="PATH", help="where to write the JSON report (default: <repo>/local/extract-report.json)")
 
     sub = parser.add_subparsers(dest="command", metavar="{inspect,fixture}")
