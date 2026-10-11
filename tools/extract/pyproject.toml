@@ -7,7 +7,9 @@ name = "dsp-extract"
 version = "0.1.0"
 description = "Extract Dyson Sphere Program game data into the DSP Factory Planner GameData JSON"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+  "jsonschema",
+]
 
 [project.scripts]
 dsp-extract = "dsp_extract.cli:main"
@@ -19,7 +21,6 @@ game = [
 ]
 dev = [
   "pytest",
-  "jsonschema",
 ]
 
 [tool.setuptools.packages.find]

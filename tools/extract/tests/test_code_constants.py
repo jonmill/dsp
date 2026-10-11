@@ -136,13 +136,67 @@ public struct Cargo
     assert values == {"incTableMilli": [0, 125, 200]}
 
 
-def test_fractional_tables_are_not_used_because_the_unit_would_be_wrong():
-    # the planner stores permille integers; a table of fractions (0.125, 1.3, ...) must not slip in as-is
-    cargo = "public static readonly double[] incTableMilli = new double[3] { 0.0, 0.125, 0.2 };"
+def test_fractional_tables_are_converted_to_permille_and_the_source_says_so():
+    # the game may store 0.125 / 1.3 as double[]; the planner stores permille integers
+    cargo = """
+public struct Cargo
+{
+	public static readonly double[] incTableMilli = new double[4] { 0.0, 0.125, 0.2, 0.225 };
+	public static readonly double[] accTableMilli = new double[3] { 0, 0.25, 1.3 };
+	public static readonly double[] powerTableRatio = new double[4] { 0, 0.3, 0.7, 1.1 };
+}
+"""
     report = Report()
-    assert parse_constants({"Cargo": cargo}, report) == ({}, {})
-    (warning,) = [w for w in report.warnings if w.startswith("Cargo.incTableMilli")]  # the other tables are "not found"
-    assert "integer" in warning and "default" in warning
+    values, sources = parse_constants({"Cargo": cargo}, report)
+    assert values == {
+        "incTableMilli": [0, 125, 200, 225],
+        "accTableMilli": [0, 250, 1300],
+        "powerTableRatio": [0, 300, 700, 1100],  # 1.1 * 1000 is 1100.0000000000002 in floating point
+    }
+    assert all(type(v) is int for table in values.values() for v in table)
+    assert sources == {
+        "incTableMilli": "decompiled:Cargo.incTableMilli (×1000)",
+        "accTableMilli": "decompiled:Cargo.accTableMilli (×1000)",
+        "powerTableRatio": "decompiled:Cargo.powerTableRatio (×1000)",
+    }
+    assert report.warnings == []
+
+
+def test_one_fraction_scales_the_whole_table_including_its_whole_numbers():
+    values, sources = parse_constants({"Cargo": "public static readonly double[] incTableMilli = { 0, 0.125, 1 };"})
+    assert values == {"incTableMilli": [0, 125, 1000]}
+    assert sources["incTableMilli"].endswith("(×1000)")
+
+
+def test_integer_tables_keep_the_plain_source_even_when_declared_as_doubles():
+    values, sources = parse_constants({"Cargo": "public static readonly double[] incTableMilli = { 0.0, 125.0, 200.0 };"})
+    assert values == {"incTableMilli": [0, 125, 200]}
+    assert sources == {"incTableMilli": "decompiled:Cargo.incTableMilli"}
+
+
+def test_fractions_that_are_not_exact_permille_are_rounded_with_a_warning():
+    report = Report()
+    values, sources = parse_constants({"Cargo": "public static readonly double[] incTableMilli = { 0, 0.1255 };"}, report)
+    assert values == {"incTableMilli": [0, 126]}
+    assert sources == {"incTableMilli": "decompiled:Cargo.incTableMilli (×1000)"}
+    (warning,) = [w for w in report.warnings if w.startswith("Cargo.incTableMilli")]
+    assert "rounded" in warning and "permille" in warning
+
+
+def test_fractions_in_the_static_constructor_form_are_converted_too():
+    cargo = """
+public struct Cargo
+{
+	public static double[] incTableMilli;
+	static Cargo()
+	{
+		incTableMilli = new double[3] { 0.0, 0.125, 0.2 };
+	}
+}
+"""
+    values, sources = parse_constants({"Cargo": cargo})
+    assert values == {"incTableMilli": [0, 125, 200]}
+    assert sources == {"incTableMilli": "decompiled:Cargo.incTableMilli (×1000)"}
 
 
 def test_unparseable_and_inconsistent_definitions_warn_and_stay_absent():

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
-from pathlib import Path
 from typing import Any, Protocol
 
 from .errors import ExtractError
@@ -32,7 +31,15 @@ from .raw import RawBuilding, RawBundle
 from .report import Report
 from .steam import GameInstall
 
-__all__ = ["EnvAdapter", "ExtractError", "UnityEnvAdapter", "collect_protosets", "read_bundle", "read_game_version"]
+__all__ = [
+    "EnvAdapter",
+    "ExtractError",
+    "UnityEnvAdapter",
+    "collect_protosets",
+    "find_protosets",
+    "read_bundle",
+    "read_game_version",
+]
 
 INSTALL_HINT = "pip install 'dsp-extract[game]'"
 MIN_UNITYPY = (1, 25)
@@ -390,11 +397,8 @@ def _check_protoset(class_name: str, tree: Mapping) -> list[dict]:
     return entries
 
 
-def collect_protosets(adapter: EnvAdapter, report: Report) -> dict[str, dict]:
-    """The Item/Recipe/Tech/Model ProtoSet trees by MonoScript class name, validated.
-
-    Every `*ProtoSet` found is listed in the report's `protosets_found`; only the wanted four are read.
-    """
+def _scan_protosets(adapter: EnvAdapter, report: Report) -> tuple[dict[str, list[Any]], int, int]:
+    """`(found, scanned, unresolved)`: the `*ProtoSet` MonoBehaviours by script class, and how many scripts failed."""
     found: dict[str, list[Any]] = {}
     scanned = unresolved = 0
     first_error = ""
@@ -413,6 +417,20 @@ def collect_protosets(adapter: EnvAdapter, report: Report) -> dict[str, dict]:
             f"{unresolved} MonoBehaviour objects (of {scanned}) have a script that could not be resolved, "
             f"first: {first_error}"
         )
+    return found, scanned, unresolved
+
+
+def find_protosets(adapter: EnvAdapter, report: Report) -> dict[str, list[Any]]:
+    """Every `*ProtoSet` MonoBehaviour by MonoScript class name (the `inspect` command lists them all)."""
+    return _scan_protosets(adapter, report)[0]
+
+
+def collect_protosets(adapter: EnvAdapter, report: Report) -> dict[str, dict]:
+    """The Item/Recipe/Tech/Model ProtoSet trees by MonoScript class name, validated.
+
+    Every `*ProtoSet` found is listed in the report's `protosets_found`; only the wanted four are read.
+    """
+    found, scanned, unresolved = _scan_protosets(adapter, report)
 
     listing = {name: {"count": len(objs), "read": False} for name, objs in sorted(found.items())}
     report.set("protosets_found", listing)
@@ -469,6 +487,13 @@ def read_bundle(
     trees = collect_protosets(adapter, report)
     items = trees["ItemProtoSet"]["dataArray"]
     models = {int(m["ID"]): m for m in trees["ModelProtoSet"]["dataArray"]}
+
+    # Every building's prefab is found through the container; if it cannot be read, say so once instead of
+    # reporting the same failure for each of the ~100 buildings.
+    try:
+        adapter.container()
+    except Exception as exc:
+        raise ExtractError(f"cannot read the ResourceManager container, so no building prefab can be found: {exc}") from exc
 
     buildings: list[RawBuilding] = []
     for item in sorted(items, key=lambda i: int(i["ID"])):

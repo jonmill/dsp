@@ -337,6 +337,63 @@ def test_read_bundle_passes_the_collider_classifier_through(tmp_path):
     assert seen == ["body"]
 
 
+class ContainerCountingEnv(FakeEnv):
+    """A FakeEnv that counts container() calls and can fail them."""
+
+    def __init__(self, *args, fail: Exception | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fail = fail
+        self.container_calls = 0
+
+    def container(self):
+        self.container_calls += 1
+        if self.fail is not None:
+            raise self.fail
+        return super().container()
+
+
+def counting_env(**kwargs) -> ContainerCountingEnv:
+    base = build_game_env()
+    env = ContainerCountingEnv(**kwargs)
+    env.objects, env.container_map, env._next = base.objects, base.container_map, base._next
+    return env
+
+
+def test_read_bundle_reads_the_container_once_up_front_and_fails_fast(tmp_path):
+    env = counting_env(fail=ExtractError("no ResourceManager object in globalgamemanagers (needed to find prefabs)"))
+    report = Report()
+    with pytest.raises(ExtractError, match="ResourceManager") as excinfo:
+        read_bundle(make_install(tmp_path), report, adapter=env)
+    assert "container" in str(excinfo.value).lower() or "prefab" in str(excinfo.value).lower()
+    assert env.container_calls == 1  # not once per building
+    assert report.errors == []  # one fatal error, not one report error per building
+
+
+def test_read_bundle_wraps_an_unexpected_container_failure_in_one_extract_error(tmp_path):
+    env = counting_env(fail=KeyError("first"))
+    with pytest.raises(ExtractError, match="container") as excinfo:
+        read_bundle(make_install(tmp_path), Report(), adapter=env)
+    assert isinstance(excinfo.value.__cause__, KeyError)
+    assert env.container_calls == 1
+
+
+def test_read_bundle_checks_the_container_even_when_it_is_fine(tmp_path):
+    env = counting_env()
+    bundle = read_bundle(make_install(tmp_path), Report(), adapter=env)
+    assert env.container_calls >= 1
+    assert bundle.buildings[0].colliders is not None
+
+
+def test_find_protosets_lists_every_protoset_class_with_its_objects():
+    from dsp_extract.unity_reader import find_protosets
+
+    env = build_game_env()
+    report = Report()
+    found = find_protosets(env, report)
+    assert sorted(found) == ["ItemProtoSet", "ModelProtoSet", "RecipeProtoSet", "SignalProtoSet", "TechProtoSet"]
+    assert all(len(objs) == 1 for objs in found.values())
+
+
 def test_read_bundle_requires_the_locale_folder(tmp_path):
     with pytest.raises(ExtractError, match="Locale"):
         read_bundle(make_install(tmp_path, locale=False), Report(), adapter=build_game_env())

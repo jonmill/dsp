@@ -247,6 +247,109 @@ def test_bad_game_dir_never_falls_back_to_steam(home, tmp_path):
         steam.locate_game(empty, home, "linux")
 
 
+def test_game_dir_dot_from_inside_the_data_folder_is_resolved(tmp_path, home, monkeypatch):
+    custom = make_game(tmp_path / "custom", installdir="DSP")
+    monkeypatch.chdir(custom / "DSPGAME_Data")
+
+    install = steam.locate_game(Path("."), home, "linux")
+
+    assert install.root == custom
+    assert install.data_dir == custom / "DSPGAME_Data"
+    assert install.root.is_absolute()
+
+
+def test_relative_game_dir_is_resolved_against_the_cwd(tmp_path, home, monkeypatch):
+    custom = make_game(tmp_path / "custom", installdir="DSP")
+    monkeypatch.chdir(custom.parent)
+
+    assert steam.locate_game(Path("DSP"), home, "linux").root == custom
+    assert steam.locate_game(Path("../common/DSP/../DSP"), home, "linux").root == custom
+
+
+def test_game_dir_expands_the_user_home(tmp_path, home, monkeypatch):
+    games = home / "games"
+    custom = make_game(games, installdir="DSP")
+    monkeypatch.setenv("HOME", str(home))
+
+    assert steam.locate_game(Path("~/games/steamapps/common/DSP"), home, "linux").root == custom
+
+
+def test_game_dir_through_a_symlink_is_resolved(tmp_path, home):
+    real = make_game(tmp_path / "real", installdir="DSP")
+    link = tmp_path / "link"
+    link.symlink_to(real)
+
+    assert steam.locate_game(link, home, "linux").root == real
+
+
+def test_game_dir_inside_a_steam_library_reads_the_build_id_and_library(tmp_path, home):
+    library = tmp_path / "SteamLibrary"
+    root = install_dsp(library, build_id="99887766")
+    blueprints = library / "steamapps" / BLUEPRINT_SUBPATH
+    blueprints.mkdir(parents=True)
+
+    install = steam.locate_game(root, home, "linux")
+
+    assert install.root == root
+    assert install.build_id == "99887766"
+    assert install.library == library
+    assert install.compatdata_blueprint_dir() == blueprints
+
+
+def test_game_dir_pointing_at_the_data_folder_inside_a_library_also_finds_the_library(tmp_path, home):
+    library = tmp_path / "SteamLibrary"
+    root = install_dsp(library)
+
+    install = steam.locate_game(root / "DSPGAME_Data", home, "linux")
+
+    assert install.root == root
+    assert install.build_id == BUILD_ID
+    assert install.library == library
+
+
+def test_game_dir_dot_inside_a_library_finds_the_library_too(tmp_path, home, monkeypatch):
+    library = tmp_path / "SteamLibrary"
+    root = install_dsp(library)
+    monkeypatch.chdir(root / "DSPGAME_Data")
+
+    install = steam.locate_game(Path("."), home, "linux")
+
+    assert install.library == library and install.build_id == BUILD_ID
+
+
+def test_game_dir_in_a_library_with_an_unreadable_manifest_still_works_without_a_build_id(tmp_path, home):
+    library = tmp_path / "SteamLibrary"
+    root = make_game(library)
+    (library / "steamapps" / f"appmanifest_{DSP_APP_ID}.acf").write_text('"AppState" {', encoding="utf-8")
+
+    install = steam.locate_game(root, home, "linux")
+
+    assert install.root == root
+    assert install.build_id is None
+    assert install.library == library
+
+
+def test_game_dir_in_a_library_whose_manifest_has_no_buildid(tmp_path, home):
+    library = tmp_path / "SteamLibrary"
+    root = make_game(library)
+    (library / "steamapps" / f"appmanifest_{DSP_APP_ID}.acf").write_text(
+        '"AppState"\n{\n\t"installdir"\t\t"Dyson Sphere Program"\n}\n', encoding="utf-8"
+    )
+
+    install = steam.locate_game(root, home, "linux")
+
+    assert install.build_id is None and install.library == library
+
+
+def test_game_dir_outside_a_library_has_no_library_or_build_id(tmp_path, home):
+    root = tmp_path / "somewhere" / "DSP"
+    (root / "DSPGAME_Data" / "Managed").mkdir(parents=True)
+
+    install = steam.locate_game(root, home, "linux")
+
+    assert install.library is None and install.build_id is None
+
+
 # --- locate_game: failures ----------------------------------------------------------------
 
 

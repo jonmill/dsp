@@ -1,6 +1,6 @@
 """Decompile selected game types with ilspycmd, fingerprint the methods the TS code mirrors, and report drift.
 
-Flow (Task 7 wires it into the CLI):
+Flow (`cli.run_extract` runs it):
   1. `find_ilspycmd` / `decompile_types` write `local/decompiled/<Type>.cs`; `rotate_previous` first moves the
      last run to `local/decompiled.prev/` so `drift_report` can show a diff.
   2. `build_fingerprints` hashes each method of `mirrored_methods.MIRRORED` (`extract_method` +
@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -82,9 +83,21 @@ TYPES_TO_DECOMPILE: list[str] = [
 _TYPE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_.`+]*\Z")  # `Outer+Inner`, `ProtoSet`1`; nothing path-like
 
 
-def find_ilspycmd() -> str | None:
-    """The `ilspycmd` executable on PATH, or None (`dotnet tool install -g ilspycmd` puts it in ~/.dotnet/tools)."""
-    return shutil.which("ilspycmd")
+def find_ilspycmd(home: Path | None = None) -> str | None:
+    """The `ilspycmd` executable: on PATH, else in `~/.dotnet/tools`, else None.
+
+    `dotnet tool install -g ilspycmd` puts it in `~/.dotnet/tools`, which is only on PATH after the dotnet
+    profile script has run (often not in a fresh shell), so that folder is checked explicitly. `home` is for tests.
+    """
+    found = shutil.which("ilspycmd")
+    if found:
+        return found
+    tools = (Path.home() if home is None else Path(home)) / ".dotnet" / "tools"
+    for name in ("ilspycmd", "ilspycmd.exe"):
+        candidate = tools / name
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
 
 
 def _first_line(*streams: bytes | str | None) -> str:

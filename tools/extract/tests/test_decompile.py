@@ -496,18 +496,56 @@ def test_every_mirrored_type_is_decompiled_and_the_list_has_what_the_readers_nee
 # ---- find_ilspycmd ----------------------------------------------------------------------------------
 
 
-def test_find_ilspycmd_is_none_when_path_is_empty(monkeypatch):
+def make_executable(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def test_find_ilspycmd_is_none_when_path_is_empty(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", "")
-    assert find_ilspycmd() is None
+    assert find_ilspycmd(home=tmp_path) is None
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable bit")
 def test_find_ilspycmd_returns_the_executable_on_path(tmp_path, monkeypatch):
-    exe = tmp_path / "ilspycmd"
-    exe.write_text("#!/bin/sh\nexit 0\n")
-    exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
-    monkeypatch.setenv("PATH", str(tmp_path))
-    assert find_ilspycmd() == str(exe)
+    exe = make_executable(tmp_path / "bin" / "ilspycmd")
+    monkeypatch.setenv("PATH", str(exe.parent))
+    assert find_ilspycmd(home=tmp_path / "home") == str(exe)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable bit")
+def test_find_ilspycmd_falls_back_to_the_dotnet_tools_folder(tmp_path, monkeypatch):
+    # `dotnet tool install -g` puts it in ~/.dotnet/tools, which a fresh shell often does not have on PATH
+    monkeypatch.setenv("PATH", "")
+    exe = make_executable(tmp_path / ".dotnet" / "tools" / "ilspycmd")
+    assert find_ilspycmd(home=tmp_path) == str(exe)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable bit")
+def test_find_ilspycmd_prefers_path_over_the_dotnet_tools_folder(tmp_path, monkeypatch):
+    on_path = make_executable(tmp_path / "bin" / "ilspycmd")
+    make_executable(tmp_path / ".dotnet" / "tools" / "ilspycmd")
+    monkeypatch.setenv("PATH", str(on_path.parent))
+    assert find_ilspycmd(home=tmp_path) == str(on_path)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX executable bit")
+def test_find_ilspycmd_ignores_a_dotnet_tools_file_that_is_not_executable(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    plain = tmp_path / ".dotnet" / "tools" / "ilspycmd"
+    plain.parent.mkdir(parents=True)
+    plain.write_text("not executable")
+    plain.chmod(0o644)
+    assert find_ilspycmd(home=tmp_path) is None
+
+
+def test_find_ilspycmd_uses_the_real_home_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    assert find_ilspycmd() is None
 
 
 # ---- decompile_types (against a fake ilspycmd) --------------------------------------------------------

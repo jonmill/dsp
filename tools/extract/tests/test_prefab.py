@@ -515,3 +515,162 @@ def test_ambiguous_suffix_match_is_not_guessed():
     report = Report()
     raw = read_building(env, MODEL, ITEM, report)
     assert raw.descs == {} and "2 suffix matches" in report.errors[0]
+
+
+# ---- Task 5 follow-ups ------------------------------------------------------------------------
+
+ROLL_90 = (0.0, 0.0, H, H)  # +90 degrees about +z: x -> y, y -> -x
+ROLL_45 = (0.0, 0.0, math.sin(math.radians(22.5)), math.cos(math.radians(22.5)))
+
+
+def test_compose_derives_lossy_scale_from_the_full_matrix_for_a_non_uniform_ancestor():
+    # world matrix = diag(1, 2, 1) * Rz90, whose columns have lengths (2, 1, 1): the child's x axis is stretched
+    parent = Pose(scale=(1, 2, 1))
+    child = compose(parent, Pose(rotation=ROLL_90))
+    assert child.scale == approx((2, 1, 1))
+    assert child.rotation == approx(ROLL_90)
+    assert not child.sheared
+    # a grandchild one unit along the child's x axis sits two units up in the world
+    grandchild = compose(child, Pose(position=(1, 0, 0)))
+    assert grandchild.position == approx((0, 2, 0))
+
+
+def test_compose_flags_a_sheared_transform():
+    # a 45 degree child under a (1, 2, 1) ancestor is sheared: no rotation and scale reproduce its matrix
+    child = compose(Pose(scale=(1, 2, 1)), Pose(rotation=ROLL_45))
+    assert child.sheared
+    assert not compose(Pose(scale=(2, 2, 2)), Pose(rotation=ROLL_45)).sheared  # uniform parent: still a similarity
+    assert not compose(Pose(scale=(1, 2, 1)), Pose(rotation=YAW_90)).sheared  # axis-aligned turn about the stretched axis
+
+
+def test_collider_extents_use_the_lossy_scale_of_a_rotated_child_under_a_non_uniform_ancestor():
+    env = FakeEnv()
+    b = PrefabBuilder(env)
+    root = b.game_object("root", scale=(1, 2, 1))
+    child = b.game_object("body", root, rot=ROLL_90, pos=(0, 0, 0))
+    b.box(child, size=(1, 1, 1))
+    b.publish(root, "Entities/Prefabs/Assembler-MK-1")
+    report = Report()
+    raw = read_building(env, MODEL, ITEM, report)
+    box = raw.colliders[0]
+    assert box["halfExtents"] == approx([1, 0.5, 0.5])  # local x is the stretched axis
+    assert box["rotation"] == approx(ROLL_90)
+    assert not any("shear" in w for w in report.warnings)
+
+
+def test_slot_pose_position_under_a_non_uniform_rotated_ancestor_uses_the_full_matrix():
+    env = FakeEnv()
+    b = PrefabBuilder(env)
+    root = b.game_object("root", scale=(1, 2, 1))
+    mid = b.game_object("mid", root, rot=ROLL_90)
+    slot = b.game_object("slot", mid, pos=(1, 0, 0))
+    b.box(mid, size=(1, 1, 1))
+    b.mono(root, "SlotConfig", slotPoses=[slot.transform], insertPoses=[])
+    b.publish(root, "Entities/Prefabs/Assembler-MK-1")
+    raw = read_building(env, MODEL, ITEM, Report())
+    assert raw.port_poses[0]["position"] == approx([0, 2, 0])
+
+
+def test_a_collider_under_a_sheared_transform_is_extracted_with_a_warning():
+    env = FakeEnv()
+    b = PrefabBuilder(env)
+    root = b.game_object("root", scale=(1, 2, 1))
+    child = b.game_object("body", root, rot=ROLL_45)
+    b.box(child, size=(1, 1, 1))
+    b.publish(root, "Entities/Prefabs/Assembler-MK-1")
+    report = Report()
+    raw = read_building(env, MODEL, ITEM, report)
+    assert raw.colliders is not None and len(raw.colliders) == 1
+    (warning,) = [w for w in report.warnings if "shear" in w]
+    assert "root/body" in warning
+    assert report.sections["per_building_geometry"]["2303"]["sheared_colliders"] == ["root/body"]
+
+
+def test_collider_details_carry_center_and_half_extents():
+    env, _, _ = build_assembler()
+    report = Report()
+    read_building(env, MODEL, ITEM, report)
+    (detail,) = report.sections["per_building_geometry"]["2303"]["collider_details"]
+    assert detail["center"] == approx([0, 2, 0])
+    assert detail["halfExtents"] == approx([1, 2, 3])
+    assert detail["path"] == "assembler-mk-1/body" and detail["shape"] == "box"
+
+
+# ---- the guessed separate collider prefab can be wrong ----------------------------------------
+
+
+def _with_guessed_collider_prefab(entry):
+    """The assembler plus a container key `find_collider_prefab` will guess; `entry(env)` makes its container value."""
+    env, b, root = build_assembler()
+    env.container_map["entities/colliders/assembler-mk-1"] = entry(env)
+    return env
+
+
+@pytest.mark.parametrize(
+    "entry, reason",
+    [
+        (lambda env: NULL, "null reference"),
+        (lambda env: env.add("Transform", {"m_Children": []}), "expected a GameObject"),
+        (lambda env: env.add("GameObject", {"m_Name": "broken", "m_Layer": 0, "m_IsActive": True, "m_Component": []}), "no Transform"),
+    ],
+    ids=["null", "not-a-gameobject", "unwalkable"],
+)
+def test_unusable_guessed_collider_prefab_falls_back_to_the_main_prefab(entry, reason):
+    env = _with_guessed_collider_prefab(entry)
+    report = Report()
+    raw = read_building(env, MODEL, ITEM, report)
+    assert raw.colliders is not None and len(raw.colliders) == 1
+    assert raw.colliders[0]["halfExtents"] == approx([1, 2, 3])  # the main prefab's body collider
+    record = report.sections["per_building_geometry"]["2303"]
+    assert record["collider_source"] == "prefab"
+    assert record["status"] == "extracted"
+    (warning,) = [w for w in report.warnings if "entities/colliders/assembler-mk-1" in w]
+    assert reason in warning and "main prefab" in warning
+    assert not report.errors
+
+
+def test_a_usable_guessed_collider_prefab_is_still_preferred():
+    env, b, root = build_assembler()
+    col_root = b.game_object("assembler-mk-1-collider")
+    b.box(col_root, size=(2, 2, 2))
+    b.publish(col_root, "Entities/Colliders/assembler-mk-1")
+    report = Report()
+    raw = read_building(env, MODEL, ITEM, report)
+    assert raw.colliders[0]["halfExtents"] == approx([1, 1, 1])
+    assert report.sections["per_building_geometry"]["2303"]["collider_source"] == "entities/colliders/assembler-mk-1"
+    assert report.warnings == []
+
+
+# ---- container misses -------------------------------------------------------------------------
+
+
+def test_a_container_miss_without_similar_keys_puts_a_key_sample_in_the_report():
+    env = FakeEnv()
+    for i in range(100):
+        env.container_map[f"misc/folder/thing-{i:03d}"] = ptr(1)
+    report = Report()
+    read_building(env, MODEL, ITEM, report)
+    sample = report.sections["container_sample"]
+    assert 15 <= len(sample) <= 20 and len(set(sample)) == len(sample)
+    assert set(sample) <= set(env.container_map)
+    assert "container_sample" in report.errors[0]
+
+
+def test_a_container_miss_with_similar_keys_names_them_and_adds_no_sample():
+    env = FakeEnv()
+    env.container_map["other/dir/assembler-mk-1"] = ptr(1)
+    report = Report()
+    read_building(env, MODEL, ITEM, report)
+    assert "other/dir/assembler-mk-1" in report.errors[0]
+    assert "container_sample" not in report.sections
+
+
+def test_the_container_sample_is_kept_from_the_first_miss_only():
+    env = FakeEnv()
+    env.container_map["a/b/c"] = ptr(1)
+    report = Report()
+    read_building(env, MODEL, ITEM, report)
+    first = list(report.sections["container_sample"])
+    env.container_map["z/y/x"] = ptr(2)
+    read_building(env, MODEL, {**ITEM, "ID": 2304}, report)
+    assert report.sections["container_sample"] == first

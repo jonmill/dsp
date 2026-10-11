@@ -19,17 +19,21 @@ prefab GameObject. This module re-reads the same components from the serialized 
      the report together with the decision.
   6. The collider source is the prefab itself unless the container holds exactly one sibling
      "collider" prefab for the model (research gap 2: `ModelProto.ColliderPath` is not decompiled
-     yet). The choice is recorded per building.
+     yet). That name match is a guess: a guessed prefab that is a null reference, not a GameObject or
+     cannot be walked is reported and the main prefab's colliders are used instead. The choice is
+     recorded per building.
 
 Any failure sets only the affected part to None (the normalizer then uses approximate geometry for
 it) and adds a report entry. Nothing here raises for a single building.
 
-Transform maths (Unity, left-handed, quaternions as (x, y, z, w)):
-  world.position = parent.position + parent.rotation * (parent.scale * local.position)
-  world.rotation = parent.rotation * local.rotation
-  world.scale    = parent.scale * local.scale        (component-wise "lossy" scale)
-The component-wise scale ignores the shear Unity's lossyScale would also drop; prefab hierarchies
-here only scale along rotated axes in the trivial case, so this is exact for them.
+Transform maths (Unity, left-handed, quaternions as (x, y, z, w)). Each Transform's world linear part is the
+3x3 matrix `parent.linear * R(local.rotation) * diag(local.scale)`, so
+  world.position = parent.position + parent.linear * local.position
+  world.rotation = parent.rotation * local.rotation                    (quaternion product, as Unity)
+  world.scale    = column lengths of world.linear                      (Unity's `lossyScale`)
+This is exact for positions. `lossyScale` is only a faithful description of the matrix when no rotated child sits
+under a non-uniformly scaled ancestor at a non-right angle; such a "sheared" Transform is flagged (`Pose.sheared`) and
+reported for the colliders that sit on it, whose extents are then approximate (Unity itself approximates them the same way).
 """
 
 from __future__ import annotations
@@ -119,11 +123,74 @@ def quat_rotate(q: Quat, v: Vec3) -> Vec3:
     return (v[0] + w * t[0] + c[0], v[1] + w * t[1] + c[1], v[2] + w * t[2] + c[2])
 
 
+Mat3 = tuple[Vec3, Vec3, Vec3]  # rows
+
+SHEAR_COSINE = 1e-4  # world axes closer to perpendicular than this count as perpendicular
+
+
+def _rotation_matrix(q: Quat) -> Mat3:
+    x, y, z, w = q
+    return (
+        (1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)),
+        (2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)),
+        (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)),
+    )
+
+
+def _trs_matrix(rotation: Quat, scale: Vec3) -> Mat3:
+    """`R(rotation) * diag(scale)`: the rotation matrix with its columns scaled."""
+    r = _rotation_matrix(rotation)
+    return tuple((row[0] * scale[0], row[1] * scale[1], row[2] * scale[2]) for row in r)  # type: ignore[return-value]
+
+
+def _mat_mul(a: Mat3, b: Mat3) -> Mat3:
+    return tuple(  # type: ignore[return-value]
+        tuple(sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)) for i in range(3)
+    )
+
+
+def _mat_vec(m: Mat3, v: Vec3) -> Vec3:
+    return (
+        m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+        m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+        m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+    )
+
+
+def _columns(m: Mat3) -> list[Vec3]:
+    return [(m[0][j], m[1][j], m[2][j]) for j in range(3)]
+
+
+def _norm(v: Vec3) -> float:
+    return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+
+
+def _is_sheared(m: Mat3) -> bool:
+    cols = _columns(m)
+    for i, j in ((0, 1), (0, 2), (1, 2)):
+        lengths = _norm(cols[i]) * _norm(cols[j])
+        dot = sum(a * b for a, b in zip(cols[i], cols[j], strict=True))
+        if lengths > 1e-12 and abs(dot) > SHEAR_COSINE * lengths:
+            return True
+    return False
+
+
 @dataclass(frozen=True)
 class Pose:
+    """A world pose. `scale` is Unity's lossyScale; `linear` is the true world rotation*scale matrix.
+
+    A hand-built Pose leaves `linear` as None and means `R(rotation) * diag(scale)`; `compose` always fills it.
+    """
+
     position: Vec3 = (0.0, 0.0, 0.0)
     rotation: Quat = IDENTITY_ROTATION
     scale: Vec3 = UNIT_SCALE
+    linear: Mat3 | None = None
+    sheared: bool = False
+
+    @property
+    def matrix(self) -> Mat3:
+        return self.linear if self.linear is not None else _trs_matrix(self.rotation, self.scale)
 
 
 IDENTITY_POSE = Pose()
@@ -131,16 +198,16 @@ IDENTITY_POSE = Pose()
 
 def compose(parent: Pose, local: Pose) -> Pose:
     """The world pose of a Transform with `local` pose under a parent whose world pose is `parent`."""
-    scaled = (
-        parent.scale[0] * local.position[0],
-        parent.scale[1] * local.position[1],
-        parent.scale[2] * local.position[2],
-    )
-    offset = quat_rotate(parent.rotation, scaled)
+    parent_matrix = parent.matrix
+    matrix = _mat_mul(parent_matrix, _trs_matrix(local.rotation, local.scale))
+    offset = _mat_vec(parent_matrix, local.position)
+    lengths = tuple(_norm(col) for col in _columns(matrix))
     return Pose(
         position=(parent.position[0] + offset[0], parent.position[1] + offset[1], parent.position[2] + offset[2]),
         rotation=quat_normalize(quat_mul(parent.rotation, local.rotation)),
-        scale=(parent.scale[0] * local.scale[0], parent.scale[1] * local.scale[1], parent.scale[2] * local.scale[2]),
+        scale=lengths,  # type: ignore[arg-type]
+        linear=matrix,
+        sheared=_is_sheared(matrix),
     )
 
 
@@ -280,8 +347,31 @@ def _normalise_path(path: str) -> str:
     return path.strip().replace("\\", "/").strip("/").lower()
 
 
+SAMPLE_KEYS = 20
+
+
+class ContainerMissError(PrefabError):
+    """A Resources path is not in the container and no key looks like it; `sample` is a spread of the real keys."""
+
+    def __init__(self, message: str, sample: list[str]) -> None:
+        super().__init__(message)
+        self.sample = sample
+
+
+def _sample_keys(container: Mapping[str, Any], count: int = SAMPLE_KEYS) -> list[str]:
+    """`count` keys spread evenly over the sorted container keys (all of them when there are fewer)."""
+    keys = sorted(container)
+    if len(keys) <= count:
+        return keys
+    return [keys[i * len(keys) // count] for i in range(count)]
+
+
 def lookup_container(container: Mapping[str, Any], path: str) -> tuple[str, Any]:
-    """`(key, pptr)` for a Resources path: exact lowercase match, else a unique `.../<path>` suffix match."""
+    """`(key, pptr)` for a Resources path: exact lowercase match, else a unique `.../<path>` suffix match.
+
+    A miss raises `PrefabError` naming similar keys; when there are none it raises `ContainerMissError`, whose
+    `sample` is a spread of the real container keys (so the report shows what the paths look like).
+    """
     key = _normalise_path(path)
     if not key:
         raise PrefabError("empty prefab path")
@@ -292,9 +382,14 @@ def lookup_container(container: Mapping[str, Any], path: str) -> tuple[str, Any]
         return suffix[0], container[suffix[0]]
     base = _basename(key)
     similar = [k for k in container if _basename(k) == base][:5] or [k for k in container if base in k][:5]
-    hint = f"; similar container keys: {similar}" if similar else ""
     ambiguous = f" ({len(suffix)} suffix matches: {suffix[:5]})" if len(suffix) > 1 else ""
-    raise PrefabError(f"{path!r} is not in the ResourceManager container{ambiguous}{hint} ({len(container)} keys)")
+    message = f"{path!r} is not in the ResourceManager container{ambiguous}"
+    if similar:
+        raise PrefabError(f"{message}; similar container keys: {similar} ({len(container)} keys)")
+    raise ContainerMissError(
+        f"{message}; no similar container keys ({len(container)} keys, a sample is in container_sample in the report)",
+        _sample_keys(container),
+    )
 
 
 def _collider_stem(segment: str) -> str:
@@ -359,12 +454,7 @@ def _scaled_abs(scale: Vec3, i: int) -> float:
 def _collider_geometry(shape: str, tree: Mapping, pose: Pose, what: str) -> tuple[Vec3, Vec3]:
     """`(world center, half extents)` of a Unity collider on a Transform with world `pose`."""
     center = _vector(tree, "m_Center", 3, what)
-    local_center = (
-        pose.scale[0] * center[0],
-        pose.scale[1] * center[1],
-        pose.scale[2] * center[2],
-    )
-    offset = quat_rotate(pose.rotation, local_center)  # type: ignore[arg-type]
+    offset = _mat_vec(pose.matrix, center)  # type: ignore[arg-type]
     world_center: Vec3 = (
         pose.position[0] + offset[0],
         pose.position[1] + offset[1],
@@ -470,6 +560,9 @@ def read_building(
             raise PrefabError(f"container entry {key!r} is a {adapter.type_name(root)}, expected a GameObject")
         nodes = walk_hierarchy(adapter, root)
     except Exception as exc:  # one building must never abort the extraction
+        sample = getattr(exc, "sample", None)
+        if sample and report.get("container_sample") is None:
+            report.set("container_sample", sample)
         problem("error", f"prefab {prefab_path!r} unreadable, descriptors and geometry lost: {exc}")
         return raw
 
@@ -563,6 +656,16 @@ def _read_slot_config(
     return results["slotPoses"], results["insertPoses"]
 
 
+def _walk_collider_prefab(adapter: EnvAdapter, container: Mapping[str, Any], key: str) -> list[GoNode]:
+    root = adapter.deref(container[key])
+    if root is None:
+        raise PrefabError("it is a null reference")
+    type_name = adapter.type_name(root)
+    if type_name != "GameObject":
+        raise PrefabError(f"it is a {type_name}, expected a GameObject")
+    return walk_hierarchy(adapter, root)
+
+
 def _read_colliders(
     adapter: EnvAdapter,
     nodes: list[GoNode],
@@ -579,17 +682,20 @@ def _read_colliders(
     try:
         separate = find_collider_prefab(container, prefab_key)
         if separate is not None:
-            source = separate
-            root = adapter.deref(container[separate])
-            if root is None:
-                raise PrefabError(f"collider prefab {separate!r} is a null reference")
-            collider_nodes = walk_hierarchy(adapter, root)
+            # The name match is a guess (research gap 2), so a prefab that cannot be used is not fatal.
+            try:
+                collider_nodes = _walk_collider_prefab(adapter, container, separate)
+                source = separate
+            except Exception as exc:
+                record["collider_prefab_unusable"] = {"key": separate, "reason": str(exc)}
+                problem("warn", f"guessed collider prefab {separate!r} is unusable ({exc}); using the colliders of the main prefab")
         record["collider_source"] = source
 
         layer_names = adapter.layer_names()
         colliders: list[dict] = []
         details: list[dict] = []
         ignored: dict[str, int] = {}
+        sheared: list[str] = []
         for node in collider_nodes:
             for type_name, obj in node.components:
                 shape = COLLIDER_SHAPES.get(type_name)
@@ -603,6 +709,8 @@ def _read_colliders(
                     raise PrefabError(f"{what}: missing field m_IsTrigger")
                 is_trigger = bool(tree["m_IsTrigger"])
                 center, half = _collider_geometry(shape, tree, node.world, what)
+                if node.world.sheared and node.path not in sheared:
+                    sheared.append(node.path)
                 layer_name = layer_names.get(node.layer)
                 usage = classify(node.name, node.layer, is_trigger, shape=shape, layer_name=layer_name)
                 report.note_collider(
@@ -624,7 +732,15 @@ def _read_colliders(
                     }
                 )
                 details.append(
-                    {"path": node.path, "shape": shape, "layer": node.layer, "is_trigger": is_trigger, "usage": usage}
+                    {
+                        "path": node.path,
+                        "shape": shape,
+                        "layer": node.layer,
+                        "is_trigger": is_trigger,
+                        "usage": usage,
+                        "center": _rounded(center),
+                        "halfExtents": _rounded(half),
+                    }
                 )
         record["colliders"] = {
             "total": len(colliders),
@@ -632,6 +748,13 @@ def _read_colliders(
             "ignored_types": ignored,
         }
         record["collider_details"] = details[:MAX_DETAILS]
+        if sheared:
+            record["sheared_colliders"] = sheared
+            problem(
+                "warn",
+                f"colliders on {sheared[:3]} sit under a sheared transform (a rotated child under a non-uniformly "
+                "scaled ancestor); their extents are approximate",
+            )
         if not colliders:
             raise PrefabError(f"no Box/Sphere/Capsule colliders found on {source} (ignored: {ignored or 'none'})")
         if record["colliders"]["build"] == 0:

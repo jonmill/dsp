@@ -29,7 +29,7 @@ def validate_against_schema(gamedata: dict, schema_path: Path) -> None:
     try:
         from jsonschema import Draft202012Validator
     except ImportError:
-        raise SchemaError("schema validation needs jsonschema: pip install -e 'tools/extract[dev]'") from None
+        raise SchemaError("schema validation needs jsonschema: pip install -e tools/extract") from None
 
     schema = json.loads(Path(schema_path).read_text(encoding="utf-8"))
     validator = Draft202012Validator(schema)

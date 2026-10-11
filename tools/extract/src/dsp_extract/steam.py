@@ -3,6 +3,10 @@
 Order (design spec 4.1): an explicit `--game-dir` wins; otherwise every existing Steam
 `steamapps` directory for the platform is read for `libraryfolders.vdf`, and each library it
 names is checked for `appmanifest_1366540.acf`.
+
+An explicit `--game-dir` is expanded and resolved first (so `.` works from inside `DSPGAME_Data`).
+When the resolved game folder is `<library>/steamapps/common/<dir>` and that library has DSP's
+manifest, the install still gets its `library` (for the Proton blueprint folder) and `build_id`.
 """
 
 from __future__ import annotations
@@ -118,17 +122,42 @@ def _install(root: Path, build_id: str | None, library: Path | None) -> GameInst
 
 
 def _from_game_dir(game_dir: Path) -> GameInstall:
-    path = game_dir.expanduser()
+    path = _resolved(game_dir.expanduser())  # `--game-dir .` from inside DSPGAME_Data must still work
     if not path.is_dir():
         raise GameNotFoundError(f"--game-dir {path} does not exist or is not a directory.")
     if path.name == DATA_DIR_NAME:
-        return _install(path.parent, None, None)
-    if (path / DATA_DIR_NAME).is_dir():
-        return _install(path, None, None)
-    raise GameNotFoundError(
-        f"--game-dir {path} has no {DATA_DIR_NAME} folder; the install looks incomplete or the path "
-        f"is wrong. Pass the Dyson Sphere Program folder (or its {DATA_DIR_NAME} folder)."
-    )
+        root = path.parent
+    elif (path / DATA_DIR_NAME).is_dir():
+        root = path
+    else:
+        raise GameNotFoundError(
+            f"--game-dir {path} has no {DATA_DIR_NAME} folder; the install looks incomplete or the path "
+            f"is wrong. Pass the Dyson Sphere Program folder (or its {DATA_DIR_NAME} folder)."
+        )
+    library, build_id = _steam_library_of(root)
+    return _install(root, build_id, library)
+
+
+def _steam_library_of(root: Path) -> tuple[Path | None, str | None]:
+    """`(library, build_id)` when `root` is `<library>/steamapps/common/<dir>` and the library has DSP's manifest.
+
+    Lets an explicit `--game-dir` still find the Proton blueprint folder and the Steam build id. A manifest that
+    cannot be read only costs the build id; a game folder outside a library gives `(None, None)`.
+    """
+    common = root.parent
+    steamapps = common.parent
+    if common.name.lower() != "common" or steamapps.name.lower() != "steamapps":
+        return None, None
+    manifest = steamapps / f"appmanifest_{DSP_APP_ID}.acf"
+    if not manifest.is_file():
+        return None, None
+    build_id = None
+    try:
+        value = _get(_get(vdf.parse(manifest.read_text(encoding="utf-8", errors="replace")), "AppState"), "buildid")
+        build_id = value if isinstance(value, str) and value else None
+    except (OSError, vdf.VdfError):
+        pass
+    return steamapps.parent, build_id
 
 
 def _libraries(steamapps: Path, searched: list[str]) -> list[Path]:
@@ -180,5 +209,5 @@ def _get(node: object, key: str) -> object | None:
 def _resolved(path: Path) -> Path:
     try:
         return path.resolve()
-    except OSError:
-        return path
+    except (OSError, RuntimeError):  # RuntimeError: a symlink loop
+        return path.absolute()

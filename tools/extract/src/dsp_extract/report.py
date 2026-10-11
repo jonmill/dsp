@@ -11,7 +11,9 @@ Sections (keys of `Report.sections`, all JSON-serializable):
   per_building_geometry   item id -> what was read for that building and what fell back
   collider_layers_seen    every distinct (layer, is_trigger, GameObject name, shape) with the usage
                           decided for it, so the collider-usage rule (research gap 1) can be fixed
-  (other keys may be added by the readers, for example typetree_generator or container)
+  (other keys may be added by the readers, for example typetree_generator or container; the CLI adds
+   environment, install, game_version, decompile, code_constants, drift, output, icons, container_sample,
+   protoset_samples, prefab_walks and, after an unexpected failure, traceback)
 """
 
 from __future__ import annotations
