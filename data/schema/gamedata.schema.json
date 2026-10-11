@@ -1,0 +1,1119 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "meta": {
+      "type": "object",
+      "properties": {
+        "schemaVersion": {
+          "type": "number",
+          "const": 1
+        },
+        "gameVersion": {
+          "type": "string"
+        },
+        "steamBuildId": {
+          "type": "string"
+        },
+        "extractedAt": {
+          "type": "string"
+        },
+        "extractorVersion": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string",
+          "enum": [
+            "game",
+            "fixture"
+          ]
+        },
+        "protoSignatures": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "gameVersion",
+        "extractedAt",
+        "extractorVersion",
+        "source"
+      ],
+      "additionalProperties": false
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "name": {
+            "type": "string"
+          },
+          "nameKey": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          },
+          "stackSize": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "isFluid": {
+            "type": "boolean"
+          },
+          "canBuild": {
+            "type": "boolean"
+          },
+          "productive": {
+            "type": "boolean"
+          },
+          "gridIndex": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "iconPath": {
+            "type": "string"
+          },
+          "heatValue": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "modelIndex": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "proliferator": {
+            "type": "object",
+            "properties": {
+              "ability": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "sprays": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "ability",
+              "sprays"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "nameKey",
+          "type",
+          "stackSize",
+          "isFluid",
+          "canBuild",
+          "productive",
+          "gridIndex",
+          "iconPath",
+          "heatValue",
+          "modelIndex"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "recipes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "NONE",
+              "SMELT",
+              "CHEMICAL",
+              "REFINE",
+              "ASSEMBLE",
+              "PARTICLE",
+              "EXCHANGE",
+              "PHOTON_STORE",
+              "FRACTIONATE",
+              "RESEARCH"
+            ]
+          },
+          "timeTicks": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "inputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "itemId": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "itemId",
+                "count"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "outputs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "itemId": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "itemId",
+                "count"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "explicit": {
+            "type": "boolean"
+          },
+          "nonProductive": {
+            "type": "boolean"
+          },
+          "handcraft": {
+            "type": "boolean"
+          },
+          "gridIndex": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "type",
+          "timeTicks",
+          "inputs",
+          "outputs",
+          "explicit",
+          "nonProductive",
+          "handcraft",
+          "gridIndex"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "techs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "name": {
+            "type": "string"
+          },
+          "preTechs": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          "preTechsImplicit": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          "unlockRecipes": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          "unlockFunctions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "func": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                },
+                "value": {
+                  "type": "number"
+                }
+              },
+              "required": [
+                "func",
+                "value"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "level": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "maxLevel": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "isObsolete": {
+            "type": "boolean"
+          },
+          "isHidden": {
+            "type": "boolean"
+          },
+          "published": {
+            "type": "boolean"
+          },
+          "position": {
+            "type": "array",
+            "prefixItems": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "items": false,
+            "minItems": 2,
+            "maxItems": 2
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "preTechs",
+          "preTechsImplicit",
+          "unlockRecipes",
+          "unlockFunctions",
+          "level",
+          "maxLevel",
+          "isObsolete",
+          "isHidden",
+          "published",
+          "position"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "buildings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "itemId": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "modelIndex": {
+            "type": "integer",
+            "minimum": -9007199254740991,
+            "maximum": 9007199254740991
+          },
+          "name": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "production",
+              "lab",
+              "belt",
+              "sorter",
+              "splitter",
+              "station",
+              "powerNode",
+              "sprayCoater",
+              "piler",
+              "storage",
+              "fractionator",
+              "other"
+            ]
+          },
+          "production": {
+            "type": "object",
+            "properties": {
+              "recipeType": {
+                "type": "string",
+                "enum": [
+                  "NONE",
+                  "SMELT",
+                  "CHEMICAL",
+                  "REFINE",
+                  "ASSEMBLE",
+                  "PARTICLE",
+                  "EXCHANGE",
+                  "PHOTON_STORE",
+                  "FRACTIONATE",
+                  "RESEARCH"
+                ]
+              },
+              "speed": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "recipeType",
+              "speed"
+            ],
+            "additionalProperties": false
+          },
+          "lab": {
+            "type": "object",
+            "properties": {
+              "assembleSpeed": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "researchSpeed": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "assembleSpeed",
+              "researchSpeed"
+            ],
+            "additionalProperties": false
+          },
+          "belt": {
+            "type": "object",
+            "properties": {
+              "speed": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "speed"
+            ],
+            "additionalProperties": false
+          },
+          "sorter": {
+            "type": "object",
+            "properties": {
+              "grade": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "stt": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "delay": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "canStack": {
+                "type": "boolean"
+              },
+              "stackSize": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "grade",
+              "stt",
+              "delay",
+              "canStack",
+              "stackSize"
+            ],
+            "additionalProperties": false
+          },
+          "station": {
+            "type": "object",
+            "properties": {
+              "isStellar": {
+                "type": "boolean"
+              },
+              "maxItemKinds": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "maxItemCount": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "maxEnergyAcc": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "maxDroneCount": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "maxShipCount": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "isStellar",
+              "maxItemKinds",
+              "maxItemCount",
+              "maxEnergyAcc",
+              "maxDroneCount",
+              "maxShipCount"
+            ],
+            "additionalProperties": false
+          },
+          "sprayCoater": {
+            "type": "object",
+            "properties": {
+              "incCapacity": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "incItemIds": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "minimum": -9007199254740991,
+                  "maximum": 9007199254740991
+                }
+              }
+            },
+            "required": [
+              "incCapacity",
+              "incItemIds"
+            ],
+            "additionalProperties": false
+          },
+          "power": {
+            "type": "object",
+            "properties": {
+              "consumer": {
+                "type": "boolean"
+              },
+              "workPerTick": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "idlePerTick": {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              "node": {
+                "type": "object",
+                "properties": {
+                  "connectDistance": {
+                    "type": "number"
+                  },
+                  "coverRadius": {
+                    "type": "number"
+                  },
+                  "powerPoint": {
+                    "type": "array",
+                    "prefixItems": [
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "number"
+                      },
+                      {
+                        "type": "number"
+                      }
+                    ],
+                    "items": false,
+                    "minItems": 3,
+                    "maxItems": 3
+                  }
+                },
+                "required": [
+                  "connectDistance",
+                  "coverRadius",
+                  "powerPoint"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "consumer",
+              "workPerTick",
+              "idlePerTick"
+            ],
+            "additionalProperties": false
+          },
+          "geometry": {
+            "type": "object",
+            "properties": {
+              "source": {
+                "type": "string",
+                "enum": [
+                  "extracted",
+                  "approximate"
+                ]
+              },
+              "colliders": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "center": {
+                      "type": "array",
+                      "prefixItems": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        }
+                      ],
+                      "items": false,
+                      "minItems": 3,
+                      "maxItems": 3
+                    },
+                    "halfExtents": {
+                      "type": "array",
+                      "prefixItems": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        }
+                      ],
+                      "items": false,
+                      "minItems": 3,
+                      "maxItems": 3
+                    },
+                    "rotation": {
+                      "type": "array",
+                      "prefixItems": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        }
+                      ],
+                      "items": false,
+                      "minItems": 4,
+                      "maxItems": 4
+                    },
+                    "usage": {
+                      "type": "string",
+                      "enum": [
+                        "build",
+                        "physics",
+                        "other"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "center",
+                    "halfExtents",
+                    "rotation",
+                    "usage"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "slots": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "position": {
+                      "type": "array",
+                      "prefixItems": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        }
+                      ],
+                      "items": false,
+                      "minItems": 3,
+                      "maxItems": 3
+                    },
+                    "rotation": {
+                      "type": "array",
+                      "prefixItems": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        }
+                      ],
+                      "items": false,
+                      "minItems": 4,
+                      "maxItems": 4
+                    }
+                  },
+                  "required": [
+                    "position",
+                    "rotation"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "ports": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "position": {
+                      "type": "array",
+                      "prefixItems": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        }
+                      ],
+                      "items": false,
+                      "minItems": 3,
+                      "maxItems": 3
+                    },
+                    "rotation": {
+                      "type": "array",
+                      "prefixItems": [
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        },
+                        {
+                          "type": "number"
+                        }
+                      ],
+                      "items": false,
+                      "minItems": 4,
+                      "maxItems": 4
+                    }
+                  },
+                  "required": [
+                    "position",
+                    "rotation"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              "selectCenter": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "number"
+                  }
+                ],
+                "items": false,
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "selectSize": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "number"
+                  }
+                ],
+                "items": false,
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "landPoints": {
+                "type": "array",
+                "items": {
+                  "type": "array",
+                  "prefixItems": [
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "number"
+                    },
+                    {
+                      "type": "number"
+                    }
+                  ],
+                  "items": false,
+                  "minItems": 3,
+                  "maxItems": 3
+                }
+              },
+              "multiLevel": {
+                "type": "boolean"
+              },
+              "multiLevelAllowInserter": {
+                "type": "boolean"
+              },
+              "lapJoint": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "number"
+                  }
+                ],
+                "items": false,
+                "minItems": 3,
+                "maxItems": 3
+              },
+              "blueprintBoxSize": {
+                "type": "array",
+                "prefixItems": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "type": "number"
+                  }
+                ],
+                "items": false,
+                "minItems": 2,
+                "maxItems": 2
+              }
+            },
+            "required": [
+              "source",
+              "colliders",
+              "slots",
+              "ports",
+              "selectCenter",
+              "selectSize",
+              "landPoints",
+              "multiLevel",
+              "multiLevelAllowInserter",
+              "lapJoint",
+              "blueprintBoxSize"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "itemId",
+          "modelIndex",
+          "name",
+          "kind",
+          "power",
+          "geometry"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "constants": {
+      "type": "object",
+      "properties": {
+        "ticksPerSecond": {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "cargoLength": {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "beltCellsPerTile": {
+          "type": "number"
+        },
+        "tileMeters": {
+          "type": "number"
+        },
+        "levelMeters": {
+          "type": "number"
+        },
+        "sorterMaxReachMeters": {
+          "type": "number"
+        },
+        "sorterMaxGridSpan": {
+          "type": "number"
+        },
+        "beltMaxLevelBase": {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "beltMaxLevelPerVerticalTech": {
+          "type": "integer",
+          "minimum": -9007199254740991,
+          "maximum": 9007199254740991
+        },
+        "incTableMilli": {
+          "minItems": 11,
+          "maxItems": 11,
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "accTableMilli": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "powerTableRatio": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "assemblerOutputCrafts": {
+          "type": "object",
+          "properties": {
+            "SMELT_items": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "ASSEMBLE_crafts": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "OTHER_crafts": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "SMELT_items",
+            "ASSEMBLE_crafts",
+            "OTHER_crafts"
+          ],
+          "additionalProperties": false
+        },
+        "stationDefaultChargePerTick": {
+          "type": "object",
+          "properties": {
+            "planetary": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            },
+            "interstellar": {
+              "type": "integer",
+              "minimum": -9007199254740991,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "planetary",
+            "interstellar"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "ticksPerSecond",
+        "cargoLength",
+        "beltCellsPerTile",
+        "tileMeters",
+        "levelMeters",
+        "sorterMaxReachMeters",
+        "sorterMaxGridSpan",
+        "beltMaxLevelBase",
+        "beltMaxLevelPerVerticalTech",
+        "incTableMilli",
+        "accTableMilli",
+        "powerTableRatio",
+        "assemblerOutputCrafts",
+        "stationDefaultChargePerTick"
+      ],
+      "additionalProperties": false
+    },
+    "constantSources": {
+      "type": "object",
+      "properties": {
+        "ticksPerSecond": {
+          "type": "string"
+        },
+        "cargoLength": {
+          "type": "string"
+        },
+        "beltCellsPerTile": {
+          "type": "string"
+        },
+        "tileMeters": {
+          "type": "string"
+        },
+        "levelMeters": {
+          "type": "string"
+        },
+        "sorterMaxReachMeters": {
+          "type": "string"
+        },
+        "sorterMaxGridSpan": {
+          "type": "string"
+        },
+        "beltMaxLevelBase": {
+          "type": "string"
+        },
+        "beltMaxLevelPerVerticalTech": {
+          "type": "string"
+        },
+        "incTableMilli": {
+          "type": "string"
+        },
+        "accTableMilli": {
+          "type": "string"
+        },
+        "powerTableRatio": {
+          "type": "string"
+        },
+        "assemblerOutputCrafts": {
+          "type": "string"
+        },
+        "stationDefaultChargePerTick": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "ticksPerSecond",
+        "cargoLength",
+        "beltCellsPerTile",
+        "tileMeters",
+        "levelMeters",
+        "sorterMaxReachMeters",
+        "sorterMaxGridSpan",
+        "beltMaxLevelBase",
+        "beltMaxLevelPerVerticalTech",
+        "incTableMilli",
+        "accTableMilli",
+        "powerTableRatio",
+        "assemblerOutputCrafts",
+        "stationDefaultChargePerTick"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "meta",
+    "items",
+    "recipes",
+    "techs",
+    "buildings",
+    "constants",
+    "constantSources"
+  ],
+  "additionalProperties": false
+}
