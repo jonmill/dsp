@@ -365,8 +365,8 @@ class Planner {
     const { req, data, effects } = this;
     this.validate();
     const candidates = this.candidateRecipes();
-    const { nodes, required } = this.nodesAndTargetRate(candidates, this.facilities(candidates));
-    const solution = await this.solve(nodes, required);
+    const { nodes, required, pin } = this.nodesAndTargetRate(candidates, this.facilities(candidates));
+    const solution = await this.solve(nodes, required, pin);
 
     const crafts = new Map<number, number>();
     for (const n of nodes) {
@@ -374,6 +374,13 @@ class Planner {
       if (x > EPS) crafts.set(n.recipe.id, x);
     }
     const stageNodes = this.stageOrder(nodes.filter((n) => crafts.has(n.recipe.id)));
+    if (stageNodes.length === 0) {
+      // The solver accepts any rate within its tolerance of zero, so a tiny request solves to nothing.
+      throw new PlanFailure({
+        kind: 'infeasible',
+        message: `The requested quantity of ${this.itemName(req.targetItemId)} (${required} per second) is too small to plan.`,
+      });
+    }
     const stages = stageNodes.map((n) => this.stageOf(n, crafts.get(n.recipe.id) as number));
 
     const { importRate, exportRate } = this.balance(nodes, solution.values, required);
@@ -384,18 +391,24 @@ class Planner {
       ...[...exportRate].filter(([itemId]) => itemId !== req.targetItemId).map(([itemId, perSecond]) => ({ itemId, perSecond })),
     ];
 
-    // The proliferator is one more import, in its own kind of station slot.
+    // The proliferator is one more import. It feeds the spray coaters, not a stage, so it has no flows.
     const { proliferatorPerSecond, warnings } = this.proliferation(stages);
-    const proliferator =
-      proliferatorPerSecond > 0
-        ? [{ itemId: proliferatorItemId(req.proliferator.tier as 1 | 2 | 3), perSecond: proliferatorPerSecond }]
-        : [];
-    const imports = [...materials, ...proliferator];
-    const stationSlots: StationSlotDemand[] = [
-      ...materials.map((m): StationSlotDemand => ({ itemId: m.itemId, role: 'import' })),
-      ...proliferator.map((p): StationSlotDemand => ({ itemId: p.itemId, role: 'proliferator' })),
-      ...exports.map((e): StationSlotDemand => ({ itemId: e.itemId, role: 'export' })),
-    ];
+    if (req.suppliedItemIds.has(req.targetItemId)) {
+      warnings.push(`${this.itemName(req.targetItemId)} is marked supplied but is the target; it will be produced.`);
+    }
+    const imports = materials.map((m) => ({ ...m }));
+    let sprayItemId: number | undefined;
+    if (proliferatorPerSecond > 0) {
+      sprayItemId = proliferatorItemId(req.proliferator.tier as 1 | 2 | 3);
+      const existing = imports.find((i) => i.itemId === sprayItemId);
+      if (existing) existing.perSecond += proliferatorPerSecond;
+      else imports.push({ itemId: sprayItemId, perSecond: proliferatorPerSecond });
+    }
+    const stationSlots = this.stationSlots(
+      materials.map((m) => m.itemId),
+      sprayItemId,
+      exports.map((e) => e.itemId),
+    );
 
     const withoutPower = {
       request: req,
@@ -413,27 +426,37 @@ class Planner {
   }
 
   /**
-   * One node per candidate recipe, and the target rate R. Buildings mode needs one definite recipe
-   * for the target (the non-alternate, else the first), so the other target recipes are dropped.
+   * One node per candidate recipe and the target rate R. Buildings mode needs one definite recipe
+   * for the target: the one `recipeOverrides` names, else the non-alternate, else the first. R is what
+   * `count` machines of it make, and the LP pins that recipe at exactly `count` machines (`pin`), so a
+   * by-product producer of the target (Hydrogen from Plasma Refining) cannot stand in for it.
    */
-  private nodesAndTargetRate(candidates: Recipe[], buildings: Map<number, Building>): { nodes: Node[]; required: number } {
+  private nodesAndTargetRate(
+    candidates: Recipe[],
+    buildings: Map<number, Building>,
+  ): { nodes: Node[]; required: number; pin?: { recipeId: number; crafts: number } } {
     const { req, data } = this;
     const target = req.targetItemId;
     const ticksPerSecond = data.data.constants.ticksPerSecond;
-    let nodes = candidates.map((recipe): Node => {
+    const nodes = candidates.map((recipe): Node => {
       const building = buildings.get(recipe.id) as Building;
       const effect = effectFor(req.proliferator.tier, req.proliferator.mode, recipe, data);
       const effectiveSpeed = facilitySpeed(building) * effect.speedMultiplier;
       return { recipe, building, effect, effectiveSpeed, secondsPerCraft: recipe.timeTicks / ticksPerSecond / effectiveSpeed };
     });
-    const makesTarget = (n: Node) => n.recipe.outputs.some((o) => o.itemId === target);
 
     if (req.quantity.kind === 'rate') return { nodes, required: req.quantity.perSecond };
-    const producers = nodes.filter(makesTarget);
-    const final = producers.find((n) => !n.recipe.explicit) ?? producers[0];
-    nodes = nodes.filter((n) => !makesTarget(n) || n === final);
+    const producers = nodes.filter((n) => n.recipe.outputs.some((o) => o.itemId === target));
+    const forced = req.recipeOverrides[target];
+    const final =
+      producers.find((n) => n.recipe.id === forced) ?? producers.find((n) => !n.recipe.explicit) ?? producers[0];
     const perCraft = final.recipe.outputs.find((o) => o.itemId === target)?.count ?? 0;
-    return { nodes, required: (req.quantity.count / final.secondsPerCraft) * perCraft * final.effect.outputMultiplier };
+    const crafts = req.quantity.count / final.secondsPerCraft;
+    return {
+      nodes,
+      required: crafts * perCraft * final.effect.outputMultiplier,
+      pin: { recipeId: final.recipe.id, crafts },
+    };
   }
 
   /** Cleaned import and export rates by item id (ascending). The target's export includes `required`. */
@@ -493,6 +516,24 @@ class Planner {
     return capacity;
   }
 
+  /**
+   * One slot per item id, in the order imports, spray supply, exports. An item that needs several
+   * (the target is also the spray item, or a regular import is also sprayed) keeps the most specific
+   * role: export over proliferator over import.
+   */
+  private stationSlots(importIds: number[], sprayItemId: number | undefined, exportIds: number[]): StationSlotDemand[] {
+    const rank: Record<StationSlotDemand['role'], number> = { import: 1, proliferator: 2, export: 3 };
+    const roles = new Map<number, StationSlotDemand['role']>();
+    const claim = (itemId: number, role: StationSlotDemand['role']) => {
+      const current = roles.get(itemId);
+      if (current === undefined || rank[role] > rank[current]) roles.set(itemId, role);
+    };
+    for (const itemId of importIds) claim(itemId, 'import');
+    if (sprayItemId !== undefined) claim(sprayItemId, 'proliferator');
+    for (const itemId of exportIds) claim(itemId, 'export');
+    return [...roles].map(([itemId, role]) => ({ itemId, role }));
+  }
+
   /** Slot-based lower bound: the netlist may need more stations once belt ports are counted. */
   private stationsNeeded(slots: number): number {
     const wantStellar = this.req.stationKind === 'interstellar';
@@ -521,9 +562,10 @@ class Planner {
 
   /**
    * Variables: x<recipe> crafts/s, i<item> imports (supplied items), e<item> exports (every item).
-   * Rows, per item: Σ (out·multiplier − in)·x + i − e = R for the target, 0 otherwise.
+   * Rows, per item: Σ (out·multiplier − in)·x + i − e = R for the target, 0 otherwise. `pin` fixes
+   * one recipe's crafts/s (buildings mode).
    */
-  private async solve(nodes: Node[], required: number) {
+  private async solve(nodes: Node[], required: number, pin?: { recipeId: number; crafts: number }) {
     const target = this.req.targetItemId;
     const coefs = new Map<number, Map<number, number>>(); // item -> recipe -> net coefficient
     const add = (itemId: number, recipeId: number, delta: number) => {
@@ -551,6 +593,7 @@ class Planner {
       terms.push({ variable: `e${itemId}`, coef: -1 });
       constraints.push({ name: `r${itemId}`, terms, type: 'eq', rhs: itemId === target ? required : 0 });
     }
+    if (pin) constraints.push({ name: 'pin', terms: [{ variable: `x${pin.recipeId}`, coef: 1 }], type: 'eq', rhs: pin.crafts });
     const solution = await solveLP({ variables, constraints });
     if (solution.status !== 'optimal') {
       throw new PlanFailure({

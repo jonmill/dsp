@@ -51,7 +51,10 @@ export interface Stage {
   idlePowerW: number;
 }
 
-/** `from` and `to` are indexes into `ProductionPlan.stages`. */
+/**
+ * `from` and `to` are indexes into `ProductionPlan.stages`. Flows cover the materials only: the
+ * proliferator import goes to the spray coaters, not to a stage, so it has no flows.
+ */
 export interface Flow {
   itemId: number;
   from: number | 'import';
@@ -78,10 +81,16 @@ export interface ProductionPlan {
   request: PlanRequest;
   stages: Stage[];
   flows: Flow[];
+  /**
+   * Includes the proliferator, which has no flows (spray coaters consume it, not stages). If the
+   * proliferator item is also a regular import, the two are summed into one entry and the flows
+   * carry only the regular part.
+   */
   imports: ItemRate[];
   /** The target comes first, then by-products nothing consumes. */
   exports: ItemRate[];
   actualTargetRate: number;
+  /** One slot per item id; an item with several roles keeps export over proliferator over import. */
   stationSlots: StationSlotDemand[];
   /** Slot-based lower bound; the netlist may need more once belt ports are counted. */
   stationsNeeded: number;

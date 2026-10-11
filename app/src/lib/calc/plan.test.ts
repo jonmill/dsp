@@ -252,6 +252,98 @@ describe('planProduction: quantity', () => {
   });
 });
 
+describe('planProduction: fix round (overrides, tiny rates, supplied target, spray slots)', () => {
+  it('buildings mode builds the recipe named by recipeOverrides for the target, not the first producer', async () => {
+    // Hydrogen is also a by-product of Plasma Refining (16, listed first); the override picks X-ray Cracking (58).
+    const plan = await planOf(
+      request({
+        targetItemId: 1120,
+        suppliedItemIds: new Set([1007]),
+        recipeOverrides: { 1120: 58 },
+        finalFacilityItemId: REFINERY,
+        facilityOverrides: { 58: REFINERY, 16: REFINERY },
+        quantity: { kind: 'buildings', count: 2 },
+      }),
+    );
+    const s = stageFor(plan, 58);
+    expect(s.machines).toBe(2);
+    expect(s.craftsPerSecond).toBeCloseTo(0.5, 9); // 2 refineries, 4 s per craft
+    // R comes from recipe 58: 2 machines x 0.25 crafts/s x 3 Hydrogen per craft.
+    expect(plan.exports[0]).toEqual({ itemId: 1120, perSecond: expect.closeTo(1.5, 9) });
+    expect(plan.actualTargetRate).toBeGreaterThanOrEqual(1.5 - 1e-9);
+    expectFlowsConsistent(plan);
+  });
+
+  it('buildings mode without an override still prefers the non-alternate recipe', async () => {
+    const plan = await planOf(
+      request({
+        targetItemId: 1123,
+        suppliedItemIds: new Set([1000, 1005, 1006, 1007, 1011]),
+        finalFacilityItemId: CHEMICAL_PLANT,
+        facilityOverrides: { 31: CHEMICAL_PLANT, 32: CHEMICAL_PLANT, 17: ARC_SMELTER, 24: CHEMICAL_PLANT, 16: REFINERY },
+        quantity: { kind: 'buildings', count: 3 },
+      }),
+    );
+    expect(stageFor(plan, 31).machines).toBe(3);
+    expect(plan.stages.map((st) => st.recipeId)).not.toContain(32);
+  });
+
+  it('a rate too small to need any machine is infeasible, not an empty plan', async () => {
+    const error = await errorOf(processorRequest({ quantity: { kind: 'rate', perSecond: 1e-10 } }));
+    expect(error.kind).toBe('infeasible');
+    expect(error.message).toMatch(/too small/i);
+    const tinyBuildings = await errorOf(processorRequest({ quantity: { kind: 'buildings', count: 1e-12 } }));
+    expect(tinyBuildings.kind).toBe('infeasible');
+  });
+
+  it('warns when the target is marked supplied but is built anyway', async () => {
+    const plan = await planOf(processorRequest({ suppliedItemIds: new Set([...ORES, 1303]) }));
+    expect(plan.stages.map((st) => st.recipeId)).toContain(51);
+    expect(plan.warnings).toContain('Processor is marked supplied but is the target; it will be produced.');
+    expect(plan.imports.map((i) => i.itemId)).not.toContain(1303);
+  });
+
+  it('gives a target that is also the spray supply one station slot, as an export', async () => {
+    // Proliferator Mk.III (1143) as the target, sprayed with Mk.III: the plan both makes and imports it.
+    const plan = await planOf(
+      request({
+        targetItemId: 1143,
+        suppliedItemIds: new Set([1142, 1124]),
+        proliferator: { tier: 3, mode: 'extra' },
+      }),
+    );
+    expect(plan.proliferatorPerSecond).toBeGreaterThan(0);
+    expect(rateOf(plan.imports, 1143)).toBeCloseTo(plan.proliferatorPerSecond, 9);
+    expect(plan.exports[0].itemId).toBe(1143);
+    const slotsFor1143 = plan.stationSlots.filter((slot) => slot.itemId === 1143);
+    expect(slotsFor1143).toEqual([{ itemId: 1143, role: 'export' }]);
+    const ids = plan.stationSlots.map((slot) => slot.itemId);
+    expect(new Set(ids).size).toBe(ids.length);
+    expect(plan.stationsNeeded).toBe(Math.ceil(ids.length / 4));
+    // Spray supply goes to coaters, not stages: no flow comes from the import.
+    expect(plan.flows.filter((f) => f.itemId === 1143 && f.from === 'import')).toEqual([]);
+  });
+
+  it('merges a regular import of the spray item with the spray supply into one import and one slot', async () => {
+    // Proliferator Mk.II eats Mk.I (supplied) and is sprayed with Mk.I as well.
+    const plan = await planOf(
+      request({
+        targetItemId: 1142,
+        suppliedItemIds: new Set([1141, 1112]),
+        proliferator: { tier: 1, mode: 'extra' },
+      }),
+    );
+    const stage = stageFor(plan, 107);
+    const regular = stage.inputs.find((i) => i.itemId === 1141)?.perSecond ?? 0;
+    expect(plan.imports.filter((i) => i.itemId === 1141)).toHaveLength(1);
+    expect(rateOf(plan.imports, 1141)).toBeCloseTo(regular + plan.proliferatorPerSecond, 9);
+    expect(plan.stationSlots.filter((slot) => slot.itemId === 1141)).toEqual([{ itemId: 1141, role: 'proliferator' }]);
+    // The flows carry only the regular part of the import.
+    const fromImport = plan.flows.filter((f) => f.itemId === 1141 && f.from === 'import').reduce((a, f) => a + f.perSecond, 0);
+    expect(fromImport).toBeCloseTo(regular, 9);
+  });
+});
+
 describe('planProduction: alternate recipes and by-products', () => {
   it('Graphene via recipe 32: 1 chemical plant, 1 Fire Ice/s in, 0.5 Hydrogen/s out (Review Focus #4)', async () => {
     const plan = await planOf(
