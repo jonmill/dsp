@@ -57,6 +57,8 @@ const SKEW_LIMIT_BUILDING_DEG = 14;
 const SKEW_LIMIT_BELT_DEG = 11;
 /** Two ends closer than this are a failed placement (MX §3.5). */
 const MIN_SORTER_LENGTH_M = 1;
+/** Lattice points examined between the ends of one sorter; a sorter in reach spans at most 5, this only bounds bad input. */
+const MAX_LATTICE_WALK = 16;
 /** Flat steps a lift needs on each side (MX §2.4). */
 const FLAT_STEPS_AROUND_LIFT = 2;
 
@@ -539,8 +541,42 @@ class GeometryChecker {
             : undefined;
         if (problem) {
           this.emit('BELT_PORT_MISMATCH', [beltNode(belt.id, last)], `belt ${belt.id} merges into a belt that does not exist: ${problem}`, MIRROR_PATH);
+        } else {
+          this.checkMerge(belt, last, target!, sink.node);
         }
       }
+    }
+  }
+
+  /**
+   * A belt that merges into another (`sink: belt`) ends on the target node or on a lattice point beside it at
+   * the same height, and never joins the target belt at its first node (that would be a continuation, not a merge).
+   */
+  private checkMerge(belt: BeltPath, last: number, target: BeltPath, node: number): void {
+    const m = belt.nodes[last];
+    const t = target.nodes[node];
+    const entities = [beltNode(belt.id, last), beltNode(target.id, node)];
+    const who = `belt ${belt.id} merges into belt ${target.id} node ${node} at ${at(t)} z ${num(t.z)}`;
+    const sameHeight = near(m.z, t.z);
+    const onIt = sameHeight && near(m.x, t.x) && near(m.y, t.y);
+    const beside =
+      sameHeight &&
+      ((near(Math.abs(m.x - t.x), 1) && near(m.y, t.y)) || (near(m.x, t.x) && near(Math.abs(m.y - t.y), 1)));
+    if (!onIt && !beside) {
+      this.emit(
+        'BELT_PORT_MISMATCH',
+        entities,
+        `${who}, but its last node (node ${last}) at ${at(m)} z ${num(m.z)} is neither on that node nor one tile beside it at the same height`,
+        MIRROR_PATH,
+      );
+    }
+    if (node === 0) {
+      this.emit(
+        'BELT_PORT_MISMATCH',
+        entities,
+        `${who}, but node 0 is the first node of belt ${target.id}; a merge cannot join a belt at its head`,
+        MIRROR_PATH,
+      );
     }
   }
 
@@ -700,9 +736,10 @@ class GeometryChecker {
     this.checkTap(ctx);
     if (!pos) return;
     this.sorterPoints.push({ s, x: (pos.pick.x + pos.drop.x) / 2, y: (pos.pick.y + pos.drop.y) / 2 });
-    this.checkReach(ctx, pos);
+    const inReach = this.checkReach(ctx, pos);
     this.checkSkew(ctx, pos);
-    this.checkInBuilding(ctx, pos);
+    // Walking the lattice between ends that are out of reach could take forever on absurd coordinates.
+    if (inReach) this.checkInBuilding(ctx, pos);
   }
 
   // mirrors: BuildTool_Inserter.CheckBuildConditions
@@ -756,8 +793,11 @@ class GeometryChecker {
   }
 
   // mirrors: BuildTool_Inserter.CheckBuildConditions
-  /** Rule 8, distance part: 1 m <= 3D distance between the ends <= `sorterMaxReachMeters`. */
-  private checkReach(ctx: SorterCtx, pos: { pick: GridPoint; drop: GridPoint }): void {
+  /**
+   * Rule 8, distance part: 1 m <= 3D distance between the ends <= `sorterMaxReachMeters`. Returns false when the
+   * ends are too far apart.
+   */
+  private checkReach(ctx: SorterCtx, pos: { pick: GridPoint; drop: GridPoint }): boolean {
     const { s } = ctx;
     const d = metres(pos.drop.x - pos.pick.x, pos.drop.y - pos.pick.y, pos.drop.z - pos.pick.z);
     const reach = this.data.data.constants.sorterMaxReachMeters;
@@ -766,6 +806,7 @@ class GeometryChecker {
     } else if (d < MIN_SORTER_LENGTH_M - 1e-9) {
       this.emit('SORTER_SPAN', [sorter(s.id)], `sorter ${s.id}: its ends are ${num(d)} m apart, closer than the ${MIN_SORTER_LENGTH_M} m minimum`, MIRROR_INSERTER);
     }
+    return !(d > reach + 1e-9);
   }
 
   // mirrors: BuildTool_Inserter.CheckBuildConditions
@@ -830,7 +871,7 @@ class GeometryChecker {
     const hi = Math.max(a0, a1);
     const hits: BuildingEntry[] = [];
     const points: string[] = [];
-    for (let v = Math.floor(lo + TOL) + 1; v < hi - TOL; v++) {
+    for (let v = Math.floor(lo + TOL) + 1, steps = 0; v < hi - TOL && steps < MAX_LATTICE_WALK; v++, steps++) {
       const t = (v - a0) / (a1 - a0);
       const lateral = Math.round(alongX ? pos.pick.y + t * dy : pos.pick.x + t * dx) + 0;
       const x = alongX ? v : lateral;
@@ -941,10 +982,8 @@ class GeometryChecker {
   private powerCover(nodes: PowerNode[]): void {
     const covering = nodes.filter((n) => n.cover > 0);
     const grid = new SpatialGrid(covering.length, CELL_TILES);
-    let maxTiles = 0;
     covering.forEach((n, i) => {
       const r = n.cover / TILE;
-      maxTiles = Math.max(maxTiles, r);
       grid.add(i, n.x - r, n.y - r, n.x + r, n.y + r);
     });
 

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'vitest';
 import type { Building, Pose } from '../data';
 import { TILE } from '../geometry';
-import type { Layout } from '../geometry';
+import type { GridPoint, Layout } from '../geometry';
 import { checkGeometry } from './geometry-checks';
 import {
   compositeLayout,
@@ -16,6 +16,7 @@ import {
   only,
   patchBuilding,
 } from './testkit';
+import type { P } from './testkit';
 import type { Violation, ViolationCode } from './types';
 
 const check = (kit: LayoutKit, layout: Layout = kit.layout()): Violation[] =>
@@ -285,6 +286,31 @@ describe('3 BELT_OVERLAP', () => {
     expect(only(check(kit), 'BELT_OVERLAP')).toEqual([]);
   });
 
+  test('two belts merging into one target node from opposite sides is accepted', () => {
+    const kit = new LayoutKit();
+    const target = kit.belt(1, 1001, line([0, 3], [6, 3]));
+    const sink = { kind: 'belt', beltId: target.id, node: 3 } as const;
+    kit.belt(1, 1001, line([3, 0], [3, 2]), { sink });
+    kit.belt(1, 1001, line([3, 6], [3, 4]), { sink });
+    expect(check(kit)).toEqual([]);
+  });
+
+  test('two belts that both END ON the target node overlap each other: unsupported in v1', () => {
+    // Each is exempt against the target node, but not against the other merging belt, so BELT_OVERLAP reports them.
+    // The router merges from the side (last node beside the target node), where two belts do not collide.
+    const kit = new LayoutKit();
+    const target = kit.belt(1, 1001, line([0, 3], [6, 3]));
+    const sink = { kind: 'belt', beltId: target.id, node: 3 } as const;
+    const a = kit.belt(1, 1001, line([3, 0], [3, 3]), { sink });
+    const b = kit.belt(1, 1001, line([3, 6], [3, 3]), { sink });
+    const v = only(check(kit), 'BELT_OVERLAP');
+    expect(v).toHaveLength(1);
+    expect(v[0].entities).toEqual([
+      { kind: 'belt', id: a.id, node: 3 },
+      { kind: 'belt', id: b.id, node: 3 },
+    ]);
+  });
+
   test('the merge exemption is only for that belt\'s last node on the declared target node', () => {
     const noSink = new LayoutKit();
     noSink.belt(1, 1001, line([0, 3], [6, 3]));
@@ -535,6 +561,56 @@ describe('7 BELT_PORT_MISMATCH', () => {
     const target = missingNode.belt(1, 1001, line([0, 3], [6, 3]));
     missingNode.belt(1, 1001, line([3, 0], [3, 2]), { sink: { kind: 'belt', beltId: target.id, node: 99 } });
     expect(only(check(missingNode), 'BELT_PORT_MISMATCH')).toHaveLength(1);
+  });
+
+  describe('a belt merging into another belt (sink: belt)', () => {
+    /** A target belt along y = 3, and a belt through `nodes` that merges into the target's node 3, the point (3, 3). */
+    function merge(nodes: readonly (P | GridPoint)[]) {
+      const kit = new LayoutKit();
+      const target = kit.belt(1, 1001, line([0, 3], [6, 3]));
+      const merging = kit.belt(1, 1001, nodes, { sink: { kind: 'belt', beltId: target.id, node: 3 } });
+      return { kit, target, merging };
+    }
+
+    test('pass: the last node is beside the target node (a side merge), from either side', () => {
+      for (const nodes of [line([3, 0], [3, 2]), line([3, 6], [3, 4])]) {
+        expect(check(merge(nodes).kit), `from (3, ${nodes[0].y})`).toEqual([]);
+      }
+    });
+
+    test('pass: the last node is the target node itself', () => {
+      const { kit } = merge(line([3, 0], [3, 3]));
+      expect(only(check(kit), 'BELT_PORT_MISMATCH')).toEqual([]);
+      expect(only(check(kit), 'BELT_OVERLAP')).toEqual([]);
+    });
+
+    test.each([
+      ['two tiles away', line([3, -2], [3, 1])],
+      ['diagonal to it', line([2, 0], [2, 2])],
+      ['beside it but one level higher', line([3, 0], [3, 2], 1)],
+    ])('fail: the last node is %s, naming both belts', (_name, nodes) => {
+      const { kit, target, merging } = merge(nodes);
+      const v = only(check(kit), 'BELT_PORT_MISMATCH');
+      expect(v).toHaveLength(1);
+      expect(v[0].entities).toEqual([
+        { kind: 'belt', id: merging.id, node: merging.nodes.length - 1 },
+        { kind: 'belt', id: target.id, node: 3 },
+      ]);
+      expect(v[0].message).toContain(`belt ${merging.id}`);
+      expect(v[0].message).toContain(`belt ${target.id}`);
+      expect(v[0].message).toMatch(/beside|one tile/);
+      expect(v[0].mirrors).toBe('BuildTool_Path.CheckBuildConditions');
+    });
+
+    test('fail: the target node is the first node of the target belt', () => {
+      const kit = new LayoutKit();
+      const target = kit.belt(1, 1001, line([3, 3], [8, 3]));
+      const merging = kit.belt(1, 1001, line([3, 0], [3, 2]), { sink: { kind: 'belt', beltId: target.id, node: 0 } });
+      const v = only(check(kit), 'BELT_PORT_MISMATCH');
+      expect(v).toHaveLength(1);
+      expect(v[0].message).toContain(`belt ${merging.id}`);
+      expect(v[0].message).toMatch(/first node/);
+    });
   });
 
   test('a port that does not face along an axis is reported, not thrown', () => {
@@ -890,6 +966,20 @@ describe('11 SORTER_IN_BUILDING', () => {
     kit.sorter(onNode(belt, 2), onSlot(asm, 3), 3);
     kit.building(ITEM.assembler, 3, 1, 0, { z: 5 });
     expect(only(check(kit), 'SORTER_IN_BUILDING')).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+
+describe('absurd coordinates', () => {
+  test('a sorter whose belt end is a billion tiles away is reported as out of reach, quickly', () => {
+    const { kit, asm } = lone();
+    const belt = kit.belt(1, 1001, [[1e9, 0], [1e9, 1], [1e9, 2]]);
+    kit.sorter(onNode(belt, 1), onSlot(asm, 3));
+    const t0 = performance.now();
+    const v = check(kit);
+    expect(performance.now() - t0).toBeLessThan(1000);
+    expect(only(v, 'SORTER_SPAN').some((x) => /reach/.test(x.message))).toBe(true);
   });
 });
 
