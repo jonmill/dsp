@@ -9,6 +9,9 @@ description = "Extract Dyson Sphere Program game data into the DSP Factory Plann
 requires-python = ">=3.11"
 dependencies = []
 
+[project.scripts]
+dsp-extract = "dsp_extract.cli:main"
+
 [project.optional-dependencies]
 game = [
   "UnityPy>=1.20",
