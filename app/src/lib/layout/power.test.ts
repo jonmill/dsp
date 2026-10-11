@@ -175,6 +175,31 @@ describe('placePowerNodes', () => {
     expect(placePowerNodes(buildings, [], new Set(), occupancyOf(buildings), data, effects)).toEqual([]);
   });
 
+  it('still links pre-existing nodes that cover everything but stand apart (no POWER_DISCONNECTED)', () => {
+    // two clusters 120 tiles apart, each with its own Tesla Tower at it: every consumer is covered, nothing is linked
+    const machines = [...row(2, 0, 1), ...row(2, 120, 3)];
+    const existing: PlacedBuilding[] = [
+      { id: 50, itemId: TESLA, x: 3, y: 4, z: 0, yaw: 0 },
+      { id: 51, itemId: TESLA, x: 123, y: 4, z: 0, yaw: 0 },
+    ];
+    const buildings = [...machines, ...existing];
+    expect(codes(layoutOf(buildings), /^POWER_/)).toEqual([expect.stringMatching(/^POWER_DISCONNECTED/)]);
+    const relays = placePowerNodes(buildings, [], new Set(), occupancyOf(buildings), data, effects);
+    expect(relays).not.toBeNull();
+    expect(relays!.length).toBeGreaterThanOrEqual(5);
+    expect(codes(layoutOf([...buildings, ...relays!]), /^(POWER_|BUILDING_)/)).toEqual([]);
+  });
+
+  it('returns null for pre-existing nodes that cover everything but stand apart when no node type is unlocked to link them', () => {
+    const machines = [...row(1, 0, 1), ...row(1, 120, 2)];
+    const existing: PlacedBuilding[] = [
+      { id: 50, itemId: TESLA, x: 3, y: 4, z: 0, yaw: 0 },
+      { id: 51, itemId: TESLA, x: 123, y: 4, z: 0, yaw: 0 },
+    ];
+    const buildings = [...machines, ...existing];
+    expect(placePowerNodes(buildings, [], new Set(), occupancyOf(buildings), data, withPoles())).toBeNull();
+  });
+
   it('covers the points in the validator sense: within the cover radius of the power point', () => {
     const machines = row(6);
     const points = [{ x: -9, y: 5 }, { x: 40, y: -7 }];

@@ -23,7 +23,8 @@
 // Links. Two nodes are linked when their power points are at most `min(connectDistance_a, connectDistance_b)` metres
 // apart, as in the validator. Components that the cover leaves apart are joined, closest pair first, by relay nodes
 // of the same type placed along the straight line between them, each about 0.9 of a link from the last (moved to
-// the nearest free lattice point when the exact spot is taken).
+// the nearest free lattice point when the exact spot is taken). The link phase also runs when the nodes that stand
+// already cover every consumer: covered is not connected.
 import type { GameDataIndex, TechEffects } from '../data';
 import { BELT_HALF_WIDTH_TILES, buildingDef, LayoutIndex, LEVEL, prefabToGrid, sorterEnds, TILE } from '../geometry';
 import type { Layout, PlacedBuilding } from '../geometry';
@@ -102,8 +103,9 @@ function bestPoleType(data: GameDataIndex, effects: TechEffects, occ: Occupancy)
 }
 
 /**
- * The nodes that power `buildings` and `consumerPoints`, or null when that cannot be done (no node type is unlocked,
- * or no free lattice point reaches a consumer, or a relay cannot be placed). `buildings` are all the buildings of the
+ * The nodes that power `buildings` and `consumerPoints`, or null when that cannot be done (no node type is unlocked
+ * and something is uncovered or the nodes that stand are apart, or no free lattice point reaches a consumer, or a
+ * relay cannot be placed). `buildings` are all the buildings of the
  * layout, which `occ` must hold (and nothing else: a probe node takes the id after the highest of `buildings`);
  * nodes among them count as already placed. `blockedPoints` holds "x,y" lattice cells
  * a node's body must keep off (see the file comment). Only the new nodes come back, as ground-level buildings with ids
@@ -131,10 +133,11 @@ export function placePowerNodes(
   }
   for (const p of consumerPoints) targets.push({ x: p.x, y: p.y });
   const covered = targets.map((t) => nodes.some((n) => n.cover > 0 && metres(n.x - t.x, n.y - t.y) <= n.cover - SLACK_M));
-  if (covered.every(Boolean)) return [];
 
+  // Nodes that already cover everything may still stand apart, so the link phase runs either way. Without an unlocked
+  // type there is nothing to cover or relay with, which only works out if nothing needs either.
   const type = bestPoleType(data, effects, occ);
-  if (!type) return null;
+  if (!type && !covered.every(Boolean)) return null;
   return new Placer(buildings, blockedPoints, occ, type, targets, covered, nodes).run();
 }
 
@@ -150,15 +153,21 @@ class Placer {
     buildings: PlacedBuilding[],
     private readonly blocked: Set<string>,
     private readonly occ: Occupancy,
-    private readonly type: PoleType,
+    private readonly poleType: PoleType | undefined,
     private readonly targets: { x: number; y: number }[],
     private readonly covered: boolean[],
     private readonly nodes: NodePoint[],
   ) {
     this.firstId = buildings.reduce((m, b) => Math.max(m, b.id), 0) + 1;
     // a belt node (or sorter cell) on a lattice point inside the body grown by half a belt is in the node's way
-    this.reachX = Math.ceil(type.halfX + BELT_HALF_WIDTH_TILES) - 1;
-    this.reachY = Math.ceil(type.halfY + BELT_HALF_WIDTH_TILES) - 1;
+    this.reachX = poleType ? Math.ceil(poleType.halfX + BELT_HALF_WIDTH_TILES) - 1 : 0;
+    this.reachY = poleType ? Math.ceil(poleType.halfY + BELT_HALF_WIDTH_TILES) - 1 : 0;
+  }
+
+  /** The node type, asked for only when a node is to be placed (`placePowerNodes` leaves it undefined only if none is). */
+  private get type(): PoleType {
+    if (!this.poleType) throw new Error('no power node type is unlocked');
+    return this.poleType;
   }
 
   run(): PlacedBuilding[] | null {
@@ -212,6 +221,7 @@ class Placer {
 
   /** Greedy set cover; false when a target has no free spot that reaches it. */
   private cover(): boolean {
+    if (!this.poleType) return true; // nothing is uncovered, or `placePowerNodes` would have refused
     const { targets, covered, type } = this;
     const r = type.cover / TILE;
     // candidate lattice points (the node's origin) and the targets each reaches, in the order they are found
@@ -312,6 +322,7 @@ class Placer {
 
   /** Relays from `from` towards `to` until the last one links to `to`. */
   private relayChain(from: NodePoint, to: NodePoint): boolean {
+    if (!this.poleType) return false;
     const { type } = this;
     let cur = from;
     for (let relays = 0; !this.linked(cur, to); relays++) {
