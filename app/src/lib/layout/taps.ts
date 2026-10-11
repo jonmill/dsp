@@ -11,8 +11,13 @@
 // the tap point T and T -/+ axis. They must be free for belts (`Occupancy.blockedForBelt`, which inflates every
 // footprint by half a belt and so is stricter than the slot's own `firstOutside`), and nobody else may need them:
 // not another net's tap, not a station port's two belt nodes. Taps of the same net on the same row may share nodes
-// (the belt just runs past them). The lattice points a span-2 or span-3 sorter reaches over (those between the slot
-// and T) must not lie inside a building (SORTER_IN_BUILDING); a belt may run there.
+// (the belt just runs past them), but a producer and a consumer of one net keep more than two nodes apart on a row,
+// or one straight pass would carry them in an order that starves the consumer. The lattice points a span-2 or span-3
+// sorter reaches over (those between the slot and T) must not lie inside a building (SORTER_IN_BUILDING); a belt may
+// run there.
+//
+// Skew poses. A slot or port that does not face along an axis is left out, the building's other poses still work
+// (`slotInfos` throws for the whole building, so each pose is tried alone, as the validator does).
 //
 // Which slot. Among the free slots at the smallest span: the one facing the centroid of the net's other taps (and
 // station ports) best, then the nearer tap point, then the lower index. Slots next to one already chosen for the same
@@ -21,7 +26,7 @@
 // Ports. A net that starts or ends at a station takes one of its 12 ports. A station's nets are matched to its ports
 // greedily by cost: the distance from the port's first lattice point outside to the net's tap centroid, plus a
 // penalty when the port faces away from it.
-import type { GameDataIndex, TechEffects } from '../data';
+import type { Building, GameDataIndex, TechEffects } from '../data';
 import { buildingDef, pointInOBBs, portInfos, slotInfos, sorterTapPoint } from '../geometry';
 import type { OBB2, PlacedBuilding, SlotInfo } from '../geometry';
 import { sorterRate } from '../validate/capacity';
@@ -111,8 +116,12 @@ class Assigner {
   private readonly boxes: Box[];
   private readonly blockedCache = new Map<number, boolean>();
   private readonly claims = new Map<number, Claim[]>();
+  /** Tap points chosen so far, by lattice point. */
+  private readonly tapCells = new Map<number, { netId: number; axis: 'x' | 'y'; dir: 'in' | 'out' }[]>();
   private readonly usedSlots = new Set<string>();
   private readonly slotCache = new Map<number, SlotInfo[]>();
+  /** Machines with slots left out because they do not face along an axis. */
+  private readonly skippedSlots = new Map<number, { skipped: number; cause: string }>();
   private readonly centers = new Map<number, { x: number; y: number }>();
   private readonly ports: AssignedStationPort[] = [];
   private readonly taps: AssignedTap[] = [];
@@ -160,16 +169,44 @@ class Assigner {
     return c;
   }
 
+  /**
+   * The usable slots (or ports) of a building. When `slotInfos`/`portInfos` throws because a pose does not face along
+   * an axis, each pose is tried alone, as the validator does, and only the bad ones are left out. `skipped` counts
+   * them, `cause` is the first reason.
+   */
+  private posesOf(b: PlacedBuilding, kind: 'slot' | 'port'): { usable: SlotInfo[]; skipped: number; cause?: string } {
+    const def = buildingDef(this.data, b.itemId);
+    const infos = kind === 'slot' ? slotInfos : portInfos;
+    try {
+      return { usable: infos(b, def), skipped: 0 };
+    } catch {
+      const key = kind === 'slot' ? 'slots' : 'ports';
+      const usable: SlotInfo[] = [];
+      let skipped = 0;
+      let cause: string | undefined;
+      def.geometry[key].forEach((pose, i) => {
+        const alone: Building = { ...def, geometry: { ...def.geometry, [key]: [pose] } };
+        try {
+          usable.push({ ...infos(b, alone)[0], index: i });
+        } catch (err) {
+          skipped++;
+          cause ??= (err instanceof Error ? err.message : String(err)).replace(new RegExp(` ${kind} 0\\b`), ` ${kind} ${i}`);
+        }
+      });
+      return { usable, skipped, cause };
+    }
+  }
+
   private slotsOf(machineId: number): SlotInfo[] {
     let infos = this.slotCache.get(machineId);
     if (!infos) {
       const b = this.building(placementBuildingIdOf(machineId), `machine ${machineId}`);
-      try {
-        infos = slotInfos(b, buildingDef(this.data, b.itemId));
-      } catch (err) {
-        const cause = err instanceof Error ? err.message : String(err);
-        throw new Failure(`machine ${machineId} (${this.nameOf(b)}): its sorter slots cannot be used: ${cause}`);
+      const { usable, skipped, cause } = this.posesOf(b, 'slot');
+      if (usable.length === 0 && skipped > 0) {
+        throw new Failure(`machine ${machineId} (${this.nameOf(b)}): none of its sorter slots can be used: ${cause}`);
       }
+      if (skipped > 0) this.skippedSlots.set(machineId, { skipped, cause: cause as string });
+      infos = usable;
       this.slotCache.set(machineId, infos);
     }
     return infos;
@@ -245,12 +282,9 @@ class Assigner {
     const stationIdxs = [...new Set(wants.map((w) => w.stationIdx))].sort((a, b) => a - b);
     for (const idx of stationIdxs) {
       const station = this.building(stationBuildingId(idx), `station ${idx}`);
-      let infos: SlotInfo[];
-      try {
-        infos = portInfos(station, buildingDef(this.data, station.itemId));
-      } catch (err) {
-        const cause = err instanceof Error ? err.message : String(err);
-        throw new Failure(`station ${idx} (${this.nameOf(station)}): its belt ports cannot be used: ${cause}`);
+      const { usable: infos, skipped, cause } = this.posesOf(station, 'port');
+      if (infos.length === 0 && skipped > 0) {
+        throw new Failure(`station ${idx} (${this.nameOf(station)}): none of its belt ports can be used: ${cause}`);
       }
       const usable = infos.filter((info) => {
         const { x, y } = info.firstOutside;
@@ -278,7 +312,9 @@ class Assigner {
           const left = mine.filter((w) => !done.has(w));
           throw new Failure(
             `net ${left[0].net.id}: station ${idx} (${this.nameOf(station)}) has no free usable belt port ` +
-              `(${mine.length} nets need one; ${usable.length} of its ${infos.length} ports are clear of buildings)`,
+              `(${mine.length} nets need one; ${usable.length} of its ${infos.length + skipped} ports are clear of buildings` +
+              (skipped > 0 ? ` and face along an axis: ${cause}` : '') +
+              ')',
           );
         }
         const { want, info } = best;
@@ -309,7 +345,12 @@ class Assigner {
   }
 
   /** Does a sorter of `span` on `slot` work for net `netId`? Returns where it taps, or undefined. */
-  private tapAt(netId: number, slot: SlotInfo, span: 1 | 2 | 3): { point: { x: number; y: number }; axis: 'x' | 'y' } | undefined {
+  private tapAt(
+    netId: number,
+    dir: 'in' | 'out',
+    slot: SlotInfo,
+    span: 1 | 2 | 3,
+  ): { point: { x: number; y: number }; axis: 'x' | 'y' } | undefined {
     for (let k = 0; k < span - 1; k++) {
       if (this.insideBuilding(slot.firstOutside.x + k * slot.dir[0], slot.firstOutside.y + k * slot.dir[1])) return undefined;
     }
@@ -319,6 +360,12 @@ class Assigner {
       const x = point.x + (axis === 'x' ? k : 0);
       const y = point.y + (axis === 'y' ? k : 0);
       if (this.blocked(x, y) || !this.free(netId, axis, x, y)) return undefined;
+    }
+    // The net's own taps on this row within two nodes would share one straight pass with this one, so a consumer
+    // would sit upstream of a producer on it (or the reverse): producers and consumers of a net keep apart.
+    for (const k of [-2, -1, 0, 1, 2]) {
+      const near = this.tapCells.get(keyOf(point.x + (axis === 'x' ? k : 0), point.y + (axis === 'y' ? k : 0)));
+      if (near?.some((t) => t.netId === netId && t.axis === axis && t.dir !== dir)) return undefined;
     }
     return { point, axis };
   }
@@ -338,7 +385,7 @@ class Assigner {
       for (const slot of slots) {
         if (this.usedSlots.has(`${tap.machineId}:${slot.index}`)) continue;
         for (const span of SPANS) {
-          const at = this.tapAt(n.id, slot, span);
+          const at = this.tapAt(n.id, tap.dir, slot, span);
           if (!at) continue;
           const c = this.score(slot, span, at, goal, chosen);
           if (!best || this.better(c, best)) best = c;
@@ -346,15 +393,22 @@ class Assigner {
         }
       }
       if (!best) {
+        const skip = this.skippedSlots.get(tap.machineId);
         throw new Failure(
           `net ${n.id}: machine ${tap.machineId} (${this.nameOf(b)}) has no usable sorter slot left for item ` +
             `${tap.itemId} (${tap.dir === 'in' ? 'input' : 'output'} of ${+tap.rate.toFixed(3)}/s: ` +
             `${chosen.length} sorter${chosen.length === 1 ? '' : 's'} placed carry ${+capacity.toFixed(3)}/s; ` +
-            `each of its ${slots.length} slots is taken, blocked, or needs ground another net uses)`,
+            `each of its ${slots.length} usable slots is taken, blocked, or needs ground another net uses` +
+            (skip ? `; ${skip.skipped} more do not face along an axis: ${skip.cause}` : '') +
+            ')',
         );
       }
       chosen.push(best);
       this.usedSlots.add(`${tap.machineId}:${best.slot.index}`);
+      const cellKey = keyOf(best.point.x, best.point.y);
+      const here = this.tapCells.get(cellKey);
+      if (here) here.push({ netId: n.id, axis: best.axis, dir: tap.dir });
+      else this.tapCells.set(cellKey, [{ netId: n.id, axis: best.axis, dir: tap.dir }]);
       for (const k of [-1, 0, 1]) {
         this.claim(n.id, best.axis, best.point.x + (best.axis === 'x' ? k : 0), best.point.y + (best.axis === 'y' ? k : 0));
       }
@@ -413,9 +467,8 @@ class Assigner {
 
 /**
  * Picks the sorter slots and station ports of a placed netlist (see the file comment). `occ` must hold the buildings
- * of `placement`. Returns `{ failed }` with a message when a machine runs out of usable slots, a station out of
- * usable ports, or a building's slots or ports cannot be read (one pose that does not face along an axis makes all
- * of that building's unusable). The taps come back in net order, then the order of the net's taps, then sorter index.
+ * of `placement`. Returns `{ failed }` with a message when a machine runs out of usable slots or a station out of
+ * usable ports (poses that do not face along an axis do not count, and are named in the message). The taps come back in net order, then the order of the net's taps, then sorter index.
  */
 export function assignTaps(
   net: Netlist,

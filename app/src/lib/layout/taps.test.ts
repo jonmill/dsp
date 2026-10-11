@@ -268,22 +268,117 @@ describe('assignTaps slot rules', () => {
     expect((res as { failed: string }).failed).toMatch(/slot/);
   });
 
-  it('treats the slots of a skew building as unusable, with a clear message', () => {
-    const skew = { position: [1.11, 0, 0] as [number, number, number], rotation: [0, Math.sin(Math.PI / 12), 0, Math.cos(Math.PI / 12)] as [number, number, number, number] };
-    const patched = patchBuilding(fixtureData, ASSEMBLER, (b) => ({
-      ...b,
-      geometry: { ...b.geometry, slots: b.geometry.slots.map((s, i) => (i === 3 ? skew : s)) },
-    }));
-    const { buildings, placement } = lone(ASSEMBLER);
+  describe('poses that do not face along an axis', () => {
+    const skewRotation: [number, number, number, number] = [0, Math.sin(Math.PI / 12), 0, Math.cos(Math.PI / 12)];
+    const twoMachines = (rate: number) =>
+      synthNetlist(
+        [{ building: ASSEMBLER, count: 2 }],
+        [],
+        [
+          {
+            taps: [
+              { machineId: 1, itemId: 1001, dir: 'out', rate, sorters: 1 },
+              { machineId: 2, itemId: 1001, dir: 'in', rate, sorters: 1 },
+            ],
+          },
+        ],
+      );
+    const eastWest = (): { buildings: PlacedBuilding[]; placement: Placement } => {
+      const a: PlacedBuilding = { id: placementBuildingIdOf(1), itemId: ASSEMBLER, x: 0, y: 0, z: 0, yaw: 0 };
+      const b: PlacedBuilding = { id: placementBuildingIdOf(2), itemId: ASSEMBLER, x: 20, y: 0, z: 0, yaw: 0 };
+      return { buildings: [a, b], placement: { buildings: [a, b], cost: 0 } };
+    };
+
+    it('leave out only that slot: the others of the building still work', () => {
+      const patched = patchBuilding(fixtureData, ASSEMBLER, (b) => ({
+        ...b,
+        geometry: { ...b.geometry, slots: b.geometry.slots.map((s, i) => (i === 3 ? { ...s, rotation: skewRotation } : s)) },
+      }));
+      // premise: the slots of the building cannot be read as a whole any more
+      const a = eastWest().buildings[0];
+      expect(() => slotInfos(a, buildingDef(patched, ASSEMBLER))).toThrow(/axis/);
+      const { buildings, placement } = eastWest();
+      // 4.0/s needs three Mk.I sorters at span 1, and the east face (slots 3, 4, 5) is the favourite
+      const res = ok(assignTaps(twoMachines(4.0), placement, occupancyOf(buildings), patched, effects));
+      const mine = res.taps.filter((t) => t.machineId === 1);
+      expect(mine).toHaveLength(3);
+      expect(mine.map((t) => t.slot)).not.toContain(3);
+      expect(mine.map((t) => t.slot)).toEqual(expect.arrayContaining([4, 5]));
+    });
+
+    it('make the building fail only when none is left, naming the cause', () => {
+      const patched = patchBuilding(fixtureData, ASSEMBLER, (b) => ({
+        ...b,
+        geometry: { ...b.geometry, slots: b.geometry.slots.map((s) => ({ ...s, rotation: skewRotation })) },
+      }));
+      const { buildings, placement } = eastWest();
+      const res = assignTaps(twoMachines(0.5), placement, occupancyOf(buildings), patched, effects);
+      expect(res).toHaveProperty('failed');
+      expect((res as { failed: string }).failed).toMatch(/machine 1/);
+      expect((res as { failed: string }).failed).toMatch(/none of its sorter slots/);
+      expect((res as { failed: string }).failed).toMatch(/axis/);
+    });
+
+    it('name the skew slots when a machine runs out of the others', () => {
+      const patched = patchBuilding(fixtureData, ASSEMBLER, (b) => ({
+        ...b,
+        geometry: { ...b.geometry, slots: b.geometry.slots.map((s, i) => (i < 11 ? { ...s, rotation: skewRotation } : s)) },
+      }));
+      const { buildings, placement } = eastWest();
+      const res = assignTaps(twoMachines(4.0), placement, occupancyOf(buildings), patched, effects);
+      expect(res).toHaveProperty('failed');
+      expect((res as { failed: string }).failed).toMatch(/11 more do not face along an axis/);
+    });
+
+    it('leave out only that port of a station', () => {
+      const patched = patchBuilding(fixtureData, PLS, (b) => ({
+        ...b,
+        geometry: { ...b.geometry, ports: b.geometry.ports.map((p, i) => (i === 10 ? { ...p, rotation: skewRotation } : p)) },
+      }));
+      const net = synthNetlist(
+        [{ building: ASSEMBLER, count: 1 }],
+        [PLS],
+        [{ source: { kind: 'station', stationIdx: 0 }, taps: [{ machineId: 1, itemId: 1001, dir: 'in', rate: 0.5, sorters: 1 }] }],
+      );
+      const station: PlacedBuilding = { id: stationBuildingId(0), itemId: PLS, x: 0, y: 0, z: 0, yaw: 0, role: 'station:0' };
+      const m: PlacedBuilding = { id: placementBuildingIdOf(1), itemId: ASSEMBLER, x: 30, y: 0, z: 0, yaw: 0 };
+      const occ = occupancyOf([station, m]);
+      const plain = ok(assignTaps(net, { buildings: [station, m], cost: 0 }, occ, data, effects));
+      expect(plain.stationPorts[0].port).toBe(10);
+      const res = ok(assignTaps(net, { buildings: [station, m], cost: 0 }, occ, patched, effects));
+      expect(res.stationPorts).toHaveLength(1);
+      expect(res.stationPorts[0].port).not.toBe(10);
+    });
+  });
+
+  it('keeps the producers and consumers of a net apart on a row, so no consumer sits upstream of a producer', () => {
+    // facing machines with a one-lattice-line gap: their favourite slots meet on the same row
+    const a: PlacedBuilding = { id: placementBuildingIdOf(1), itemId: ASSEMBLER, x: 0, y: 0, z: 0, yaw: 0 };
+    const b: PlacedBuilding = { id: placementBuildingIdOf(2), itemId: ASSEMBLER, x: 4, y: 0, z: 0, yaw: 0 };
     const net = synthNetlist(
-      [{ building: ASSEMBLER, count: 1 }],
+      [{ building: ASSEMBLER, count: 2 }],
       [],
-      [{ taps: [{ machineId: 1, itemId: 1001, dir: 'out', rate: 0.5, sorters: 1 }] }],
+      [
+        {
+          taps: [
+            { machineId: 1, itemId: 1001, dir: 'out', rate: 0.5, sorters: 1 },
+            { machineId: 2, itemId: 1001, dir: 'in', rate: 0.5, sorters: 1 },
+          ],
+        },
+      ],
     );
-    const res = assignTaps(net, placement, occupancyOf(buildings), patched, effects);
-    expect(res).toHaveProperty('failed');
-    expect((res as { failed: string }).failed).toMatch(/machine 1/);
-    expect((res as { failed: string }).failed).toMatch(/axis/);
+    const res = ok(assignTaps(net, { buildings: [a, b], cost: 0 }, occupancyOf([a, b]), data, effects));
+    const out = res.taps.filter((t) => t.dir === 'out');
+    const inn = res.taps.filter((t) => t.dir === 'in');
+    expect(out.length).toBeGreaterThan(0);
+    expect(inn.length).toBeGreaterThan(0);
+    for (const p of out) {
+      for (const c of inn) {
+        const sameRow = p.axis === c.axis && (p.axis === 'x' ? p.point.y === c.point.y : p.point.x === c.point.x);
+        const apart = p.axis === 'x' ? Math.abs(p.point.x - c.point.x) : Math.abs(p.point.y - c.point.y);
+        expect(!sameRow || apart > 2, `producer ${JSON.stringify(p.point)} and consumer ${JSON.stringify(c.point)}`).toBe(true);
+      }
+    }
   });
 
   it('fails when a station has no free port', () => {

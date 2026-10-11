@@ -159,6 +159,20 @@ describe('routeNets: crossings', () => {
     expect(res.routes).toHaveLength(2);
   });
 
+  it('is deterministic across negotiation rounds', () => {
+    const specs: Spec[] = [
+      ...cross,
+      { id: 3, source: { x: 0, y: 6, dir: E }, sink: { x: 20, y: 14, dir: W } },
+      { id: 4, source: { x: 6, y: 0, dir: N }, sink: { x: 14, y: 20, dir: S } },
+    ];
+    const a = route(specs, { maxLevel: 2 });
+    expect(a.ok).toBe(true);
+    expect(route(specs, { maxLevel: 2 })).toEqual(a);
+    const failing = route(specs, { allowElevation: false, maxIterations: 6 });
+    expect(failing.ok).toBe(false);
+    expect(route(specs, { allowElevation: false, maxIterations: 6 })).toEqual(failing);
+  });
+
   it('maxLevel 0 is the same as no elevation', () => {
     const res = route(cross, { allowElevation: true, maxLevel: 0, maxIterations: 8 });
     expect(res.ok).toBe(false);
@@ -178,25 +192,30 @@ describe('routeNets: crossings', () => {
 });
 
 describe('routeNets: taps and waypoints', () => {
-  it('passes a tap with axis y straight along y, and the next leg does not reverse', () => {
+  it('passes a tap with axis y straight along y and carries on to the next stop without reversing', () => {
     const res = route([
       {
         id: 1,
         source: { x: 2, y: 2, dir: E },
         taps: [{ x: 10, y: 10, axis: 'y', dir: 'in' }],
+        sink: { x: 3, y: 18, dir: E },
       },
     ]);
     expect(res.ok).toBe(true);
     const nodes = routeOf(res, 1);
     const i = at(nodes, 10, 10);
     expect(i).toBeGreaterThan(0);
-    expect(i).toBeLessThan(nodes.length - 1);
+    // the leg to the sink port follows the tap
+    expect(i).toBeLessThan(nodes.length - 3);
+    expect(nodes[nodes.length - 1]).toEqual({ x: 3, y: 18, z: 0 });
     expect(nodes[i - 1].x).toBe(10);
     expect(nodes[i + 1].x).toBe(10);
     expect(nodes[i - 1].z).toBe(0);
     expect(nodes[i + 1].z).toBe(0);
     // collinear: the step into the tap is the step out of it
     expect(nodes[i].y - nodes[i - 1].y).toBe(nodes[i + 1].y - nodes[i].y);
+    // the next leg starts in the heading it arrived in: no node is revisited two steps on
+    for (let k = 2; k < nodes.length; k++) expect(nodes[k], `U-turn at node ${k}`).not.toEqual(nodes[k - 2]);
   });
 
   it('a dead-end taps belt starts one node before its first tap and ends one node after its last, along the axes', () => {
@@ -394,5 +413,147 @@ describe('routeNets: stations', () => {
     const res = routeNets(net, taps, occ, params({ bounds: { minX: -10, minY: 0, maxX: 40, maxY: 20 } }), never);
     expect(res.ok).toBe(true);
     expect(routeOf(res, 1)).toHaveLength(23);
+  });
+});
+
+describe('routeNets: regressions', () => {
+  // five random nets round three obstacle buildings (a scratch seed); the first subset used to end with a net dropped
+  const seed: Spec[] = [
+    { id: 1, taps: [{ x: 13, y: 2, axis: 'x', dir: 'in' }], source: { x: 20, y: 4, dir: E }, sink: { x: 16, y: 22, dir: E } },
+    { id: 2, taps: [{ x: 8, y: 5, axis: 'x', dir: 'in' }], source: { x: 12, y: 25, dir: E }, sink: { x: 19, y: 21, dir: E } },
+    { id: 3, taps: [{ x: 10, y: 9, axis: 'y', dir: 'in' }], source: { x: 3, y: 11, dir: E } },
+    {
+      id: 4,
+      taps: [
+        { x: 19, y: 24, axis: 'y', dir: 'in' },
+        { x: 26, y: 9, axis: 'x', dir: 'in' },
+      ],
+      source: { x: 14, y: 10, dir: E },
+      sink: { x: 23, y: 22, dir: E },
+    },
+    {
+      id: 5,
+      taps: [
+        { x: 2, y: 2, axis: 'y', dir: 'in' },
+        { x: 17, y: 18, axis: 'y', dir: 'in' },
+      ],
+      source: { x: 25, y: 25, dir: E },
+      sink: { x: 7, y: 15, dir: N },
+    },
+  ];
+  const seedObstacles: PlacedBuilding[] = [
+    { id: 100, itemId: ASSEMBLER, x: 10, y: 14, z: 0, yaw: 0 },
+    { id: 101, itemId: ASSEMBLER, x: 9, y: 19, z: 0, yaw: 0 },
+    { id: 102, itemId: ASSEMBLER, x: 18, y: 8, z: 0, yaw: 0 },
+  ];
+  const big = { minX: 0, minY: 0, maxX: 30, maxY: 30 };
+
+  it('keeps going until every net has a route and nothing is shared', () => {
+    // nets 5, 1, 2 and 3 of the seed, renumbered 1..4
+    const specs = [seed[4], seed[0], seed[1], seed[2]].map((x, i) => ({ ...x, id: i + 1 }));
+    const res = route(specs, { maxIterations: 30, bounds: big }, seedObstacles);
+    expect(res.ok).toBe(true);
+    expect(res.routes.every((r) => r.nodes.length > 2)).toBe(true);
+    expect(beltViolations(res.routes, seedObstacles)).toEqual([]);
+  });
+
+  it('the whole seed routes too, and never with fewer nets routed than a shorter run had', () => {
+    const specs = seed.map((x, i) => ({ ...x, id: i + 1 }));
+    const unroutable = (maxIterations: number) => {
+      const r = route(specs, { maxIterations, bounds: big }, seedObstacles);
+      return r.ok ? [] : r.unroutable;
+    };
+    const counts = [1, 2, 4, 8, 16, 30].map((n) => unroutable(n).length);
+    for (let i = 1; i < counts.length; i++) expect(counts[i]).toBeLessThanOrEqual(counts[i - 1]);
+    expect(counts[counts.length - 1]).toBe(0);
+  });
+
+  // two producers; the belt ends at a sink port whose approach node (19, 6) lies on the way to the second producer
+  it('keeps the node a sink port is entered through for the last leg (no trap in open space)', () => {
+    const taps: Spec['taps'] = [
+      { x: 2, y: 17, axis: 'x', dir: 'out' },
+      { x: 19, y: 4, axis: 'y', dir: 'out' },
+    ];
+    const res = route([{ id: 1, taps, sink: { x: 18, y: 6, dir: E } }], { bounds: big });
+    expect(res.ok).toBe(true);
+    const nodes = routeOf(res, 1);
+    expect(nodes[nodes.length - 1]).toEqual({ x: 18, y: 6, z: 0 });
+    expect(nodes[nodes.length - 2]).toEqual({ x: 19, y: 6, z: 0 });
+    expect(new Set(nodes.map((p) => `${p.x},${p.y},${p.z}`)).size).toBe(nodes.length);
+    // the moved tap routed before too
+    const moved = route([{ id: 1, taps: [taps[0], { x: 19, y: 10, axis: 'y', dir: 'out' }], sink: { x: 18, y: 6, dir: E } }], { bounds: big });
+    expect(moved.ok).toBe(true);
+  });
+
+  it('lets the last tap run end on the node the sink port is entered through: a straight line into the port', () => {
+    const res = route([{ id: 1, taps: [{ x: 19, y: 13, axis: 'x', dir: 'out' }], sink: { x: 17, y: 13, dir: E } }], { bounds: big });
+    expect(res.ok).toBe(true);
+    expect(routeOf(res, 1).map((p) => `${p.x},${p.y}`)).toEqual(['20,13', '19,13', '18,13', '17,13']);
+  });
+
+  describe('producers come before consumers', () => {
+    // a producer tap (8, 10) and a consumer tap (9, 10) side by side: one straight pass, producer first
+    const mixed = (sink: Spec['sink']): { producer: number; consumer: number; ok: boolean } => {
+      const res = route([
+        {
+          id: 1,
+          sink,
+          taps: [
+            { x: 9, y: 10, axis: 'x', dir: 'in' },
+            { x: 8, y: 10, axis: 'x', dir: 'out' },
+          ],
+        },
+      ]);
+      const nodes = routeOf(res, 1);
+      return { ok: res.ok, producer: at(nodes, 8, 10), consumer: at(nodes, 9, 10) };
+    };
+
+    it('whichever side the sink port is on', () => {
+      for (const sink of [{ x: 19, y: 19, dir: W }, { x: 1, y: 19, dir: E }]) {
+        const r = mixed(sink);
+        expect(r.ok).toBe(true);
+        expect(r.producer, `sink ${JSON.stringify(sink)}`).toBeGreaterThanOrEqual(0);
+        expect(r.producer).toBeLessThan(r.consumer);
+      }
+    });
+
+    it('with one node between them', () => {
+      for (const sink of [{ x: 19, y: 19, dir: W }, { x: 1, y: 19, dir: E }]) {
+        const res = route([
+          {
+            id: 1,
+            sink,
+            taps: [
+              { x: 8, y: 10, axis: 'x', dir: 'out' },
+              { x: 10, y: 10, axis: 'x', dir: 'in' },
+            ],
+          },
+        ]);
+        expect(res.ok).toBe(true);
+        const nodes = routeOf(res, 1);
+        expect(at(nodes, 8, 10)).toBeLessThan(at(nodes, 10, 10));
+        expect(at(nodes, 9, 10)).toBe(at(nodes, 8, 10) + 1);
+      }
+    });
+
+    it('across stops: every producer stop precedes every consumer stop, whatever the cost', () => {
+      // the consumer is next to the station-side end of the belt; the producer is far away
+      const res = route([
+        {
+          id: 1,
+          sink: { x: 19, y: 10, dir: W },
+          taps: [
+            { x: 16, y: 10, axis: 'x', dir: 'in' },
+            { x: 3, y: 3, axis: 'x', dir: 'out' },
+            { x: 3, y: 17, axis: 'x', dir: 'out' },
+          ],
+        },
+      ]);
+      expect(res.ok).toBe(true);
+      const nodes = routeOf(res, 1);
+      const consumer = at(nodes, 16, 10);
+      expect(at(nodes, 3, 3)).toBeLessThan(consumer);
+      expect(at(nodes, 3, 17)).toBeLessThan(consumer);
+    });
   });
 });

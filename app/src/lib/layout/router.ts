@@ -4,17 +4,21 @@
 // free unless `Occupancy.blockedForBelt` says a building is there, or, at z 0, it is a tap point or a station port
 // point (another net's, or this net's own, which it only enters as a waypoint). A net never uses a cell twice.
 //
-// Stops. A net visits, in order: its source port (if it has one), the runs of tap points of its producers, those of
-// its consumers, and its sink port (if it has one). A run is a set of taps of the net side by side on one row, which
-// one straight pass serves; the producers are ordered by nearest neighbour from the source (or, for a belt that
-// starts at its first tap, from the producer farthest from where the belt ends), the consumers likewise from the
-// last producer. Each stop is a goal that a leg of A* ends at:
+// Stops. A net visits, in order: its source port (if it has one), the runs of tap points of its producers, then those
+// of its consumers, and its sink port (if it has one). Producers always come before consumers, whatever it costs: a
+// consumer upstream of a producer is never fed by it. A run is a set of taps of the net on one row at most two nodes
+// apart, which one straight pass serves (a run with producers and consumers is passed producers first). The
+// producers are ordered by nearest neighbour from the source (or, for a belt that starts at its first tap, from the
+// producer farthest from where the belt ends), the consumers likewise from the last producer. Each stop is a goal
+// that a leg of A* ends at:
 //  - a tap run is entered along its axis by a flat step into its first tap, run through, and left by one more
 //    straight node, so every tap has a node before and after it on the same line at z 0 (SORTER_BELT_TANGENT, and no
-//    height change beside it). Either direction along the axis may be taken. A belt that starts at its first tap
-//    begins one node before it; a belt that ends at its last tap ends one node after it;
+//    height change beside it). Either direction along the axis may be taken unless a run needs producers first. A
+//    belt that starts at its first tap begins one node before it; a belt that ends at its last tap ends one node
+//    after it;
 //  - a source port is the first node, stepping straight out of the port; a sink port is the last node, reached by a
-//    step straight into it.
+//    step straight into it. The node the sink port is entered through is kept for the last leg (the tap run before it
+//    may end on it, which makes a straight line into the port), so no earlier leg walls the port in.
 // Each leg starts where the one before ended, with the same heading and straight count, so there is no U-turn at a
 // waypoint.
 //
@@ -27,12 +31,15 @@
 // that would end a belt in a state the validator rejects (a lift not yet followed by two flat steps) are not goals.
 //
 // Cost and negotiation. A cell costs 1 + 0.5 z + presentFactor * (other nets on it) + history. Every net is routed
-// once, in order of tap count; then the nets that share a cell are ripped up and routed again (the others keep their
-// routes), the history of each shared cell grows by `historyFactor` times the present factor, the present factor
-// grows, and so on until no cell is shared or maxIterations is reached. Scaling the history with the present factor
-// keeps a cell that stays shared from being cheaper to hold than a detour across two cells others hold, which left
-// the last conflicts of large layouts unresolved. The forced nodes of a stop (the node before and after a tap, the
-// step out of a port) count as the net's cells like any other, so the other nets are steered off them.
+// once, in order of tap count; then the nets that share a cell, and those still without a route, are ripped up and
+// routed again (the others keep their routes), the history of each shared cell grows by `historyFactor` times the
+// present factor, the present factor grows, and so on until no cell is shared and every net has a route, or
+// maxIterations is reached (or a round changes nothing). A net whose new route fails keeps its old one. Scaling the
+// history with the present factor keeps a cell that stays shared from being cheaper to hold than a detour across two
+// cells others hold, which left the last conflicts of large layouts unresolved. The result is the round with the
+// fewest nets without a route and, among those, the fewest shared cells. The forced nodes of a stop (the node before
+// and after a tap, the step out of a port) count as the net's cells like any other, so the other nets are steered
+// off them.
 import type { GridPoint } from '../geometry';
 import { MinHeap } from './heap';
 import type { Netlist } from './netlist';
@@ -116,12 +123,19 @@ interface Cell {
   x: number;
   y: number;
 }
-/** Taps of one net side by side on one row, in ascending order along `axis`. */
+/**
+ * Taps of one net on one row at most two nodes apart, in ascending order along `axis`, with the node between two taps
+ * two apart: one straight pass serves them all.
+ */
 interface RunStop {
   kind: 'run';
   axis: 'x' | 'y';
   cells: Cell[];
+  /** Per cell: the tap's direction, or null for a node between two taps. */
+  kinds: (TapDir | null)[];
   center: Cell;
+  /** The directions along the axis (+1 ascending, -1 descending) the belt may pass the run in. */
+  signs: (1 | -1)[];
 }
 interface PortStop {
   kind: 'start' | 'end';
@@ -131,11 +145,38 @@ interface PortStop {
   facing: number;
 }
 type Stop = RunStop | PortStop;
+type TapDir = AssignedTap['dir'];
 
-const stopCenter = (s: Stop): Cell => (s.kind === 'run' ? s.center : { x: s.x, y: s.y });
+/** No consumer before a producer in `kinds`, in the order they are passed. */
+const producersFirst = (kinds: (TapDir | null)[]): boolean => {
+  let seenIn = false;
+  for (const k of kinds) {
+    if (k === 'in') seenIn = true;
+    else if (k === 'out' && seenIn) return false;
+  }
+  return true;
+};
+/** The first tap in `kinds` is a producer. */
+const startsWithProducer = (kinds: (TapDir | null)[]): boolean => kinds.find((k) => k !== null) !== 'in';
 
-/** The runs of a set of tap cells: contiguous cells on one row and axis. */
-function runsOf(cells: Map<number, { x: number; y: number; axis: 'x' | 'y' }>): RunStop[] {
+/**
+ * Along which directions a belt may pass a run so that consumers are fed: with producers and consumers in one run,
+ * the producers have to come first. If the run cannot be passed that way (a consumer between two producers), at least
+ * the first tap must be a producer; if even that cannot be, both directions are allowed (nothing better exists).
+ */
+function signsOf(kinds: (TapDir | null)[]): (1 | -1)[] {
+  const reversed = [...kinds].reverse();
+  for (const ok of [producersFirst, startsWithProducer]) {
+    const signs: (1 | -1)[] = [];
+    if (ok(kinds)) signs.push(1);
+    if (ok(reversed)) signs.push(-1);
+    if (signs.length > 0) return signs;
+  }
+  return [1, -1];
+}
+
+/** The runs of a set of tap cells: cells on one row and axis, at most two apart. */
+function runsOf(cells: Map<number, { x: number; y: number; axis: 'x' | 'y'; dir: TapDir }>): RunStop[] {
   const list = [...cells.values()];
   list.sort((a, b) => {
     if (a.axis !== b.axis) return a.axis < b.axis ? -1 : 1;
@@ -148,15 +189,25 @@ function runsOf(cells: Map<number, { x: number; y: number; axis: 'x' | 'y' }>): 
   let cur: RunStop | undefined;
   for (const c of list) {
     const last = cur?.cells[cur.cells.length - 1];
-    const joins =
-      cur !== undefined &&
-      last !== undefined &&
-      cur.axis === c.axis &&
-      (c.axis === 'x' ? c.y === last.y && c.x === last.x + 1 : c.x === last.x && c.y === last.y + 1);
-    if (joins && cur) {
+    const gap =
+      cur !== undefined && last !== undefined && cur.axis === c.axis
+        ? c.axis === 'x'
+          ? c.y === last.y
+            ? c.x - last.x
+            : Infinity
+          : c.x === last.x
+            ? c.y - last.y
+            : Infinity
+        : Infinity;
+    if (cur && last && gap <= 2) {
+      if (gap === 2) {
+        cur.cells.push({ x: c.axis === 'x' ? last.x + 1 : last.x, y: c.axis === 'y' ? last.y + 1 : last.y });
+        cur.kinds.push(null);
+      }
       cur.cells.push({ x: c.x, y: c.y });
+      cur.kinds.push(c.dir);
     } else {
-      cur = { kind: 'run', axis: c.axis, cells: [{ x: c.x, y: c.y }], center: { x: c.x, y: c.y } };
+      cur = { kind: 'run', axis: c.axis, cells: [{ x: c.x, y: c.y }], kinds: [c.dir], center: { x: c.x, y: c.y }, signs: [1, -1] };
       runs.push(cur);
     }
   }
@@ -164,6 +215,7 @@ function runsOf(cells: Map<number, { x: number; y: number; axis: 'x' | 'y' }>): 
     const a = r.cells[0];
     const b = r.cells[r.cells.length - 1];
     r.center = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+    r.signs = signsOf(r.kinds);
   }
   return runs;
 }
@@ -190,7 +242,12 @@ function nearestFirst(pool: RunStop[], from: Cell): RunStop[] {
   return out;
 }
 
-/** The stops of a net in visiting order, or undefined when it has nothing to connect. */
+/**
+ * The stops of a net in visiting order, or undefined when it has nothing to connect. Producers always come before
+ * consumers, whatever it costs: the belt carries the producers' items downstream only. So: the source port, the
+ * runs of producers, the runs with both (their producers first, see `signsOf`), the runs of consumers, the sink port;
+ * each group by nearest neighbour from the one before.
+ */
 function stopsOf(
   hasSource: boolean,
   hasSink: boolean,
@@ -201,53 +258,59 @@ function stopsOf(
   const sink = ports.find((p) => p.end === 'sink');
   if ((hasSource && !source) || (hasSink && !sink)) return undefined;
 
-  // one map of tap cells, so taps side by side join into one run whoever produces or consumes; a run with a producer
-  // in it is a producer run
-  const cellsByKey = new Map<number, { x: number; y: number; axis: 'x' | 'y'; producer: boolean }>();
+  // one map of tap cells, so taps side by side join into one run whoever produces or consumes; a cell with a producer
+  // on it is a producer cell
+  const cellsByKey = new Map<number, { x: number; y: number; axis: 'x' | 'y'; dir: TapDir }>();
   const key = (x: number, y: number) => x * 1_000_003 + y;
   for (const t of taps) {
     const k = key(t.point.x, t.point.y);
     const known = cellsByKey.get(k);
-    cellsByKey.set(k, { ...t.point, axis: t.axis, producer: t.dir === 'out' || (known?.producer ?? false) });
+    cellsByKey.set(k, { ...t.point, axis: t.axis, dir: t.dir === 'out' || known?.dir === 'out' ? 'out' : 'in' });
   }
-  const allRuns = runsOf(new Map([...cellsByKey].map(([k, c]) => [k, { x: c.x, y: c.y, axis: c.axis }])));
-  const isProducer = (r: RunStop): boolean => r.cells.some((c) => cellsByKey.get(key(c.x, c.y))?.producer);
-  let producers = allRuns.filter(isProducer);
-  const consumers = allRuns.filter((r) => !isProducer(r));
+  const allRuns = runsOf(cellsByKey);
+  if (!source && allRuns.length === 0) return undefined;
+  const has = (r: RunStop, d: TapDir): boolean => r.kinds.includes(d);
+  const groups = [
+    allRuns.filter((r) => !has(r, 'in')),
+    allRuns.filter((r) => has(r, 'in') && has(r, 'out')),
+    allRuns.filter((r) => !has(r, 'out')),
+  ];
 
   const stops: Stop[] = [];
-  const all = [...producers, ...consumers];
-  if (!source && all.length === 0) return undefined;
+  let from: Cell | undefined;
   if (source) {
     stops.push({ kind: 'start', x: source.point.x, y: source.point.y, facing: headingOf(source.dir[0], source.dir[1]) });
-    producers = nearestFirst(producers, source.point);
-  } else if (producers.length > 0) {
-    // the belt starts at a producer: the one farthest from where the belt goes on
-    let anchor: Cell;
-    if (sink) {
-      anchor = sink.point;
-    } else {
-      anchor = {
-        x: all.reduce((s, r) => s + r.center.x, 0) / all.length,
-        y: all.reduce((s, r) => s + r.center.y, 0) / all.length,
-      };
-    }
-    let first = 0;
-    let far = -1;
-    producers.forEach((r, i) => {
-      const d = manhattan(r.center.x, r.center.y, anchor.x, anchor.y);
-      if (d > far) {
-        far = d;
-        first = i;
-      }
-    });
-    const [head] = producers.splice(first, 1);
-    producers = [head, ...nearestFirst(producers, head.center)];
+    from = source.point;
   }
-  stops.push(...producers);
-  const last = stops[stops.length - 1];
-  const reference: Cell = last ? stopCenter(last) : (consumers[0]?.center ?? { x: 0, y: 0 });
-  stops.push(...nearestFirst(consumers, reference));
+  for (const group of groups) {
+    let pool = group;
+    if (pool.length === 0) continue;
+    if (!from) {
+      // the belt starts here: at the run farthest from where the belt goes on
+      const anchor: Cell = sink
+        ? sink.point
+        : {
+            x: allRuns.reduce((s, r) => s + r.center.x, 0) / allRuns.length,
+            y: allRuns.reduce((s, r) => s + r.center.y, 0) / allRuns.length,
+          };
+      let first = 0;
+      let far = -1;
+      pool.forEach((r, i) => {
+        const d = manhattan(r.center.x, r.center.y, anchor.x, anchor.y);
+        if (d > far) {
+          far = d;
+          first = i;
+        }
+      });
+      const head = pool[first];
+      pool = pool.filter((_, i) => i !== first);
+      stops.push(head);
+      from = head.center;
+    }
+    const ordered = nearestFirst(pool, from);
+    stops.push(...ordered);
+    if (ordered.length > 0) from = ordered[ordered.length - 1].center;
+  }
   if (sink) stops.push({ kind: 'end', x: sink.point.x, y: sink.point.y, facing: headingOf(sink.dir[0], sink.dir[1]) });
   return stops.length > 0 ? stops : undefined;
 }
@@ -284,7 +347,7 @@ interface Found {
   goal: Goal;
   /** The phase on entering the goal cell. */
   phase: number;
-  /** Total cost of the leg's cells, the goal tail included, on top of the start's `g0`. */
+  /** Cost of the whole belt so far: the start's `g0`, the leg's cells and the goal tail. */
   cost: number;
 }
 
@@ -320,6 +383,8 @@ class Router {
   private readonly heap = new MinHeap(4096);
 
   private presentFactor: number;
+  /** The node before a sink port's first node (cell index), or -1: only the last leg may use it. */
+  private approach = -1;
 
   // the search under way
   private goals: Goal[] = [];
@@ -383,6 +448,15 @@ class Router {
   }
   private plain(x: number, y: number): boolean {
     return this.inWindow(x, y) && this.usable(x, y, 0, this.cellOf(x, y, 0));
+  }
+  /**
+   * The node after a tap run. The last run before a sink port may end on the node the port is entered through (the
+   * belt then goes straight on into the port); no other stretch may use that node.
+   */
+  private postPlain(x: number, y: number, nextIsEnd: boolean): boolean {
+    if (!nextIsEnd || this.approach < 0 || !this.inWindow(x, y) || this.cellOf(x, y, 0) !== this.approach) return this.plain(x, y);
+    const cell = this.approach;
+    return this.own[cell] !== this.ownStamp && this.reserved[this.flatOf(x, y)] === 0 && !this.blocked(x, y, 0, cell);
   }
   private cost(cell: number, z: number): number {
     return 1 + ELEVATION_COST * z + this.presentFactor * this.use[cell] + this.history[cell];
@@ -546,21 +620,25 @@ class Router {
   // -------------------------------------------------------------------------------------------
   // One net
 
-  /** Forgets the cells the previous leg closed because its best path crossed itself. */
-  private newLeg(): void {
+  /**
+   * Starts a leg: forgets the cells the previous leg closed because its best path crossed itself, and, unless this is
+   * the last leg, closes the node the sink port is entered through, which only the last leg may use.
+   */
+  private newLeg(last: boolean): void {
     this.legStamp++;
+    if (!last && this.approach >= 0) this.legBlock[this.approach] = this.legStamp;
   }
 
   /** The goals for entering `stop` (both directions along the axis for a run), with the tails priced and checked. */
-  private goalsOf(stop: RunStop | PortStop): Goal[] {
+  private goalsOf(stop: RunStop | PortStop, from: Start, nextIsEnd: boolean): Goal[] {
     const goals: Goal[] = [];
     if (stop.kind === 'run') {
-      for (const sign of [1, -1]) {
+      for (const sign of stop.signs) {
         const dir = stop.axis === 'x' ? (sign > 0 ? 0 : 2) : sign > 0 ? 1 : 3;
         const cells = sign > 0 ? stop.cells : [...stop.cells].reverse();
         const last = cells[cells.length - 1];
         const post = { x: last.x + DX[dir], y: last.y + DY[dir] };
-        if (!this.plain(post.x, post.y)) continue;
+        if (!this.postPlain(post.x, post.y, nextIsEnd)) continue;
         const tail: GridPoint[] = [...cells.map((c) => ({ x: c.x, y: c.y, z: 0 })), { x: post.x, y: post.y, z: 0 }];
         if (!tail.every((n) => this.inWindow(n.x, n.y))) continue;
         if (!cells.every((c) => !this.blocked(c.x, c.y, 0, this.cellOf(c.x, c.y, 0)) && this.own[this.cellOf(c.x, c.y, 0)] !== this.ownStamp)) continue;
@@ -568,7 +646,9 @@ class Router {
       }
     } else {
       const dir = (stop.facing + 2) & 3;
-      if (this.inWindow(stop.x, stop.y) && !this.blocked(stop.x, stop.y, 0, this.cellOf(stop.x, stop.y, 0))) {
+      const ax = stop.x + DX[stop.facing];
+      const ay = stop.y + DY[stop.facing];
+      if (this.inWindow(stop.x, stop.y) && !this.blocked(stop.x, stop.y, 0, this.cellOf(stop.x, stop.y, 0)) && (this.plain(ax, ay) || (ax === from.x && ay === from.y && from.z === 0))) {
         const node = { x: stop.x, y: stop.y, z: 0 };
         goals.push({ ex: stop.x, ey: stop.y, dir, phases: END_PHASES, tail: [node], tailCost: 0 });
       }
@@ -577,7 +657,7 @@ class Router {
   }
 
   /** The starting states of a belt that begins with `stop`: the port and its first step, or a run entered from one node before. */
-  private startsOf(stop: Stop): Start[] {
+  private startsOf(stop: Stop, nextIsEnd: boolean): Start[] {
     const starts: Start[] = [];
     if (stop.kind === 'start') {
       const { x, y } = stop;
@@ -590,13 +670,13 @@ class Router {
       ];
       starts.push({ x: nx, y: ny, z: 0, dir: stop.facing, phase: 1, g0: prefix.reduce((s, n) => s + this.nodeCost(n), 0), prefix });
     } else if (stop.kind === 'run') {
-      for (const sign of [1, -1]) {
+      for (const sign of stop.signs) {
         const dir = stop.axis === 'x' ? (sign > 0 ? 0 : 2) : sign > 0 ? 1 : 3;
         const cells = sign > 0 ? stop.cells : [...stop.cells].reverse();
         const last = cells[cells.length - 1];
         const pre = { x: cells[0].x - DX[dir], y: cells[0].y - DY[dir] };
         const post = { x: last.x + DX[dir], y: last.y + DY[dir] };
-        if (!this.plain(pre.x, pre.y) || !this.plain(post.x, post.y)) continue;
+        if (!this.plain(pre.x, pre.y) || !this.postPlain(post.x, post.y, nextIsEnd)) continue;
         if (!cells.every((c) => this.inWindow(c.x, c.y) && !this.blocked(c.x, c.y, 0, this.cellOf(c.x, c.y, 0)))) continue;
         const prefix: GridPoint[] = [pre, ...cells, post].map((c) => ({ x: c.x, y: c.y, z: 0 }));
         starts.push({ x: post.x, y: post.y, z: 0, dir, phase: 2, g0: prefix.reduce((s, n) => s + this.nodeCost(n), 0), prefix });
@@ -617,9 +697,13 @@ class Router {
 
   /** Routes a net through `stops`; undefined when it cannot be done. Throws `Aborted`. */
   private routeNet(stops: Stop[]): GridPoint[] | undefined {
+    const end = stops[stops.length - 1];
+    const ax = end.kind === 'end' ? end.x + DX[end.facing] : 0;
+    const ay = end.kind === 'end' ? end.y + DY[end.facing] : 0;
+    this.approach = end.kind === 'end' && this.inWindow(ax, ay) ? this.cellOf(ax, ay, 0) : -1;
     this.ownStamp++;
-    this.newLeg();
-    const firsts = this.startsOf(stops[0]);
+    this.newLeg(stops.length <= 1);
+    const firsts = this.startsOf(stops[0], stops[1]?.kind === 'end');
     if (firsts.length === 0) return undefined;
     if (stops.length === 1) {
       // a lone run: the cheaper direction
@@ -632,12 +716,12 @@ class Router {
     let chosen: { found: Found; start: Start } | undefined;
     for (const start of firsts) {
       this.ownStamp++;
-      this.newLeg();
+      this.newLeg(stops.length === 2);
       this.markOwn(start.prefix, 0);
-      const goals = this.goalsOf(stops[1]);
+      const goals = this.goalsOf(stops[1], start, stops[2]?.kind === 'end');
       if (goals.length === 0) continue;
       const found = this.leg([start], goals);
-      if (found && (!chosen || found.cost + start.g0 < chosen.found.cost + chosen.start.g0)) chosen = { found, start };
+      if (found && (!chosen || found.cost < chosen.found.cost)) chosen = { found, start };
     }
     if (!chosen) return undefined;
     this.ownStamp++;
@@ -647,8 +731,8 @@ class Router {
     for (let k = 2; k < stops.length; k++) {
       const stop = stops[k];
       if (stop.kind === 'start') return undefined;
-      this.newLeg();
-      const goals = this.goalsOf(stop);
+      this.newLeg(k === stops.length - 1);
+      const goals = this.goalsOf(stop, start, stops[k + 1]?.kind === 'end');
       if (goals.length === 0) return undefined;
       const found = this.leg([start], goals);
       if (!found) return undefined;
@@ -675,16 +759,19 @@ class Router {
       .map((n, i) => i)
       .sort((a, b) => nets[b].taps.length - nets[a].taps.length || nets[a].id - nets[b].id);
     const routes: GridPoint[][] = nets.map(() => []);
-    const hopeless = new Set<number>();
-    let best: { routes: GridPoint[][]; conflicts: number; unroutable: number[] } | undefined;
+    /** A net with no stops has nothing to route: it stays without a route. */
+    const routable = (i: number): boolean => stopsOfNet[i] !== undefined;
+    type Best = { routes: GridPoint[][]; shared: number; unroutable: number[] };
+    let best: Best | undefined;
 
     const addUse = (nodes: GridPoint[], delta: 1 | -1): void => {
       for (const n of nodes) this.use[this.cellOf(n.x, n.y, n.z)] += delta;
     };
-    const snapshot = (): { conflicts: number; hot: Set<number>; cells: number[] } => {
+    /** The shared cells (and how many nets too many are on them), and the nets on them. */
+    const snapshot = (): { shared: number; hot: Set<number>; cells: number[] } => {
       const cells: number[] = [];
       const hot = new Set<number>();
-      let conflicts = 0;
+      let shared = 0;
       const counted = new Set<number>();
       routes.forEach((nodes, i) => {
         for (const n of nodes) {
@@ -693,65 +780,79 @@ class Router {
             hot.add(i);
             if (!counted.has(c)) {
               counted.add(c);
-              conflicts += this.use[c] - 1;
+              shared += this.use[c] - 1;
               cells.push(c);
             }
           }
         }
       });
-      return { conflicts, hot, cells };
+      return { shared, hot, cells };
     };
-    const record = (): { conflicts: number; hot: Set<number>; cells: number[] } => {
+    const unroutableIds = (): number[] => nets.flatMap((n, i) => (routes[i].length === 0 ? [n.id] : []));
+    /** Keeps the iteration if it has fewer nets without a route, or as many and no more shared cells. */
+    const record = (): ReturnType<typeof snapshot> => {
       const snap = snapshot();
-      const unroutable = nets.flatMap((n, i) => (routes[i].length === 0 ? [n.id] : []));
-      const total = snap.conflicts + unroutable.length;
-      if (!best || total <= best.conflicts) best = { routes: routes.map((r) => r), conflicts: total, unroutable };
+      const unroutable = unroutableIds();
+      const better =
+        !best ||
+        unroutable.length < best.unroutable.length ||
+        (unroutable.length === best.unroutable.length && snap.shared <= best.shared);
+      if (better) best = { routes: routes.map((r) => r), shared: snap.shared, unroutable };
       return snap;
     };
 
     try {
       let todo = order;
       for (let iter = 0; iter < Math.max(1, this.p.maxIterations); iter++) {
+        let gained = false;
         for (const i of todo) {
           if (this.shouldStop()) throw new Aborted();
-          addUse(routes[i], -1);
+          const before = routes[i];
+          addUse(before, -1);
           routes[i] = [];
-          const stops = stopsOfNet[i];
-          if (!stops || hopeless.has(i)) {
-            hopeless.add(i);
-            continue;
+          let nodes: GridPoint[] | undefined;
+          try {
+            nodes = routable(i) ? this.routeNet(stopsOfNet[i] as Stop[]) : undefined;
+          } catch (err) {
+            routes[i] = before;
+            addUse(before, 1);
+            throw err;
           }
-          const nodes = this.routeNet(stops);
-          if (!nodes) {
-            hopeless.add(i);
-            continue;
-          }
-          routes[i] = nodes;
-          addUse(nodes, 1);
+          // a net that cannot be routed this time keeps the route it had
+          routes[i] = nodes ?? before;
+          addUse(routes[i], 1);
+          if (nodes && before.length === 0) gained = true;
         }
         const snap = record();
-        if (snap.conflicts === 0) break;
-        // history is scaled by the present factor, so a cell that stays shared overtakes the price of sharing another
-        for (const c of snap.cells) this.history[c] += this.p.historyFactor * (this.use[c] - 1) * Math.max(1, this.presentFactor);
-        this.presentFactor = Math.min(this.presentFactor * this.p.presentFactorGrowth, Math.max(this.p.presentFactorStart, MAX_PRESENT_FACTOR));
-        todo = order.filter((i) => snap.hot.has(i));
+        const missing = nets.filter((_, i) => routes[i].length === 0 && routable(i)).length;
+        if (snap.shared === 0 && missing === 0) break;
+        // with nothing shared and no net newly routed, another round would only repeat this one
+        if (snap.shared === 0 && !gained) break;
+        if (snap.shared > 0) {
+          // history is scaled by the present factor, so a cell that stays shared overtakes the price of sharing another
+          for (const c of snap.cells) this.history[c] += this.p.historyFactor * (this.use[c] - 1) * Math.max(1, this.presentFactor);
+          this.presentFactor = Math.min(
+            this.presentFactor * this.p.presentFactorGrowth,
+            Math.max(this.p.presentFactorStart, MAX_PRESENT_FACTOR),
+          );
+        }
+        todo = order.filter((i) => snap.hot.has(i) || (routes[i].length === 0 && routable(i)));
         if (todo.length === 0) break;
       }
     } catch (err) {
       if (!(err instanceof Aborted)) throw err;
-      // routes in progress are dropped: report the best complete iteration, or what there is
-      const unroutable = nets.flatMap((n, i) => (routes[i].length === 0 ? [n.id] : []));
-      if (!best) best = { routes: routes.map((r) => r), conflicts: snapshot().conflicts + unroutable.length, unroutable };
-      return this.result(best.routes, best.conflicts, best.unroutable, true);
+      // the round in progress is dropped: report the best complete round, or what there is
+      if (!best) best = { routes: routes.map((r) => r), shared: snapshot().shared, unroutable: unroutableIds() };
+      return this.result(best, true);
     }
-    const b = best as { routes: GridPoint[][]; conflicts: number; unroutable: number[] };
-    return this.result(b.routes, b.conflicts, b.unroutable, false);
+    return this.result(best as Best, false);
   }
 
-  private result(routes: GridPoint[][], conflicts: number, unroutable: number[], stopped: boolean): RouteResult {
-    const out: RoutedNet[] = this.net.nets.map((n, i) => ({ netId: n.id, nodes: routes[i] }));
-    if (conflicts === 0 && unroutable.length === 0 && !stopped) return { ok: true, routes: out };
-    return { ok: false, conflicts: Math.max(conflicts, stopped ? 1 : 0), routes: out, unroutable };
+  private result(best: { routes: GridPoint[][]; shared: number; unroutable: number[] }, stopped: boolean): RouteResult {
+    const out: RoutedNet[] = this.net.nets.map((n, i) => ({ netId: n.id, nodes: best.routes[i] }));
+    if (best.shared === 0 && best.unroutable.length === 0 && !stopped) return { ok: true, routes: out };
+    const conflicts = best.shared + best.unroutable.length;
+    return { ok: false, conflicts: Math.max(conflicts, stopped ? 1 : 0), routes: out, unroutable: best.unroutable };
   }
 }
 
@@ -759,8 +860,9 @@ class Router {
  * Routes every net of `net` over the tap points and ports of `taps` (see the file comment). The routes are in flow
  * order, one node per lattice point, with `z` in levels. `ok` is true when no (x, y, z) is used by two nets and
  * every net has a route; otherwise `conflicts` counts the shared cells plus the nets without a route, and
- * `unroutable` names those. The result is the best iteration seen. `shouldStop` is asked between nets and every few
- * thousand search steps; when it says yes the best so far comes back with `ok: false`.
+ * `unroutable` names those. The result is the best round seen: fewest nets without a route, then fewest shared cells.
+ * `shouldStop` is asked between nets and every few thousand search steps; when it says yes the best so far comes back
+ * with `ok: false`.
  */
 export function routeNets(
   net: Netlist,
