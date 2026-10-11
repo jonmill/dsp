@@ -67,6 +67,24 @@ function facilitySpeed(building: Building): number {
   return raw / 10000;
 }
 
+/** Recipes of these types are plannable; everything else (fractionation, exchange, ...) is not. */
+export function isPlannableRecipe(recipe: Recipe): boolean {
+  return !EXCLUDED_TYPES.has(recipe.type) && (recipe.type !== 'RESEARCH' || isMatrixRecipe(recipe));
+}
+
+/** Unlocked, plannable recipes that make `itemId`, in GameData order (overrides not applied). */
+export function plannableProducers(itemId: number, data: GameDataIndex, effects: TechEffects): Recipe[] {
+  return data.recipesProducing(itemId).filter((r) => effects.unlockedRecipes.has(r.id) && isPlannableRecipe(r));
+}
+
+/** Every building that can run `recipe` (matrix recipes: labs), slowest first, which is unlock order. */
+export function compatibleFacilities(recipe: Recipe, data: GameDataIndex): Building[] {
+  const pool = isMatrixRecipe(recipe)
+    ? data.data.buildings.filter((b) => b.kind === 'lab')
+    : data.buildingsForRecipeType(recipe.type);
+  return pool.filter((b) => facilityCompatible(b, recipe)).sort((a, b) => facilitySpeed(a) - facilitySpeed(b));
+}
+
 function fastest(buildings: Building[]): Building | undefined {
   let best: Building | undefined;
   for (const b of buildings) if (!best || facilitySpeed(b) > facilitySpeed(best)) best = b;
@@ -133,21 +151,14 @@ class Planner {
   /** Unlocked recipes of a plannable type that make `itemId`, honouring `recipeOverrides`. */
   private rawProducers(itemId: number): Recipe[] {
     const forced = this.req.recipeOverrides[itemId];
-    return this.data
-      .recipesProducing(itemId)
-      .filter((r) => this.effects.unlockedRecipes.has(r.id))
-      .filter((r) => !EXCLUDED_TYPES.has(r.type) && (r.type !== 'RESEARCH' || isMatrixRecipe(r)))
-      .filter((r) => forced === undefined || r.id === forced);
+    return plannableProducers(itemId, this.data, this.effects).filter((r) => forced === undefined || r.id === forced);
   }
 
   /** Unlocked buildings that can run `recipe`. */
   private availableFacilities(recipe: Recipe): Building[] {
     let list = this.facilityCache.get(recipe.id);
     if (!list) {
-      const pool = isMatrixRecipe(recipe)
-        ? this.data.data.buildings.filter((b) => b.kind === 'lab')
-        : this.data.buildingsForRecipeType(recipe.type);
-      list = pool.filter((b) => facilityCompatible(b, recipe) && this.effects.availableBuildings.has(b.itemId));
+      list = compatibleFacilities(recipe, this.data).filter((b) => this.effects.availableBuildings.has(b.itemId));
       this.facilityCache.set(recipe.id, list);
     }
     return list;
@@ -212,7 +223,7 @@ class Planner {
     }
     if (this.usableProducers(target).length === 0) {
       const recipe = targetRecipes[0];
-      const needed = slowest(this.compatibleBuildings(recipe));
+      const needed = slowest(compatibleFacilities(recipe, this.data));
       throw new PlanFailure({
         kind: 'facility-unavailable',
         recipeId: recipe.id,
@@ -237,13 +248,6 @@ class Planner {
 
     const needed = this.collect((itemId) => this.usableProducers(itemId).filter((r) => enabled.has(r.id)));
     return [...needed.values()].sort((a, b) => a.id - b.id);
-  }
-
-  private compatibleBuildings(recipe: Recipe): Building[] {
-    const pool = isMatrixRecipe(recipe)
-      ? this.data.data.buildings.filter((b) => b.kind === 'lab')
-      : this.data.buildingsForRecipeType(recipe.type);
-    return pool.filter((b) => facilityCompatible(b, recipe));
   }
 
   /** The first item, walking from the target, that is neither supplied nor makeable. */
@@ -273,7 +277,7 @@ class Planner {
     if (unlockedRecipes.length > 0) {
       // A recipe exists, but no unlocked building can run it.
       const recipe = unlockedRecipes[0];
-      const needed = slowest(this.compatibleBuildings(recipe));
+      const needed = slowest(compatibleFacilities(recipe, this.data));
       return new PlanFailure({
         kind: 'facility-unavailable',
         recipeId: recipe.id,

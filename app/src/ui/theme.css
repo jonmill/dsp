@@ -1,0 +1,279 @@
+/* Global tokens and the few shared classes the panels build on. Colours are variables so light and
+   dark are one block each; nothing here depends on a UI framework. */
+
+:root {
+  color-scheme: light dark;
+
+  --bg: #eef1f5;
+  --surface: #ffffff;
+  --surface-2: #f4f6fa;
+  --surface-3: #e8ecf3;
+  --border: #d4dbe7;
+  --border-strong: #b5c0d2;
+  --text: #19212e;
+  --text-dim: #566277;
+  --accent: #0a7ea4;
+  --accent-strong: #08607e;
+  --accent-soft: #def1f7;
+  --on-accent: #ffffff;
+  --ok: #17794a;
+  --ok-soft: #dff3e8;
+  --warn: #7d5200;
+  --warn-soft: #fff1cf;
+  --warn-border: #e4c36f;
+  --danger: #b3261e;
+  --danger-soft: #fde9e7;
+  --danger-border: #efaaa4;
+  --shadow: 0 1px 2px rgb(20 30 50 / 8%);
+
+  --radius: 6px;
+  --font: system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+  --mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e131a;
+    --surface: #161c26;
+    --surface-2: #1c2330;
+    --surface-3: #263041;
+    --border: #2b3546;
+    --border-strong: #3d4a5f;
+    --text: #e4e9f2;
+    --text-dim: #94a1b7;
+    --accent: #3eb8dd;
+    --accent-strong: #70cbe8;
+    --accent-soft: #13313f;
+    --on-accent: #05202b;
+    --ok: #62d596;
+    --ok-soft: #12301f;
+    --warn: #f1c35d;
+    --warn-soft: #33290f;
+    --warn-border: #6c5521;
+    --danger: #ff8d83;
+    --danger-soft: #3a1816;
+    --danger-border: #7b2f2a;
+    --shadow: none;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 var(--font);
+}
+
+h1,
+h2,
+h3 {
+  margin: 0;
+  font-weight: 600;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+input[type='text'],
+input[type='search'],
+input[type='number'],
+select {
+  min-width: 0;
+  height: 28px;
+  padding: 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
+
+select {
+  padding-right: 4px;
+}
+
+input:focus-visible,
+select:focus-visible,
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+input[type='checkbox'],
+input[type='radio'],
+input[type='range'] {
+  accent-color: var(--accent);
+}
+
+button {
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+button:hover:not(:disabled) {
+  background: var(--surface-3);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--accent-strong);
+}
+
+/* Panels */
+
+.card {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.card > h2 {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+
+.card > h2 .grow {
+  flex: 1;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.field > :not(span) {
+  font-size: 13px;
+  color: var(--text);
+}
+
+.muted {
+  color: var(--text-dim);
+}
+
+.num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.hint {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+/* A two-button choice (supply/make, /s and /min). */
+.seg {
+  display: inline-flex;
+}
+
+.seg > button {
+  height: 24px;
+  padding: 0 8px;
+  border-radius: 0;
+  font-size: 12px;
+}
+
+.seg > button + button {
+  margin-left: -1px;
+}
+
+.seg > button:first-child {
+  border-radius: var(--radius) 0 0 var(--radius);
+}
+
+.seg > button:last-child {
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+
+.seg > button[aria-pressed='true'] {
+  position: relative;
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  border: 1px solid var(--warn-border);
+  border-radius: 11px;
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.callout {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+}
+
+.callout.warn {
+  border-color: var(--warn-border);
+  background: var(--warn-soft);
+  color: var(--warn);
+}
+
+.callout.error {
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.scroll {
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+}
