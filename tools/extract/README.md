@@ -23,9 +23,10 @@ sudo dnf install python3 python3-pip dotnet-sdk-10.0
 #      bash dotnet-install.sh --channel 10.0
 
 # 2. Make this shell find dotnet and the dotnet tools. Needed BEFORE step 3 when you used dotnet-install.sh
-#    (the script does not touch your PATH); harmless with the dnf package. To keep it for new shells, also
-#    add these two lines to ~/.bashrc or ~/.zshrc.
-export DOTNET_ROOT="$HOME/.dotnet"
+#    (the script does not touch your environment). With the dnf package DOTNET_ROOT must stay unset, so
+#    it is only exported when ~/.dotnet/dotnet exists, i.e. after a script install. To keep this for new
+#    shells, also add the two lines to ~/.bashrc or ~/.zshrc.
+[ -x "$HOME/.dotnet/dotnet" ] && export DOTNET_ROOT="$HOME/.dotnet"
 export PATH="$PATH:$HOME/.dotnet:$HOME/.dotnet/tools"
 
 # 3. ilspycmd, the decompiler
@@ -39,7 +40,7 @@ pip install -e 'tools/extract[game,dev]'
 
 `dotnet tool install -g` puts `ilspycmd` in `~/.dotnet/tools`, which is usually not on `PATH` in a new shell.
 `dsp-extract` also looks there itself, so it finds `ilspycmd` even without step 2, but `dotnet tool install`
-itself needs `dotnet` on `PATH` (and `DOTNET_ROOT` for a script install), and you need the `PATH` line to run
+itself needs `dotnet` on `PATH` (and `DOTNET_ROOT`, only for a script install), and you need the `PATH` line to run
 `ilspycmd` by hand. If `ilspycmd` cannot be found at all the extraction still runs: the game version then comes
 from the Steam build id, the code constants keep their (unverified) defaults, and the fingerprints are not
 updated. Without the `game` extra (UnityPy and TypeTreeGeneratorAPI) nothing can be read from the game; the

@@ -1,7 +1,7 @@
 """`dsp-extract` command line: the end-to-end extraction, plus `inspect` and `fixture`.
 
     dsp-extract [--game-dir PATH] [--out DIR] [--copy-blueprints] [--icons] [--no-decompile]
-                [--check] [--strict] [--report PATH]
+                [--check] [--strict] [--allow-partial] [--report PATH]
     dsp-extract inspect [--game-dir PATH] [--report PATH]
     dsp-extract fixture --from DIR --out FILE
 
@@ -739,7 +739,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--game-dir", type=Path, metavar="PATH", help="the Dyson Sphere Program folder (or its DSPGAME_Data folder); default: find it through Steam")
-    parser.add_argument("--out", type=Path, metavar="DIR", help="output folder for dsp-<gameVersion>.json and fingerprints.json (default: <repo>/data)")
+    parser.add_argument("--out", type=Path, metavar="DIR", help="output folder for dsp-<gameVersion>.json (default: <repo>/data); data/fingerprints.json always stays in the repo")
     parser.add_argument("--copy-blueprints", action="store_true", help="copy your .txt blueprints from the Proton prefix to app/test/fixtures/blueprints/game/")
     parser.add_argument("--icons", action="store_true", help="export item icons as PNG to app/public/icons/ (needs the game extra)")
     parser.add_argument("--no-decompile", action="store_true", help="do not run ilspycmd (game version from the Steam build id, default code constants, fingerprints untouched)")
