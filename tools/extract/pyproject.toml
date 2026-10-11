@@ -14,7 +14,7 @@ dsp-extract = "dsp_extract.cli:main"
 
 [project.optional-dependencies]
 game = [
-  "UnityPy>=1.20",
+  "UnityPy>=1.25,<2",
   "TypeTreeGeneratorAPI>=0.0.10",
 ]
 dev = [
