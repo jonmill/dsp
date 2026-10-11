@@ -107,7 +107,7 @@ local/                       gitignored: decompiled sources, extract reports
 - [ ] **Step 1:** Scaffold `app/` by hand (not `npm create`, to avoid interactive prompts).
   - Dependencies: `svelte@^5`, `vite@^8`, `@sveltejs/vite-plugin-svelte`, `typescript`, `vitest`, `svelte-check`, `zod@^4`, `pako@^3`, `@types/pako`, `glpk.js@^5`, `eslint`, `typescript-eslint`, `eslint-plugin-svelte`.
   - `vite.config.ts`: Svelte plugin; `test: { environment: 'node', include: ['src/**/*.test.ts','test/**/*.test.ts'] }`; `server.fs.allow: ['..']` so the app can import `../data/*.json`.
-- [ ] **Step 2:** In `eslint.config.js`, add a `no-restricted-imports` rule for files matching `src/lib/validate/**` that forbids patterns `**/layout/**` and `$lib/layout/*`, with the message "validator must stay independent of the solver".
+- [ ] **Step 2:** In `eslint.config.js`, add a `no-restricted-imports` rule for files matching `src/lib/validate/**` that forbids patterns `**/lib/layout/**`, `../layout/*`, `../../layout/*` and `$lib/layout/*`, with the message "validator must stay independent of the solver". (`geometry/model.ts` is shared and allowed.) Verify the rule both ways: a temporary file under `src/lib/validate/` importing `../layout/x` fails lint, and one importing `../geometry/model` passes; delete both temporary files afterwards.
 - [ ] **Step 3:** Write the smoke tests:
   - `app/test/smoke.test.ts`: `expect(1+1).toBe(2)`.
   - `tools/extract/tests/test_smoke.py`: imports `dsp_extract` and asserts `dsp_extract.__version__ == "0.1.0"`.
@@ -287,13 +287,29 @@ def validate_against_schema(gamedata: dict, schema_path: Path) -> None   # raise
 - **Key normalization:** accept both `TimeSpend`/`timeSpend`, `ItemCounts`/`itemCounts`, etc. Normalize keys by lowercasing the first letter.
   - Enum values may arrive as strings (`"ASSEMBLE"`) or ints (4). Map ints using GX §2.2.
   - BigInt values `{":type":"BigInt","value":"…"}` become numbers.
+- **Required vs defaulted fields** (Review Focus #1). The dump omits default-valued fields, so a missing field is an error **only** if it is REQUIRED:
+
+  | Proto | REQUIRED (missing → `NormalizeError("<proto> <id> (<nameKey>): missing field <f>")`) | DEFAULTED (missing → default) |
+  |---|---|---|
+  | item | `id`, `name`, `type`, `stackSize`, `gridIndex` | `isFluid` false, `canBuild` false, `productive` false, `heatValue` 0, `modelIndex` 0, `iconPath` "", `ability` 0, `hpMax` 0 |
+  | recipe | `id`, `name`, `type`, `timeSpend`, `items`, `itemCounts`, `results`, `resultCounts` | `handcraft` false, `explicit` false, `nonProductive` false, `gridIndex` 0 |
+  | tech | `id`, `name` | `preTechs` [], `preTechsImplicit` [], `unlockRecipes` [], `unlockFunctions` [], `unlockValues` [], `level` 0, `maxLevel` 0, `isObsolete` false, `isHiddenTech` false, `published` false, `position` [0,0] |
+  | descriptors | `AssemblerDesc.speed` (or `speedf`), `InserterDesc.stt` (or `sttf`), `BeltDesc.speed`, `StationDesc.maxItemKinds` | `PowerDesc` absent → `{consumer:false, workPerTick:0, idlePerTick:0}`; `PowerDesc.consumer`/`workEnergyPerTick`/`idleEnergyPerTick` absent → false/0/0; `InserterDesc.delay` 0, `canStack` false, `stackSize` 1 |
+
+- **Raw game descriptor field mapping with unit conversion** (the game's MonoBehaviours differ from the dump; GX §2.6 table). Normalize accepts BOTH shapes:
+  - `AssemblerDesc`: `speed` (int, 10000 = 1×) **or** `speedf` (float) → `speed = round(speedf*10000)`.
+  - `InserterDesc`: `stt` **or** `sttf` → `round(sttf*600000)`; `delay` **or** `delayf` → `round(delayf*600000)`; `grade` taken from the descriptor if present, else from the upgrade chain (2011→1 … 2014→4).
+  - `LabDesc.assembleSpeed`/`researchSpeed`: an int ≥ 100 is used as-is; a float < 100 → `round(v*10000)`.
+  - Plausibility guards (raise `NormalizeError`): production `speed < 100`, sorter `stt < 1000`, belt `speed` not in 1..20.
+  - Test with a game-shaped `RawBuilding` (`AssemblerDesc {recipeType: 4, speedf: 0.75}` → `production.speed == 7500`; `InserterDesc {sttf: 0.33333334}` → `stt == 200000`).
+- **Game version** (`RawBundle.game_version`): the fixture uses `meta.json`. The game reader (Task 5/7) uses the decompiled `GameConfig` version (major.minor.release.build) when ilspycmd is available, else `"0.0.0+build<steam buildid>"`. If neither exists, raise `ExtractError("cannot determine game version")`.
 - **Names:** `name = locale.get(nameKey, nameKey)`.
 - **Building kind:** derived from the descriptors present.
   - `AssemblerDesc` → production.
   - `LabDesc` → lab.
   - `BeltDesc.speed > 0` → belt.
   - `InserterDesc` → sorter; `grade` comes from the item's position in the sorter upgrade chain (2011→1, 2012→2, 2013→3, 2014→4).
-  - `StationDesc` (not collector) → station.
+  - `StationDesc` with `isCollector == false` **and** `isVeinCollector == false` → station (the Advanced Mining Machine 2316 is a vein collector → other).
   - `PowerDesc.node` → powerNode.
   - `SpraycoaterDesc` → sprayCoater.
   - `SplitterDesc` or item 2020 → splitter.
@@ -305,16 +321,19 @@ def validate_against_schema(gamedata: dict, schema_path: Path) -> None   # raise
 
 **Approximate geometry rules** (deterministic, documented in a module docstring):
 - Footprint half-extents `hx, hz`: the max |x| and |z| over `BuildConditionConfig.landPoints` when there are at least 2 points. Otherwise `SlotConfig.selectSize/2 − 0.1`. Height `hy = selectSize.y/2`, center `(selectCenter.x, hy, selectCenter.z)` and identity rotation. Produce one `build` collider.
-- Sorter slots: `n = len(SlotConfig.insertPoses)`.
-  - n = 12: 3 per side on the 4 sides. Lateral offsets `−TILE, 0, +TILE` metres. Position on the side face at `±(hx)` (or `±hz`), `y = 0.5`. Rotation faces outward: yaw 0 = +z, 90 = +x, 180 = −z, 270 = −x, as quaternion about +y.
-  - n = 8: 4 on each long side at lateral offsets `−1.5, −0.5, 0.5, 1.5` tiles.
-  - n = 9: 3 per side on +z, −z and +x.
-  - Other n: spread round-robin over the sides at offsets centred on 0, spaced 1 tile apart.
+  - **Cross-shaped land points** (both `(±a, ±b)` and `(±b, ±a)` present with a ≠ b, e.g. PLS/ILS `(±4,±2)` and `(±2,±4)`): produce **two** build boxes, half-extents `(a, hy, b)` and `(b, hy, a)`.
+- Sorter slots: `n = len(SlotConfig.insertPoses)`. Slot `y = 0` (real sorters sit at z ≈ 0).
+  - n = 12 (assemblers, smelters, labs; **values derived from real blueprint samples by the plan review**): 3 per side. Slot centre at normal offset **1.11 m** from the building centre, lateral offsets **−1.0, 0, +1.0 m**. **Index order clockwise starting at the north side's west slot**: north (+z) 0 (W), 1, 2 (E); east (+x) 3 (N), 4, 5 (S); south (−z) 6 (E), 7, 8 (W); west (−x) 9 (S), 10, 11 (N). Rotation faces outward: yaw 0 = +z, 90 = +x, 180 = −z, 270 = −x, as a quaternion about +y.
+  - n = 8: 4 on each long side at lateral offsets `−1.5, −0.5, 0.5, 1.5` tiles, normal offset = half-extent − 0.9 m, indexed clockwise as above.
+  - n = 9: 3 per side on +z, −z and +x, normal offset = half-extent − 0.9 m.
+  - Other n: spread round-robin over the sides at offsets centred on 0, spaced 1 tile apart, normal offset = half-extent − 0.9 m.
 - Belt ports: `m = len(SlotConfig.slotPoses)`.
-  - m = 12 (stations): 3 per side, offsets `−TILE, 0, +TILE`, on the faces at `±hx`, facing outward.
+  - m = 12 (stations; **derived from the ILS sample**): 3 per side at normal offset **2.70 m** (≈2.15 tiles), lateral offsets **−TILE, 0, +TILE**, facing outward. **Index order counter-clockwise starting at the north side's east port**: north 0 (E), 1, 2 (W); west 3 (N), 4, 5 (S); south 6 (W), 7, 8 (E); east 9 (S), 10, 11 (N). Use the same numbers for the PLS.
   - m = 4 (splitter): one per side, at 0 offset.
   - Otherwise round-robin as for slots.
-- **Calibration test:** decode the capsule sample's 8 Assembler Mk.II and their attached Mk.III sorters (pure Python decode of the -101 records: re-use a minimal reader written in the test, following BF §3.3). For each sorter end within 3 m of an assembler centre, convert to the assembler's local frame (BF yaw) and assert that it lies within **0.6 m** of some approximate slot position for model 66. If it fails, adjust the approximation (e.g. the side offset), not the tolerance, and record the derived numbers in the module docstring.
+- **Calibration test (assembler):** decode the capsule sample's 8 Assembler Mk.II and their attached Mk.III sorters (pure Python decode of the -101 records: re-use a minimal reader written in the test, following BF §3.3). For each sorter end connected to an assembler (via `inputObjIdx`/`outputObjIdx` and the slot fields `inputFromSlot`/`outputToSlot`), convert the end to the assembler's local frame (BF yaw) and assert that it lies within **0.35 m** of the approximate slot **with that slot index**.
+- **Calibration test (station):** decode `ils-configured-0.9.24.txt`. For each belt whose `inputObjIdx` is the ILS, assert that the first belt node (local frame) lies within **0.35 m** of the approximate port with index `inputFromSlot`.
+- If a calibration test fails, fix the approximation (not the tolerance) and record the derived numbers in the module docstring.
 
 **Constants:**
 - `DEFAULT_CONSTANTS` holds the Constants values from Task 2 (incTable `0,125,200,225,250,275,300,325,350,375,400`, accTable `0,250,…,2500`, powerTable `0,300,700,1100,1500,1900,2300,2700,3100,3500,3900`, MX §5).
@@ -322,7 +341,8 @@ def validate_against_schema(gamedata: dict, schema_path: Path) -> None   # raise
 
 **Fixture source mapping (dsp-parser):**
 - `items.json` entries with `_XxxDesc` keys become `RawBuilding.descs["XxxDesc"]` (underscore stripped).
-- `locale.json` holds a list of languages; pick the one with `name`/`lcid` en-US and use its `strings` map.
+- `locale.json` holds a list of languages; pick the entry with `lcid == 1033` (`locale: "en-US"`) and use its `strings` map.
+- Proliferator items 1141–1143: `proliferator = {ability: item.ability, sprays: item.hpMax}`.
 - `meta.json` gives `game_version`.
 
 **Tests:**
@@ -333,17 +353,22 @@ def validate_against_schema(gamedata: dict, schema_path: Path) -> None   # raise
   - An unknown building with no descriptors → kind `"other"`.
   - Locale fallback to the key.
   - A recipe missing `timeSpend` raises `NormalizeError("recipe 51 (处理器): missing field timeSpend")`. This is the missing-key test from Review Focus #1.
+  - A recipe missing `explicit`/`handcraft`/`nonProductive` normalizes with `false` defaults (DEFAULTED fields never raise).
+  - A tech missing `preTechs` normalizes to `[]`.
+  - Game-shaped descriptors: `AssemblerDesc {recipeType: 4, speedf: 0.75}` → `production.speed == 7500`; `InserterDesc {sttf: 0.33333334, delayf: 0}` → `sorter.stt == 200000`; `AssemblerDesc {speedf: 0.0001}` raises (plausibility guard).
+  - The Advanced Mining Machine (StationDesc with `isVeinCollector: true`) → kind `"other"`.
 - [ ] **Step 2:** Implement `raw.py`, `normalize.py` and `constants.py`. Run the tests until they pass.
 - [ ] **Step 3:** `test_approx_geometry.py`:
   - The assembler (landPoints ±2) gives half-extents `(2, 2.3, 2)` and 12 slots.
-  - The station gives 12 ports, 3 per face.
-  - The calibration test above, which reads `docs/research/blueprint-samples/capsule-production-v2-reform-0.10.33.txt`. Skip it with a clear reason if the file is missing.
+  - The station gives 12 ports, 3 per face, in the counter-clockwise order above (port 0 is on the north face, east end), and two cross-shaped build boxes.
+  - Slot index 3 on the assembler is on the east face, north end (`position ≈ (1.11, 0, 1.0)`).
+  - Both calibration tests above, which read `docs/research/blueprint-samples/capsule-production-v2-reform-0.10.33.txt` and `ils-configured-0.9.24.txt`. Skip with a clear reason if a file is missing.
 - [ ] **Step 4:** Implement `approx_geometry.py`. Run the tests until they pass.
 - [ ] **Step 5:** Implement `schema_check.py` using `jsonschema` (Draft 2020-12) against `data/schema/gamedata.schema.json`. Implement `fixture.py`.
 - [ ] **Step 6:** `test_fixture.py`, which skips if `docs/research/datasets/dsp-parser` is absent:
   - Building the fixture to a tmp path validates against the schema.
   - It has ≥ 160 recipes.
-  - Recipe 51 has `timeTicks` 180 and inputs `[{1301,2},{1303,2}]`.
+  - Recipe 51 has `timeTicks` 180, inputs `[{1301,2},{1302,2}]` and outputs `[{1303,1}]`.
   - Item 1141 has `proliferator == {ability:1, sprays:12}` (sprays come from `hpMax` in the dump).
   - Building 2303 has `production.speed == 7500` and `power.workPerTick == 4500`.
   - Building 2104 has `station.maxItemKinds == 5`.
@@ -365,6 +390,7 @@ This can't be tested against a real install in CI. Tests use **fakes** that imit
 **Interfaces:**
 - Consumes: `GameInstall` (Task 3), `RawBundle`/`RawBuilding` (Task 4).
 - Produces:
+  - `unity_reader.read_game_version(install, decompiled: dict[str,str] | None) -> str`: parses `GameConfig` from decompiled source (the `gameVersion` / `Version(major, minor, release, build)` construction; record the regex in a docstring) when available, else `"0.0.0+build<buildid>"`; raises `ExtractError("cannot determine game version")` if neither exists. Test both paths with inline C# and a fake install.
   - `locale_files.load_english(game_root: Path) -> dict[str,str]`. Reads `Locale/Header.txt` and `Locale/1033/*.txt` (UTF-16 LE with BOM, falling back to UTF-8; lines are `key\t?\t?\ttext`; unescape `\n \t \r \\`). GX §2.5.
   - `unity_reader.read_bundle(install: GameInstall, report: Report) -> RawBundle`. Uses UnityPy with `TypeTreeGenerator.load_local_game` (GX §5) and the GX §1 locations. Collects ProtoSets by MonoScript class name; asserts the expected keys (`dataArray`, and for ItemProto `ID`, `ModelIndex`, `CanBuild`) and raises `ExtractError` naming the class and the missing key.
   - `prefab.read_building(env_adapter, model_proto: dict, item: dict, report) -> RawBuilding`. Implements the GX §2.6 static-extraction plan:
@@ -398,13 +424,13 @@ This can't be tested against a real install in CI. Tests use **fakes** that imit
 
 **Interfaces:**
 - Produces:
-  - `mirrored_methods.MIRRORED: dict[str, str]`, mapping game method (`"CargoPath.Update"`) to the TS module that mirrors it (`"app/src/lib/validate/sim/belt.ts"`). The initial list covers every method named in Tasks 8, 17, 18 and 19: `BlueprintData.Export`, `BlueprintData.Import`, `MD5F.Compute`, `CargoPath.Update`, `CargoPath.TryInsertItem`, `CargoPath.TryPickItem`, `InserterComponent.InternalUpdate`, `AssemblerComponent.InternalUpdate`, `AssemblerComponent.UpdateNeeds`, `SpraycoaterComponent.InternalUpdate`, `StationComponent.UpdateOutputSlots`, `StationComponent.UpdateInputSlots`, `PowerSystem.GameTick`, `LabComponent.InternalUpdateAssemble`.
+  - `mirrored_methods.MIRRORED: dict[str, str]`, mapping game method (`"CargoPath.Update"`) to the TS module that mirrors it (`"app/src/lib/validate/sim/belt.ts"`). The initial list covers every method named in Tasks 8, 15, 17, 18 and 19: `BlueprintData.Export`, `BlueprintData.Import`, `MD5F.Compute`, `CargoPath.Update`, `CargoPath.TryInsertItem`, `CargoPath.TryPickItem`, `CargoPath.TryInsertItemAtHeadAndFillBlank`, `InserterComponent.InternalUpdate`, `AssemblerComponent.InternalUpdate`, `AssemblerComponent.UpdateNeeds`, `SpraycoaterComponent.InternalUpdate`, `StationComponent.UpdateOutputSlots`, `StationComponent.UpdateInputSlots`, `PowerSystem.GameTick`, `LabComponent.InternalUpdateAssemble`, `BuildTool_Click.CheckBuildConditions`, `BuildTool_Path.CheckBuildConditions`, `BuildTool_Inserter.CheckBuildConditions`. Each later task that adds a `// mirrors: X` comment must add `X` here (Task 30 adds a consistency test).
   - `decompile.find_ilspycmd() -> str | None`.
   - `decompile.decompile_types(ilspy: str, managed_dir: Path, types: list[str], out_dir: Path) -> dict[str, Path]` runs `ilspycmd --disable-updatecheck -r <managed> -t <Type> <managed>/Assembly-CSharp.dll`.
   - `decompile.extract_method(source: str, method: str) -> str | None`: brace-matching extraction of every overload whose name matches. Overloads are joined in source order.
   - `decompile.normalize_body(src: str) -> str`: strip comments and blank lines, collapse whitespace.
   - `decompile.fingerprint(body: str) -> str` (sha256 hex of the normalized body).
-  - `decompile.drift_report(old: dict, new: dict, mirrored: dict) -> list[DriftEntry]`, where `DriftEntry(method, ts_module, status: "changed"|"missing"|"new")`.
+  - `decompile.drift_report(old: dict, new: dict, mirrored: dict) -> list[DriftEntry]`, where `DriftEntry(method, ts_module, status: "changed"|"missing"|"new", diff: str | None)`. `diff` is a unified diff (difflib) of the old vs new normalized method body when the previous decompiled source is present in `local/decompiled/` (spec §4.4); the previous decompile is kept by renaming the directory to `local/decompiled.prev/` before a new run.
   - `code_constants.parse_constants(sources: dict[str,str]) -> tuple[dict, dict]` parses `Cargo.incTableMilli`, `accTableMilli` and `powerTableRatio` from the decompiled `Cargo` source, plus `CargoPath.kCargoLength`. It returns `(values, sources)`; missing values are simply absent, so defaults remain.
 
 - [ ] **Step 1:** `test_decompile.py` with an inline C# sample class containing two overloads of `InternalUpdate`, a nested brace inside a string literal and a `//` comment:
@@ -452,7 +478,7 @@ This can't be tested against a real install in CI. Tests use **fakes** that imit
   - When serialization raises (an unserializable object is injected), the existing target file is unchanged and no tmp file remains.
 - [ ] **Step 2:** Implement `writer.py`. Run the tests until they pass.
 - [ ] **Step 3:** `test_cli.py` (monkeypatch `read_bundle` to return a small valid RawBundle and `locate_game` to return a fake install):
-  - The exit code is 0 and `data/dsp-0.10.35.29104.json` exists and validates.
+  - The exit code is 0 and `data/dsp-0.10.35.29104.json` exists and validates (the fake bundle's `game_version` is `0.10.35.29104`).
   - A schema failure (the bundle produces an invalid recipe) gives exit 4, and no output file is created.
   - Game not found gives exit 2, with the message on stderr.
   - `--check` with a fingerprint drift gives exit 5.
@@ -522,13 +548,13 @@ export interface Blueprint { header: BlueprintHeader; body: BlueprintBody; gzipO
 ### Task 9: Layout model and Layout→Blueprint builder
 
 **Files:**
-- Create: `app/src/lib/geometry/layout.ts` (Layout model types; shared contract)
+- Create: `app/src/lib/geometry/model.ts` (Layout model types; shared contract)
 - Create: `app/src/lib/blueprint/build.ts`
 - Create: `app/scripts/emit-test-blueprint.ts`
 - Test: `app/src/lib/blueprint/build.test.ts`
 
 **Interfaces:**
-- Produces (`geometry/layout.ts`; used by every later task):
+- Produces (`geometry/model.ts`; used by every later task):
 
 ```ts
 export type Yaw = 0 | 90 | 180 | 270;
@@ -563,18 +589,20 @@ export interface Layout {
 - Also produces:
   - `build.ts`: `layoutToBlueprint(layout: Layout, data: GameDataIndex, opts: { shortDesc: string; desc: string; now?: Date }): Blueprint`, plus `layoutToBlueprintString(...) = encodeBlueprint(layoutToBlueprint(...))`.
   - Building records use marker -101. Indexes: buildings first (in `layout.buildings` order), then belt nodes (belt by belt, node by node), then sorters. `index == position`.
-  - Positions: translate so the min x/y of all entities is ≥ 0. Single area `{0,-1,0,200,0,0,w,h}`, where `w/h` = ceil(extent)+1. `cursorOffset` = centre, `dragBox = (w,h)`.
+  - Positions: translate by the **integer** offset `(−floor(minX), −floor(minY))` over all emitted positions (including fractional sorter ends and port stubs), applied identically to everything, so buildings stay on their grid parity. Single area `{0,-1,0,200,0,0,w,h}`, where `w/h` = ceil(extent)+1. `cursorOffset` = centre, `dragBox = (w,h)`.
   - Belt node record: `itemId = tierItemId`, `modelIndex` from `GameDataIndex.building(tier).modelIndex`.
     - `yaw` = direction to the next node (last node: same as the previous). `tilt = 0`.
     - Each node's `outputObjIdx` = the next node's index. The last node's `outputObjIdx` = the sink building index with `outputToSlot = sink.port`, or the merge belt node index for a belt sink, else -1.
     - The first node with a `source` has `inputObjIdx = station index` and `inputFromSlot = port`.
+    - **Port stubs** (derived from the ILS sample by the plan review: belts leaving a port have nodes at ≈2.15 and ≈3.02 tiles from the station centre before reaching the lattice at 4.0): for a belt with a `source` port, the builder emits two extra belt records **before** `nodes[0]`: the port position itself (`prefabToGrid(port.position)`), then the midpoint between it and `nodes[0]`. For a belt with a `sink` port, it emits the mirror image after the last node (midpoint, then the port position). Stub records carry the station link (the first stub has `inputObjIdx = station`, `inputFromSlot = port`; the last sink stub has `outputObjIdx = station`, `outputToSlot = port`). Stubs exist only in the blueprint, not in `Layout` (the validator and solver reason about `nodes`, whose first/last node is the port's `firstOutside` lattice point).
+    - Belts change level only by **vertical lifts** (consecutive nodes with equal x/y and `|dz| = 1`), as seen in the capsule sample; `tilt` is always 0.
     - Slot fields per BF §3.3: belt chain `outputToSlot=1, inputFromSlot=0, outputFromSlot=0, inputToSlot=1, offsets 0`, except the overrides above.
   - Sorter record:
-    - `localOffset` = pick world position and `localOffset2` = drop world position. Use `endpointWorld(endpoint)` from Task 14; until Task 14 exists, implement a local helper in `build.ts` and move it later. For a building slot: `prefabToGrid(slot.position)`. For a belt: the node point.
+    - `localOffset` = pick world position and `localOffset2` = drop world position, from `sorterEnds(sorter, layout, data)` (Task 14 owns it; until Task 14 exists, implement it locally in `build.ts` and move it later). Building end: `prefabToGrid(slot.position)`. Belt end (**derived from the capsule sample**): the projection of the building slot's position onto the belt's axis line through the tap node, i.e. the point on the belt at the slot's lateral coordinate (e.g. a side slot at lateral +0.795 tiles gives a belt end at lateral +0.795, not at the node). Building↔building: both slot positions.
     - `yaw`/`yaw2` = direction from pick to drop. `parameters = [span]`. `filterId = filterItemId`.
     - `inputObjIdx` = pick target index and `outputObjIdx` = drop target index.
     - `inputFromSlot` = pick slot (building) or -1 (belt). `outputToSlot` = drop slot or -1. `outputFromSlot=0`, `inputToSlot=1`.
-  - Production building: `recipeId` and `parameters = [prolifMode ?? 0]`. Station: 2048 params per BF §4.1, from `StationConfig`. Power node: 0 params.
+  - Production building: `recipeId` and `parameters = [prolifMode ?? 0]`. Station: 2048 params per BF §4.1, from `StationConfig` (slot `itemId`, `localLogic`, `remoteLogic`, `max`; port `dir`, `storageIdx`; `params[320] = chargePerTick`; `params[328] = pilerCount`; drone/ship defaults: `321 = 64278761` (50°), `326 = 1`, `327 = 1`, `330 = 1`). Power node: 0 params.
   - Header: layout 10, `icons[0]` = target item id, `gameVersion = layout.meta.gameVersion`. `desc` gets the line `"[geometry: approximate - unverified in game]"` appended when `meta.geometrySource === 'approximate'` (Review Focus #5).
   - Body version 2, patch2 = 1, no reform, gzipOs 0x0A.
 
@@ -583,10 +611,15 @@ export interface Layout {
   - (b) A smelter + Mk.I sorter + belt: the sorter's `inputObjIdx`/`outputObjIdx` point at the smelter/belt records, and `parameters[0] == span`.
   - (c) `desc` contains "approximate" when the geometry is approximate, and does not otherwise.
   - (d) Every record has `index == position` and all link indexes are in range.
-- [ ] **Step 2:** Implement `geometry/layout.ts` and `blueprint/build.ts`. Run the tests until they pass.
+  - (e) Station slot params: a StationConfig with slot 0 `{itemId 1001, localLogic 2, remoteLogic 2, max 10000}` and slot 1 `{1101, 1, 1, 10000}` emits `params[0..3] == [1001,2,2,10000]` and `params[6..9] == [1101,1,1,10000]`.
+  - (f) Port stubs: a belt sourced at ILS port 0 emits 2 stub records before its first node, the first stub's position is within 0.01 of `prefabToGrid(port0.position)`, and the chain links stub→stub→node 0.
+  - (g) Translation is an integer: a layout whose minimum x is −3.6 shifts every record by exactly +4.
+  - (h) A sorter from a belt to an assembler side slot has its belt end at the slot's lateral coordinate (not the node's).
+- [ ] **Step 2:** Implement `geometry/model.ts` and `blueprint/build.ts`. Run the tests until they pass.
 - [ ] **Step 3:** `scripts/emit-test-blueprint.ts` (npm script `emit:test-bp`) builds the M0 hand-made layout from the fixture data and writes `local/test-blueprints/m0-smelter-row.txt`:
   - ILS at the origin.
-  - Port 3 outputs Iron Ore into a Mk.I belt running 10 tiles past 3 Arc Smelters (iron ingot recipe 1). Each smelter has a Mk.I input sorter span 1 from the belt and an output sorter span 1 onto a second belt that returns to ILS port 4 (input).
+  - ILS slot 0 = Iron Ore (local demand, remote demand, max 10000); slot 1 = Iron Ingot (local supply, remote supply, max 10000).
+  - Port 3 outputs Iron Ore into a Mk.I belt running 10 tiles past 3 Arc Smelters (iron ingot recipe 1). Each smelter has a Mk.I input sorter span 1 from the belt and an output sorter span 1 (filter Iron Ingot) onto a second belt that returns to ILS port 4 (input).
   - Tesla towers covering everything.
   - Hand-place the coordinates using the approximate geometry rule "slot cell = first lattice point outside the footprint along the slot facing".
   - It is used in the final user test checklist (Task 30). The test for this script only checks that it runs and the output decodes.
@@ -632,7 +665,7 @@ export function allTechs(data: GameData): Set<number>;   // every published, non
   - `techClosure({1302})` contains 1311 and 1001.
   - With `techClosure({1302})`, recipe 51 is unlocked and recipe 52 (Quantum Chip) is not.
   - Recipe 1 (iron ingot) is unlocked with the empty set.
-  - `computeTechEffects(allTechs)` has `stationPilerLevel == 4`, `inserterStackOutput == 4`, `beltMaxLevel == 48` and `beltVerticalConstruction == true`.
+  - `computeTechEffects(allTechs)` has `stationPilerLevel == 4`, `inserterStackOutput == 4` and `beltMaxLevel == 48`. `beltVerticalConstruction` is `true` iff some unlocked tech has unlock function 42 (the 0.10.29 fixture has none, so assert `false` on the fixture and `true` on a synthetic tech list containing func 42).
   - With the empty set, the base values hold (1, 2, 1, 3, 2, false, 12).
   - Building 2305 (Mk.III assembler) is unavailable at the empty set and available with all techs.
 - [ ] **Step 2:** Implement. Run the tests until they pass. Commit `feat(data): tech closure and effects`.
@@ -690,18 +723,19 @@ export function planProduction(req: PlanRequest, data: GameDataIndex, effects: T
 ```
 
 **Algorithm:**
-1. **Candidate recipes.** Walk back from the target over unlocked recipes (honouring `recipeOverrides`). Stop at supplied items. Exclude types FRACTIONATE, RESEARCH, EXCHANGE, PHOTON_STORE and NONE.
-   - If a needed item is neither supplied nor producible, return `no-recipe`, naming the item (English name).
+1. **Candidate recipes.** Walk back from the target over unlocked recipes (honouring `recipeOverrides`). Stop at supplied items. Exclude types FRACTIONATE, EXCHANGE, PHOTON_STORE and NONE; exclude RESEARCH **except** recipes whose results are matrices (items 6001–6006), which are admitted and run in labs (in the dump, matrix recipes such as recipe 9 have `type: RESEARCH`).
+   - **Prune infeasible alternates** to a fixed point: a recipe is dropped if any input is neither supplied nor producible by a remaining candidate (e.g. Graphene recipe 32 when Fire Ice is unsupplied; Hydrogen via recipe 74 when Critical Photon has no recipe).
+   - Return `no-recipe` only when a required item (one the target cannot be made without, i.e. pruning removed every producer of an item on all paths to the target) is neither supplied nor producible; name the first such item found walking from the target (English name).
    - If the target itself has no unlocked recipe and isn't supplied, return `target-locked`.
 2. **Facility per recipe.** Use the override, else `finalFacilityItemId` for the target's recipe, else the fastest available building with `production.recipeType == recipe.type`.
-   - Labs: recipes of type RESEARCH are excluded, but matrix recipes are type ASSEMBLE in some dumps and LAB-only in the game. Rule: if a recipe's results are matrices (items 6001-6006), use lab buildings (`kind == 'lab'`) with speed `lab.assembleSpeed`.
+   - Labs: if a recipe's results are matrices (items 6001–6006), its facility candidates are buildings with `kind == 'lab'` (speed = `lab.assembleSpeed`), regardless of the recipe's `type`. `GameDataIndex.buildingsForRecipeType` doesn't return labs, so handle this case explicitly.
    - An overridden facility that is unavailable or wrong-typed gives `facility-unavailable`.
 3. **Proliferator** (`proliferator.ts`):
    - `effectFor(tier, mode, recipe, data)` returns `{ outputMultiplier, speedMultiplier, powerMultiplier, proliferated }`.
    - Ability per tier: 1→1, 2→2, 3→4.
    - Extra mode applies only if `!recipe.nonProductive` and every input item is `productive`; otherwise it falls back to speed mode (a warning is added).
    - outputMultiplier = `1 + incTableMilli[ability]/1000`; speedMultiplier = `1 + accTableMilli[ability]/1000`; powerMultiplier = `1 + powerTableRatio[ability]/1000`.
-   - Sprays per proliferator item = `sprays + floor(sprays * incTableMilli[ability]/1000 + 0.1)` (self-sprayed). Mk.III: 75.
+   - Sprays per proliferator item = `sprays` (the item's `hpMax`: 12/24/60). The station imports unsprayed proliferator; self-spray loops (75 for Mk.III) are out of scope for v1.
    - Proliferator consumption = (Σ input items/s across all proliferated stages) / spraysPerItem. It is added as an import with a `'proliferator'` station slot.
 4. **LP** (`lp.ts`, glpk.js; initialise once and cache). Variables: `x_r ≥ 0` crafts/s per candidate recipe; `imp_k ≥ 0` for supplied items; `exp_k ≥ 0` for every item.
    - Constraints per item k: `Σ_r out·mult·x_r − Σ_r in·x_r + imp_k − exp_k = (k == target ? R : 0)`.
@@ -711,7 +745,7 @@ export function planProduction(req: PlanRequest, data: GameDataIndex, effects: T
 5. **Stages:** one per recipe with `x_r > 1e-9`. `exactMachines = x_r · machineSecondsPerCraft`; `machines = ceil(exactMachines − 1e-9)`.
 6. **Flows:** decompose by proportional allocation. For each item, distribute producers' output (stages, then import) to consumers (stages, then export) in stage order. Precision is 1e-9.
 7. **Exports:** the target first, then by-products with positive `exp_k`. `actualTargetRate` = `machines`-limited capacity of the target's producing stage(s) (ceil effect), never below R.
-8. **Station slots:** imports + exports + proliferator. `maxKinds` = station `maxItemKinds` for the chosen station kind's building (fixture: PLS 4, ILS 5); `stationsNeeded = ceil(slots / maxKinds)`.
+8. **Station slots:** imports + exports + proliferator. `maxKinds` = station `maxItemKinds` for the chosen station kind's building (fixture: PLS 4, ILS 5); `stationsNeeded = ceil(slots / maxKinds)`. This is a **lower bound**: the netlist (Task 20) may raise the station count further when belt-port demand exceeds 12 per station; it reports its own count.
 9. **Power** (`power.ts`):
    - `estimatePower(plan, data, effects)`: production work W = Σ machines·work·powerMult·utilization; idle W = Σ machines·idle·(1−utilization).
    - Sorters: estimate `2 × machines` Mk.III sorters at 50 % duty.
@@ -721,6 +755,7 @@ export function planProduction(req: PlanRequest, data: GameDataIndex, effects: T
 
 **Tests** (`plan.test.ts`, fixture data, all techs unless noted; numbers from DS "Test targets"):
 - [ ] **Step 1:** Write failing tests:
+  - All tests that name a facility pass `facilityOverrides` for **every** recipe in the chain (otherwise "all techs" picks the fastest building). E.g. Processor: `{51: 2303, 50: 2303, 53: 2303, 1: 2302, 3: 2302, 59: 2302}`.
   - 1 Processor/s, Mk.I assemblers everywhere, Arc Smelters, supplied ores {1001,1002,1003}:
     - stages for recipes 51, 50, 53, 1, 3, 59;
     - Processor exactMachines = 4, Circuit Board 4/3 → machines 2, Microcrystalline 16/3 → 6, High-purity Si 8, Iron Ingot 2, Copper 3;
@@ -728,13 +763,14 @@ export function planProduction(req: PlanRequest, data: GameDataIndex, effects: T
     - exports `[{1303,1}]`.
   - Facility override to Mk.III on recipe 51: 2 machines.
   - Buildings mode: `{kind:'buildings', count:4}` with Mk.I gives `actualTargetRate` 1.
-  - Graphene with `recipeOverrides {1123: 32}` and Fire Ice supplied: one stage (recipe 32), 1 chemical plant at 1/s, and exports include hydrogen 0.5/s (Review Focus #4).
-  - Graphene with no override and fire ice **not** supplied picks recipe 31 and imports crude oil, coal, stone and water when those are supplied.
+  - Graphene with `recipeOverrides {1123: 32}`, `facilityOverrides {32: 2309}` and Fire Ice supplied: one stage (recipe 32), 1 chemical plant at 1/s, and exports include hydrogen 0.5/s (Review Focus #4).
+  - Graphene with no override and fire ice **not** supplied picks recipe 31 (recipe 32 pruned, not an error) and imports crude oil, coal, stone and water when those are supplied.
+  - Electromagnetic Matrix (6001) at 1/s with Magnetic Coil and Circuit Board supplied: one stage on a lab building (`kind == 'lab'`), 3 Matrix Labs (2901) with `facilityOverrides {9: 2901}`.
   - Locked: `unlockedTechs = techClosure({})` with target Processor gives `{ok:false, kind:'target-locked'}` (Review Focus #2).
   - Missing input: target Processor, supplied only {1001}: `no-recipe` for an ore whose name appears in the message.
   - Station overflow: Quantum Chip from raw ores with PLS (4 kinds) gives `stationsNeeded ≥ 3` (Review Focus #3).
-  - Proliferator Mk.III extra on Processor (as in DS): 3.2 Mk.I assemblers exact, input rates 1.6/1.6, power 675 kW/machine; `proliferatorPerSecond > 0` and a slot with role `'proliferator'`.
-- [ ] **Step 2:** Implement `proliferator.ts` with its unit tests (`proliferator.test.ts`: Mk.III sprays 75; Mk.I extra multiplier 1.125; nonProductive falls back to speed).
+  - Proliferator Mk.III extra on Processor (as in DS): 3.2 Mk.I assemblers exact, input rates 1.6/1.6, power 675 kW/machine; `proliferatorPerSecond > 0` and a slot with role `'proliferator'`. Proliferator consumption uses 60 sprays per Mk.III item.
+- [ ] **Step 2:** Implement `proliferator.ts` with its unit tests (`proliferator.test.ts`: Mk.III sprays 60; Mk.I extra multiplier 1.125; nonProductive falls back to speed).
 - [ ] **Step 3:** Implement `lp.ts` (a thin wrapper `solveLP(model): Promise<{status, values}>` over glpk.js). Implement `plan.ts`. Run the tests until they pass.
 - [ ] **Step 4:** `power.test.ts`: for a plan with a single stage of 4 Mk.I assemblers at utilization 1 and no proliferator, productionWorkW = 4·270000 W and productionIdleW = 0; with utilization 0.5 (exactMachines 2 of 4), productionWorkW = 540000 and productionIdleW = 2·12000; ILS stationChargeW = 60e6 per station. Implement `power.ts`.
 - [ ] **Step 5:** Commit `feat(calc): LP production planner with proliferator and power estimate`.
@@ -752,7 +788,7 @@ export function planProduction(req: PlanRequest, data: GameDataIndex, effects: T
 - Produces:
   - `state.svelte.ts` exports `createAppState(data: GameData)`, returning a runes object: `{ request: PlanRequest (reactive), techProfileName, plan: PlanResult | null, setTarget(id), toggleSupplied(id), ... }`.
   - Tech profiles persist in `localStorage` under key `dsp-planner.techProfiles.v1` (`Record<name, number[]>`); every access is wrapped in try/catch.
-  - Debounced (150 ms) recompute of the plan on any request change.
+  - Plan recompute: **no `$effect` in the `.svelte.ts` module** (it would throw `effect_orphan` outside a component). Every mutator (`setTarget`, `toggleSupplied`, `setQuantity`, …) calls a debounced (150 ms) `scheduleRecompute()`. The state also exposes `recompute(): Promise<PlanResult>` (immediate, used by tests) and `whenSettled(): Promise<void>` (resolves after any pending debounced recompute).
   - `format.ts`: `formatPower(w: number): string` ("675 kW", "60.0 MW", "1.20 GW"), `formatRate(perSecond, unit: 's'|'min')`, `itemName(index, id)`.
 
 **UI layout:** two columns (left config 380px, right results); a single column below 900px.
@@ -777,10 +813,10 @@ export function planProduction(req: PlanRequest, data: GameDataIndex, effects: T
 
 - Every displayed string about geometry shows a badge "Geometry: approximate (fixture data)" when `meta.source === 'fixture'`, or when any building's geometry is approximate.
 
-- [ ] **Step 1:** Write `format.test.ts` (power formatting edge cases: 0 W, 999 kW → "999 kW", 1.5e6 → "1.50 MW") and `state.test.ts` (create state on the fixture; set target 1303 with rate 1; the plan resolves ok after awaiting the recompute; toggling supplied 1101 removes the Iron Ingot stage). Run them and see them fail.
+- [ ] **Step 1:** Write `format.test.ts` (power formatting edge cases: 0 W, 999 kW → "999 kW", 1.5e6 → "1.50 MW") and `state.test.ts` (create state on the fixture; set target 1303 with rate 1; `await state.whenSettled()` then the plan is ok; toggling supplied 1101 then `await state.recompute()` removes the Iron Ingot stage; use `vi.useFakeTimers()` where the debounce matters). Run them and see them fail.
 - [ ] **Step 2:** Implement `format.ts` and `state.svelte.ts` (tests run under Vitest with the Svelte compiler; name the file `*.svelte.ts` so runes compile). Run the tests until they pass.
 - [ ] **Step 3:** Implement the components and the `App.svelte` layout. Use CSS variables for colours with light/dark via `prefers-color-scheme`. `ItemIcon` shows `/icons/<name>.png` if it loads, else a coloured monogram.
-- [ ] **Step 4:** `npm run check && npm run build` must pass. Start `npm run dev` and use the Playwright MCP to load the page: select Processor at 1/s and confirm the plan table shows 4 assemblers for the Processor stage. Save a screenshot to `local/screenshots/m1-plan.png`.
+- [ ] **Step 4:** `npm run check && npm run build` must pass. Browser check: the **controller** runs it after the task (Playwright MCP: select Processor at 1/s and confirm the plan table shows the Processor stage; screenshot to `local/screenshots/m1-plan.png`). The implementer may skip it if no browser tool is available, and says so in the report.
 - [ ] **Step 5:** Commit `feat(ui): configuration panels and production plan view`.
 
 ---
@@ -791,7 +827,7 @@ export function planProduction(req: PlanRequest, data: GameDataIndex, effects: T
 
 **Files:**
 - Create: `app/src/lib/geometry/transform.ts`, `app/src/lib/geometry/obb.ts`, `app/src/lib/geometry/footprint.ts`, `app/src/lib/geometry/endpoints.ts`, `app/src/lib/geometry/index.ts`
-- Modify: `app/src/lib/blueprint/build.ts` (use `endpointWorld` from here; delete the local helper)
+- Modify: `app/src/lib/blueprint/build.ts` (use `sorterEnds` from here; delete the local helper)
 - Test: `transform.test.ts`, `obb.test.ts`, `footprint.test.ts`, `endpoints.test.ts`
 
 **Interfaces:**
@@ -807,10 +843,14 @@ export function buildingOBBs(b: PlacedBuilding, bd: Building): OBB2[];   // from
 export function obbOverlap(a: OBB2, b: OBB2, eps?: number): boolean;     // SAT in 2D + z interval overlap; eps shrink (default 0.02 tiles)
 export function pointInOBBs(x: number, y: number, z: number, obbs: OBB2[], inflate: number): boolean;
 export interface SlotInfo { index: number; pos: GridPoint; dir: [number, number]; firstOutside: { x: number; y: number } }
-export function slotInfos(b: PlacedBuilding, bd: Building): SlotInfo[];  // firstOutside: first lattice point along dir (from pos) not inside footprint (inflate 0)
+export function slotInfos(b: PlacedBuilding, bd: Building): SlotInfo[];  // firstOutside: on the line through the slot along dir, at lateral = round(slot lateral), the first lattice point beyond the slot (normal coordinate > slot's) that is not inside the building's footprint (inflate 0)
 export function portInfos(b: PlacedBuilding, bd: Building): SlotInfo[];  // same for belt ports
 export function sorterTapPoint(slot: SlotInfo, span: 1|2|3): { x: number; y: number }; // firstOutside + (span-1)*dir, rounded to lattice
-export function endpointWorld(e: Endpoint, layout: Layout, data: GameDataIndex): GridPoint;
+export function endpointWorld(e: Endpoint, layout: Layout, data: GameDataIndex): GridPoint; // building: slot position; belt: the node point
+export function sorterEnds(s: Sorter, layout: Layout, data: GameDataIndex): { pick: GridPoint; drop: GridPoint };
+// building end = slot position; belt end = projection of the opposite building slot's position onto the belt's axis line through the
+// tap node (axis = direction between the tap node's neighbours), i.e. the belt point at the slot's lateral coordinate, z = node z.
+// building↔building: both slot positions. belt↔belt (not used in v1): both node points.
 export const BELT_HALF_WIDTH_TILES: number; // 0.32 m / TILE
 ```
 
@@ -819,9 +859,11 @@ export const BELT_HALF_WIDTH_TILES: number; // 0.32 m / TILE
   - `prefabToGrid` for a building at (10,20,0) yaw 90 maps p = (0,0,TILE) to (11,20,0).
   - SAT: two 1×1 squares 1.5 apart don't overlap; 0.9 apart overlap; 45° rotated squares touching at corners behave correctly; disjoint z intervals never overlap.
   - Fixture assemblers: centres 4 tiles apart (same yaw) do **not** overlap; 3 tiles apart **do** overlap (half-extent 2 m: 3 tiles = 3.77 m < 4 m).
-  - `slotInfos` on a fixture assembler at yaw 0 gives 12 slots, and `firstOutside` for an east-side slot is at x = +2. Span-2 tap at x = +3.
+  - `slotInfos` on a fixture assembler at (0,0) yaw 0 gives 12 slots; slot 3 (east face, north end) has `pos ≈ (0.883, 0.796, 0)` and `firstOutside = (2, 1)`. Span-2 tap at (3, 1).
+  - The same at yaw 90: slot 3 is rotated onto the south face (`pos ≈ (0.796, −0.883, 0)` per the convention), `firstOutside = (1, −2)`.
   - `endpointWorld` for a belt endpoint returns the node.
-- [ ] **Step 2:** Implement. Run the tests until they pass. Update `build.ts` to use `endpointWorld`. Re-run the blueprint tests.
+  - `sorterEnds` for a sorter from a N–S belt through (2,0),(2,1),(2,2) (tap node index 1) to assembler slot 3: belt end `(2, 0.796, 0)`, building end `(0.883, 0.796, 0)`.
+- [ ] **Step 2:** Implement. Run the tests until they pass. Update `build.ts` to use `sorterEnds`. Re-run the blueprint tests.
 - [ ] **Step 3:** Commit `feat(geometry): transforms, OBB collision, slot and port geometry`.
 
 ### Task 15: Geometry and connection checks (validator part 1)
@@ -838,7 +880,8 @@ export const BELT_HALF_WIDTH_TILES: number; // 0.32 m / TILE
 export type ViolationCode =
   | 'BUILDING_OVERLAP' | 'BELT_IN_BUILDING' | 'BELT_OVERLAP' | 'BELT_DISCONNECTED' | 'BELT_BAD_RAMP' | 'BELT_TOO_HIGH'
   | 'BELT_PORT_MISMATCH' | 'SORTER_SPAN' | 'SORTER_SLOT_INVALID' | 'SORTER_SLOT_REUSED' | 'SORTER_SKEW' | 'SORTER_IN_BUILDING'
-  | 'SORTER_ENDPOINT_BELT_RAMP' | 'SORTER_TO_STATION' | 'POWER_UNCOVERED' | 'POWER_DISCONNECTED' | 'STATION_SLOTS'
+  | 'SORTER_ENDPOINT_BELT_RAMP' | 'SORTER_BELT_TANGENT' | 'SORTER_TO_STATION' | 'POWER_UNCOVERED' | 'POWER_DISCONNECTED' | 'STATION_SLOTS'
+  | 'COATER_PLACEMENT' | 'COATER_UNFED'
   | 'RATE_BELT' | 'RATE_SORTER' | 'RATE_MACHINE_INPUT' | 'SIM_OUTPUT_LOW' | 'SIM_DEADLOCK' | 'SIM_STALLED';
 export interface Violation { code: ViolationCode; entities: { kind: 'building'|'belt'|'sorter'; id: number; node?: number }[];
   message: string; mirrors?: string }          // game method the rule mirrors, e.g. "BuildTool_Path.CheckBuildConditions"
@@ -849,17 +892,18 @@ export function checkGeometry(layout: Layout, data: GameDataIndex, effects: Tech
 1. `BUILDING_OVERLAP`: pairwise `obbOverlap` of building OBBs. Buildings stacked via `multiLevel` with z offset = `lapJoint` are exempt.
 2. `BELT_IN_BUILDING`: a belt node point inside any building OBB, inflated by `BELT_HALF_WIDTH_TILES`, with node z within the building's z range.
 3. `BELT_OVERLAP`: two belt nodes (any belts, or non-consecutive in the same belt) at the same (x,y,z). A `sink: belt` merge target node is exempt for the merging belt's last node.
-4. `BELT_DISCONNECTED`: consecutive nodes not 4-adjacent in x/y with |dz| ≤ 1, or with dz≠0 and dx=dy=0.
-5. `BELT_BAD_RAMP`: a node where z changes must be preceded by ≥ 2 straight same-direction steps with no z change, and followed by the same; no direction change between the ramp's entry and exit (MX §2.4).
+4. `BELT_DISCONNECTED`: consecutive nodes must be either a **flat step** (4-adjacent in x/y, dz = 0) or a **vertical lift** (same x/y, |dz| = 1). Anything else (diagonal, a horizontal step combined with a z change, a jump) is disconnected. Diagonal "1 tile + 1 level" ramps are **unverified in-game** and not generated in v1.
+5. `BELT_BAD_RAMP`: a lift run (one or more consecutive vertical lifts in the same z direction at one x/y) must be preceded by ≥ 2 flat steps and followed by ≥ 2 flat steps, all in the same horizontal direction (no turn within 2 steps either side of the lift; capsule-sample pattern, MX §2.4).
 6. `BELT_TOO_HIGH`: z > `effects.beltMaxLevel`.
 7. `BELT_PORT_MISMATCH`: `source`/`sink` ports must exist, and the first/last node must equal the port's `firstOutside` lattice point at z 0.
-8. `SORTER_SPAN`: the grid distance between pick and drop points (x/y) must be within `[span − 0.5, span + 1.5]` tiles of the slot geometry, using `sorterTapPoint` equality for building↔belt. The 3D distance must be ≤ `sorterMaxReachMeters`. Building↔building: lattice distance between the two slots' `firstOutside` points ≤ 3, and the points must face each other.
+8. `SORTER_SPAN`: building↔belt: the belt tap node must equal `sorterTapPoint(slot, span)` (x/y) for the building slot. Building↔building: the two slots face each other (opposite facings) and the distance between their `firstOutside` points along the facing is `span − 1` (span 1 = adjacent lattice). In all cases the 3D distance between `sorterEnds` pick and drop must be ≤ `sorterMaxReachMeters` and ≥ 1 m.
 9. `SORTER_SLOT_INVALID` (slot index out of range) and `SORTER_SLOT_REUSED` (two sorters on the same building slot).
-10. `SORTER_SKEW`: the sorter direction (pick→drop) must align with the building slot facing within 14° (building↔building) or 11° (belt involved).
+10. `SORTER_SKEW`: the sorter direction computed from `sorterEnds` (pick→drop) must align with the building slot facing (or its reverse) within 14° (building↔building) or 11° (belt involved).
 11. `SORTER_IN_BUILDING`: lattice points strictly between the endpoints that lie inside a building OBB that isn't one of the endpoints' own buildings.
 12. `SORTER_ENDPOINT_BELT_RAMP`: a sorter's belt endpoint node must have z = 0 and no z change on adjacent nodes.
+12a. `SORTER_BELT_TANGENT`: a sorter's belt tap node must be mid-straight: it has a previous and a next node, all three collinear, and the belt axis is perpendicular to the sorter's slot facing (within 11°). Belt corners are diagonal in-game and break the facing rule (plan review, capsule sample).
 13. `SORTER_TO_STATION`: a sorter endpoint on a station building (MX §3.3).
-14. `POWER_UNCOVERED`: every consumer building (power.consumer and not a node) must have its centre within `coverRadius` m of some node's `powerPoint` (2D, metres).
+14. `POWER_UNCOVERED`: every power consumer must be within `coverRadius` m (2D, metres) of some node's `powerPoint`: consumer **buildings** (power.consumer and not a node) measured at their centre, and every **sorter** measured at the midpoint of its `sorterEnds` (sorters are consumers). Coaters (Task 28) are added here too.
 15. `POWER_DISCONNECTED`: nodes form one connected graph, with an edge when the distance is ≤ `min(connectDistance_a, connectDistance_b)` (MX §6.1, C3; noted in the rule's message).
 16. `STATION_SLOTS`: slot configs exceed `maxItemKinds`, or a port references a storageIdx > slots.length.
 
@@ -880,7 +924,7 @@ export function checkGeometry(layout: Layout, data: GameDataIndex, effects: Tech
   - `checkCapacity(layout, plan: ProductionPlan, data, effects): Violation[]` emits RATE_BELT, RATE_SORTER and RATE_MACHINE_INPUT:
     - **belt:** `plannedRate > capacity` (stack = `effects.stationPilerLevel` for belts sourced at a station port, else 1).
     - **sorter:** `plannedRate > sorterRate`.
-    - **machine input:** for each production building and each recipe input, Σ plannedRate of sorters dropping into it with that filter (or unfiltered sorters fed from a belt carrying that item) < required per-machine input rate × 0.999.
+    - **machine input:** for each production building and each recipe input, Σ plannedRate of sorters dropping into it with that filter (or unfiltered sorters fed from a belt carrying that item) < required per-machine input rate × 0.999, where the required rate is the **planned** rate (stage input totals ÷ machines, i.e. utilization-weighted), not full speed.
 - Fast: precomputed indexes; O(entities).
 
 - [ ] **Step 1:** Failing tests:
@@ -921,13 +965,15 @@ export class StationSim {           // mirrors: StationComponent.UpdateOutputSlo
   received(itemId: number): number;
 }
 export class World {
-  constructor(layout: Layout, plan: ProductionPlan, data: GameDataIndex, effects: TechEffects);
+  constructor(layout: Layout, plan: ProductionPlan, data: GameDataIndex, effects: TechEffects, opts?: { powerSupplyW?: number });
+  readonly powerRatio: number;                        // 1 unless powerSupplyW caps it
   tick(): void;                                       // fixed order per MX §10.7
   readonly ticks: number;
 }
 ```
 
-- Belt cell mapping: `lengthCells = nodes.length · constants.beltCellsPerTile`. Node `i` maps to cell `i·cellsPerTile + cellsPerTile/2`. Speed = `belt.speed` of the tier.
+- Belt cell mapping: `lengthCells = nodes.length · constants.beltCellsPerTile` (+ `2·cellsPerTile/2` extra cells for each port stub end, approximating the blueprint's stub records). Node `i` maps to cell `stubCells + i·cellsPerTile + cellsPerTile/2`. Speed = `belt.speed` of the tier. **Cell index 0 is the head (where items enter); the rear is the last cell.**
+- **Power supply:** the block's network is assumed to be externally supplied. The `World` power ratio is `1` by default; an optional `opts.powerSupplyW` cap sets `ratio = min(1, supply / lastTickDemand)` (mirrors: PowerSystem.GameTick consumer ratio, MX §6.2).
 - `World` builds BeltSims for all belts, wires `sink: belt` merges via `setOutput`, and builds StationSims. Later tasks register sorters and machines. Expose a registration API: `world.addEntity({ tick(): void })` with an explicit phase (`'power'|'machines'|'stationIn'|'sorters'|'belts'|'stationOut'`).
 
 - [ ] **Step 1:** `belt.test.ts`:
@@ -987,12 +1033,13 @@ export interface PickSource { pickProduct(filter: number, accept: (item: number)
     - `powerDemand()` = work·(1000+powerTable[L])/1000 while replicating, else idle;
     - counters `crafts`, `stalledTicks`, `starvedTicks`.
   - `class CoaterSim` (mirrors `SpraycoaterComponent.InternalUpdate`, MX §4.6): attached to an item belt cell and a proliferator belt.
-  - `runSimulation(layout, plan, data, effects, opts?: { warmupTicks?: number; measureTicks?: number }): SimResult`. Defaults: 7200 and 18000 ticks.
+  - `runSimulation(layout, plan, data, effects, opts?: { warmupTicks?: number; measureTicks?: number; powerSupplyW?: number }): SimResult`. Defaults: 7200 and 18000 ticks; power externally supplied (ratio 1) unless `powerSupplyW` is given.
 
 ```ts
 export interface SimResult {
   measuredTargetRate: number; measuredExports: ItemRate[];
   machineStats: { buildingId: number; crafts: number; busyFraction: number; outputBlockedFraction: number; starvedFraction: number }[];
+  stageStats: { stageIndex: number; crafts: number; plannedCrafts: number }[];   // over the measurement window
   deadlocked: boolean;          // no belt movement, no sorter state change and no machine progress for 600 consecutive ticks during measurement while plan expects output
   power: { steadyW: number; peakW: number; idleW: number };   // measured average; peak = max tick demand + station charge
 }
@@ -1009,7 +1056,7 @@ export interface ValidationReport { pass: boolean; violations: Violation[]; sim?
     - Run checkGeometry, then (if clean) checkCapacity, then (if `simulate`, default true) runSimulation.
     - SIM_OUTPUT_LOW if measured target < 0.99·plan rate.
     - SIM_DEADLOCK if deadlocked.
-    - SIM_STALLED for any machine whose stage utilization > 0.05 in the plan but `busyFraction < 0.01` during measurement, or `outputBlockedFraction > 0.9`. This catches undrained byproducts (Review Focus #4).
+    - SIM_STALLED for any **stage** whose measured crafts < 0.9 × planned crafts (`stage.craftsPerSecond × measureSeconds`); the violation lists that stage's machines with their `busyFraction`/`outputBlockedFraction`. This catches undrained byproducts (Review Focus #4) without flagging machines that are legitimately idle part of the time because they were rounded up (a dead-end net keeps a low-utilization machine blocked most of the time, which is correct).
   - Power accounting: sorters work while Sending/Returning; machines per demand; coaters work while spraying; station charge = `chargePerTick` constant at peak (blocks start with empty stations), and `steadyW` excludes station charge (reported separately).
 
 - [ ] **Step 1:** `machine.test.ts`:
@@ -1046,7 +1093,7 @@ export interface ValidationReport { pass: boolean; violations: Violation[]; sim?
 ```ts
 export interface MachineInst { id: number; stageIndex: number; recipeId: number; buildingItemId: number }
 export interface MachineInstIO { inputs: ItemRate[]; outputs: ItemRate[] }  // per machine, at plan utilization (stage totals / machines)
-export interface NetTap { machineId: number; itemId: number; dir: 'in' | 'out'; rate: number; sorters: number } // sorters needed at chosen tier+span assumptions
+export interface NetTap { machineId: number; itemId: number; dir: 'in' | 'out'; rate: number; sorters: number } // sorters needed at span 1 (recomputed by assignTaps once spans are chosen)
 export interface BeltNet {
   id: number; itemId: number; tierItemId: 2001|2002|2003; rate: number;
   source: { kind: 'station'; stationIdx: number } | { kind: 'taps' };      // import belts start at a station port; intermediate belts start at first producer tap
@@ -1057,6 +1104,7 @@ export interface Netlist {
   machines: (MachineInst & MachineInstIO)[]; nets: BeltNet[];
   stations: { kind: 'planetary' | 'interstellar'; buildingItemId: number; slots: StationSlotConfig[]; portsNeeded: number }[];
   sorterTierItemId: 2011|2012|2013|2014; beltTierItemId: 2001|2002|2003;
+  warnings: string[];
 }
 export function buildNetlist(plan: ProductionPlan, data: GameDataIndex, effects: TechEffects, opts?: { maxMachinesPerNet?: number }): Netlist;
 ```
@@ -1068,12 +1116,14 @@ export function buildNetlist(plan: ProductionPlan, data: GameDataIndex, effects:
   - imports → nets with a station source;
   - the target and exports → nets with a station sink;
   - intermediates → nets with source `taps` and sink `deadEnd`, **unless** the item is also exported, in which case the sink is the station.
-- Split a net into several when its rate > 0.95·beltCapacity, or when its tap count > `maxMachinesPerNet` (default 12). Machines are partitioned in id order.
-- Sorters per tap = `ceil(rate / sorterRate(tier, span=1))`. If that is > 3, raise the belt tier or flag it in netlist warnings.
+- Net capacity = `0.95 · beltCapacity(tier, stack)`, with `stack = effects.stationPilerLevel` for station-sourced nets and 1 otherwise.
+- Split a net into several when its rate > capacity, or when its tap count > `maxMachinesPerNet` (default 12). **Split by rate, not by id**: partition the consumers (id order) into groups whose demand ≤ capacity and tap count ≤ the max; then allocate producer capacity to the groups greedily (id order) so that each group's supply ≥ its demand. A producer whose output is split between two groups gets one tap in each group, with the rate divided. Every sub-net must satisfy Σ producer tap rates ≥ Σ consumer tap rates (assert it).
+- Sorters per tap = `ceil(rate / sorterRate(tier, span=1, stack, …))`. If that is > 3, raise the belt tier or add a netlist warning.
 - Stations:
   - Assign item slots in order (target first, then imports by rate, then proliferator, then byproducts).
-  - Start a new station when `maxItemKinds` is exceeded; the number of stations equals `plan.stationsNeeded`.
-  - Each net with a station source/sink uses one port. Error if a station's ports needed > 12. Remedy: split items across stations.
+  - Start a new station when `maxItemKinds` is exceeded.
+  - Each net with a station source/sink uses one port. Also start a new station when the current one's port demand would exceed 12. So `stations.length = max(plan.stationsNeeded, slot- and port-driven count)`; record a warning when the netlist needs more stations than the plan predicted.
+  - Slot logic: imports and proliferator → `localLogic 2` (demand), `remoteLogic 2` on an ILS (0 on a PLS); exports (target and byproducts) → `localLogic 1` (supply), `remoteLogic 1` on an ILS (0 on a PLS); `max = station.maxItemCount`.
 
 - [ ] **Step 1:** Failing tests:
   - The Processor plan (Mk.I) has 4+2+6 assemblers and 2+3+8 smelters = 25 machines.
@@ -1081,8 +1131,10 @@ export function buildNetlist(plan: ProductionPlan, data: GameDataIndex, effects:
   - The circuit-board net has producer taps from 2 machines and consumer taps on 4 Processor machines, sink deadEnd.
   - The Processor export net has a station sink.
   - An iron ore net with 2/s on Mk.I (6/s) is one net.
-  - A 20/s net on Mk.I splits into 4.
-  - Quantum Chip with PLS: stations.length == plan.stationsNeeded.
+  - An **intermediate** (taps-sourced, stack 1) 20/s net on Mk.I splits into 4, and each sub-net's producer supply ≥ its consumer demand.
+  - A **station-sourced** 20/s import on Mk.I with `stationPilerLevel 4` (capacity 0.95·24) is one net.
+  - Quantum Chip with PLS: `stations.length ≥ plan.stationsNeeded`, every station has ≤ 4 slots and ≤ 12 ports.
+  - Slot logic: on an ILS, import slots are `{localLogic 2, remoteLogic 2}` and the export slot is `{1, 1}`; `max == 10000`.
 - [ ] **Step 2:** Implement. Run the tests until they pass. Commit `feat(layout): netlist from production plan`.
 
 ### Task 21: Occupancy grid and placement (simulated annealing)
@@ -1144,7 +1196,9 @@ export function annealPlacement(net: Netlist, data: GameDataIndex, init: Placeme
   - `taps.ts`: `assignTaps(net: Netlist, placement: Placement, occ: Occupancy, data): TapAssignment | { failed: string }`.
 
 ```ts
-export interface AssignedTap { netId: number; machineId: number; slot: number; span: 1|2|3; point: { x: number; y: number }; dir: 'in'|'out'; sorterIndex: number }
+export interface AssignedTap { netId: number; machineId: number; slot: number; span: 1|2|3; point: { x: number; y: number }; axis: 'x' | 'y'; dir: 'in'|'out'; sorterIndex: number; rate: number }
+// ONE AssignedTap per sorter: a NetTap needing k sorters yields k AssignedTaps on k distinct slots, each with its own belt point;
+// `axis` = the belt direction required through `point` (perpendicular to the slot facing); `rate` = this sorter's share.
 export interface TapAssignment { taps: AssignedTap[]; stationPorts: { netId: number; stationBuildingId: number; port: number; point: { x: number; y: number } }[] }
 ```
 
@@ -1152,7 +1206,8 @@ export interface TapAssignment { taps: AssignedTap[]; stationPorts: { netId: num
     - Each machine slot is used at most once.
     - The tap point (`sorterTapPoint`) must not be blocked for belts, and must not equal another net's tap point.
     - Prefer span 1, then 2, then 3. Prefer slots facing the centroid of the net's other taps.
-    - Station ports are assigned to nets by nearest facing toward the net's tap centroid.
+    - After a span is chosen, recompute that NetTap's sorter count with `sorterRate(tier, span, …)` (span 2/3 sorters are slower) and allocate more slots if needed; fail if the machine runs out of slots.
+    - Station ports are assigned to nets by nearest facing toward the net's tap centroid; the port's lattice point is its `portInfos(...).firstOutside`.
   - `router.ts`:
 
 ```ts
@@ -1162,13 +1217,14 @@ export interface RoutedNet { netId: number; nodes: GridPoint[] }
 export function routeNets(net: Netlist, taps: TapAssignment, occ: Occupancy, p: RouteParams, shouldStop: () => boolean): { ok: true; routes: RoutedNet[] } | { ok: false; conflicts: number; routes: RoutedNet[] };
 ```
 
-  - Waypoints per net: [station port point, if source] → producer tap points (nearest-neighbour order) → consumer tap points (nearest-neighbour) → [station port point, if sink]. Each leg is routed with A*.
-  - A* state = `(x, y, z, dir, straight)`, with `straight ∈ {0,1,2}` = flat same-direction steps taken since the last turn or z change (capped at 2).
-  - Moves:
-    - forward flat;
-    - turn left/right (only if `straight == 2` or `z == 0`; ground turns are free in game, ramp-adjacent turns are not);
-    - forward with z ± 1 (only if `allowElevation`, `straight == 2`, and resulting z ∈ [0, maxLevel]; after a ramp step `straight = 0`).
-  - Tap and port points must be visited at z = 0, with the node's in/out not on a ramp.
+  - Waypoints per net: [station port point, if source] → producer tap points (nearest-neighbour order) → consumer tap points (nearest-neighbour) → [station port point, if sink]. Each leg is routed with A*, and the **A* direction state is carried from one leg to the next** (no U-turns at a waypoint).
+  - **Taps are mid-straight:** the path must pass through each tap point at z = 0 moving along the tap's `axis`, with the previous and next nodes collinear (so a tap is never a belt corner and never the first or last node). A taps-sourced belt therefore starts one node *before* its first tap along the axis, and a dead-end belt ends one node *after* its last tap. Port points are visited at z = 0, and the port's first/last node must step straight out from/into the port along the port's facing.
+  - A* state = `(x, y, z, dir, straight)`, with `straight ∈ {0,1,2}` = flat same-direction steps taken since the last turn or lift (capped at 2).
+  - Moves (the only level change is the in-game-verified **vertical lift**, capsule sample):
+    - forward flat (`straight = min(2, straight+1)`);
+    - turn left/right at z = 0 always; at z > 0 only if `straight == 2`;
+    - lift: same x/y, z ± 1 (only if `allowElevation`, `straight == 2`, and resulting z ∈ [0, maxLevel]); after a lift `straight = 0`, the next two moves must be forward flat in the same direction, and consecutive lifts in the same z direction are allowed (multi-level lift).
+  - A z = 1 belt may pass over a z = 0 belt at the same x/y (capsule sample); occupancy is per (x, y, z).
   - Cell cost = 1 + elevation penalty 0.5·z + present-congestion·presentFactor + history.
   - Blocked: `occ.blockedForBelt`, and cells that are another net's tap points.
   - Negotiated congestion: iterate rip-up/reroute of all nets; overused (x,y,z) cells raise history; stop at zero overuse or `maxIterations`.
@@ -1176,12 +1232,14 @@ export function routeNets(net: Netlist, taps: TapAssignment, occ: Occupancy, p: 
 
 - [ ] **Step 1:** `router.test.ts`:
   - Route one net in an empty 20×20 area between two points: a shortest-length path with 4-adjacent nodes.
-  - Two nets that must cross on the ground: with `allowElevation` they succeed with one net lifted to z = 1 and valid ramps (assert by running `checkGeometry` BELT_* rules on a synthetic layout); without elevation they fail (`ok: false`).
+  - Two nets that must cross on the ground: with `allowElevation` they succeed with one net lifted to z = 1 by vertical lifts (assert by running `checkGeometry` BELT_* rules on a synthetic layout: no BELT_DISCONNECTED/BELT_BAD_RAMP); without elevation they fail (`ok: false`).
+  - A tap waypoint with axis `y` is passed straight along y (previous and next node share its x), and the following leg never reverses direction.
   - An obstacle building is avoided.
   - Waypoints are visited in order at z = 0.
 - [ ] **Step 2:** `taps.test.ts`:
-  - On the constructive Processor placement (margin 2), every netlist tap gets a slot and no slot is reused.
+  - On the constructive Processor placement (margin 2), every netlist tap gets its sorters' slots, no slot is reused, and Σ AssignedTap rates per NetTap ≥ the NetTap rate.
   - Tap points are not inside buildings.
+  - A span-2 choice increases the sorter count when one span-2 sorter can't carry the rate.
 - [ ] **Step 3:** Implement `heap.ts` (binary heap), `taps.ts` and `router.ts`. Run the tests until they pass. Commit `feat(layout): tap assignment and negotiated 3D belt routing`.
 
 ### Task 23: Power poles and layout assembly
@@ -1192,20 +1250,22 @@ export function routeNets(net: Netlist, taps: TapAssignment, occ: Occupancy, p: 
 
 **Interfaces:**
 - Produces:
-  - `placePowerNodes(buildings: PlacedBuilding[], blockedPoints: Set<string> /* "x,y" belts+taps+sorter cells */, occ: Occupancy, data, effects): PlacedBuilding[] | null`.
+  - `placePowerNodes(buildings: PlacedBuilding[], consumerPoints: { x: number; y: number }[] /* sorter midpoints (and later coaters) */, blockedPoints: Set<string> /* "x,y" belts+taps+sorter cells */, occ: Occupancy, data, effects): PlacedBuilding[] | null`. Coverage targets = consumer building centres **plus** `consumerPoints`.
     - Node type: the available node with the best `coverRadius² / footprint` (Tesla Tower in the fixture). Wireless Power Tower and Satellite Substation are only used if Tesla is unavailable.
     - Greedy set cover over candidate lattice points (not blocked; the node OBB collides with nothing).
     - Then connect components by adding relay nodes along straight lines (steps of 0.9·connectDistance).
     - Return null if coverage fails.
   - `assembleLayout(netlist, placement, taps, routes, powerNodes, plan, data): Layout`.
     - Creates the `BeltPath`s: the route nodes, `source`/`sink` set from station ports, `plannedRate` = net rate.
-    - Creates `Sorter`s per AssignedTap: pick/drop endpoints between the machine slot and the belt node index of the tap point. Direction: 'in' taps pick from the belt and drop into the machine; 'out' taps the reverse. `filterItemId` = net item for 'in', 0 for 'out'. Multiple sorters per tap use adjacent free slots, and each gets its own tap point on the same belt.
-    - Creates station `StationConfig`: slots per netlist; ports dir 1 for source nets, 2 for sink nets; `storageIdx` 1-based of the item slot; `chargePerTick` from the plan request; `pilerCount 0`.
+    - Creates one `Sorter` per AssignedTap: pick/drop endpoints between the machine slot and the belt node index of the tap point. Direction: 'in' taps pick from the belt and drop into the machine; 'out' taps the reverse. `filterItemId` = the net's item for **both** directions (an unfiltered output sorter on a multi-output machine, e.g. Plasma Refining, would put the wrong product on the belt and jam the station input). `plannedRate` = the tap's rate.
+    - Creates station `StationConfig`: slots from the netlist (logic and max as set there); ports dir 1 for source nets, 2 for sink nets, 0 otherwise; `storageIdx` 1-based of the item slot; `chargePerTick` from the plan request; `pilerCount 0`.
     - Fills meta.
 
 - [ ] **Step 1:** Tests:
   - On a synthetic set of 6 assemblers in a row, `placePowerNodes` yields nodes such that `checkGeometry` reports no POWER_* violations.
+  - `placePowerNodes` covers sorter midpoints: a layout whose only uncovered consumer is a sorter gets an extra node.
   - `assembleLayout` from a tiny hand netlist (1 station, 1 smelter, import and export nets, hand routes) produces a layout that passes `validateLayout` with simulation (3000/6000 ticks).
+  - For a Plasma Refining stage, the hydrogen output sorter has `filterItemId == 1120` and the refined-oil one `1114`.
 - [ ] **Step 2:** Implement. Run the tests until they pass. Commit `feat(layout): power node placement and layout assembly`.
 
 ### Task 24: Solver orchestrator, Web Worker and anytime loop
@@ -1231,7 +1291,7 @@ export function footprintOf(layout: Layout, data: GameDataIndex): number;   // b
 **Algorithm (anytime):**
 1. Build the netlist.
 2. **Fallback ladder first:** margins `[3, 4, 6]`, then **constructivePlacement** → assignTaps → routeNets (elevation on) → power → assemble → `validateLayout` (fast checks; then simulation only if this would be the new best).
-   - The first valid result is emitted immediately; this is the guarantee.
+   - The first valid result is emitted immediately; this is the guarantee. **The fallback ladder runs to completion regardless of the time budget** (the budget and early-stop only apply to the improvement loop); only a user stop interrupts it.
    - If every margin fails, report `failures` (all violation messages) with `stoppedBy: 'exhausted'`.
 3. **Improvement loop until the stop condition:**
    - pick a margin from `[1, 2]`;
@@ -1252,13 +1312,15 @@ export function footprintOf(layout: Layout, data: GameDataIndex): number;   // b
   - The budget stop triggers.
   - The user stop returns the best found.
   - Determinism for a fixed seed.
-- [ ] **Step 2:** `test/solver-e2e.test.ts`, marked with a 120 s timeout. For fixture plans (a) 3 iron ingots/s, (b) 1 Circuit Board/s from iron and copper ore, (c) 1 Processor/s from ores (Mk.III assemblers, Mk.II belts), with a 20 s budget:
+- [ ] **Step 2:** `test/solver-e2e.test.ts`, marked with a 180 s timeout, using `simWarmupTicks: 1800, simMeasureTicks: 3600` to keep it fast. For fixture plans (a) 3 iron ingots/s, (b) 1 Circuit Board/s from iron and copper ore, (c) 1 Processor/s from ores (Mk.III assemblers, Mk.II belts), with a 20 s budget:
   - `layout != null`;
   - `report.pass`;
   - `report.sim.measuredTargetRate ≥ 0.99·plan rate`;
   - the blueprint string decodes;
   - the footprint is logged.
   - **This is the M3 acceptance test.** If (c) can't be made to pass, step back and fix the earlier components; don't weaken the assertion.
+  - Performance: log the simulator's ticks/second for (c) and assert ≥ 2000 ticks/s.
+  - **Property test** (spec §11): for 5 seeded random feasible plans (random target among items with ≤ 3 recipe stages from raw ores, random rate 0.5–3/s, all techs), every layout emitted through `onImproved` passes `validateLayout` with simulation. Use a 10 s budget each.
 - [ ] **Step 3:** Implement. Run the tests until they pass. Commit `feat(layout): anytime solver with fallback ladder and web worker`.
 
 ### Task 25: UI: solve, preview, validation report and blueprint export
@@ -1275,11 +1337,11 @@ export function footprintOf(layout: Layout, data: GameDataIndex): number;   // b
 - **SolvePanel:** a Solve button (disabled without an ok plan); the time budget from the options; live progress (elapsed, attempts, validated, best footprint); "Stop & use best".
 - **LayoutPreview:** a canvas with pan/zoom (wheel, drag), a height-level slider (`all`, 0..max z) and an entity tooltip.
 - **ValidationPanel:** pass/fail; the violation list (clicking one highlights it); simulated vs planned target rate; measured power (steady/peak) next to the estimate.
-- **BlueprintPanel:** a read-only textarea with the blueprint string, Copy (clipboard API with a fallback), Download `.txt` (`<target-name>-<rate>.txt`), and an "approximate geometry" warning banner when applicable (Review Focus #5).
+- **BlueprintPanel:** a read-only textarea with the blueprint string, Copy (clipboard API with a fallback), Download `.txt` (`<target-name>-<rate>.txt`), an "approximate geometry" warning banner when applicable (Review Focus #5), and a permanent note: "Paste within the equatorial band (±28° latitude); pasting near the poles may fail" (spec §6.1).
 
 - [ ] **Step 1:** `preview.test.ts` with a fake 2D context recording calls: renderLayout draws one path per belt and one rect per building; `hitTest` returns the assembler at its centre.
 - [ ] **Step 2:** Implement. `npm run check && npm run build` must pass.
-- [ ] **Step 3:** Playwright MCP check on `npm run dev`:
+- [ ] **Step 3:** Browser check (the **controller** runs this after the task with the Playwright MCP; the implementer may skip it and say so) on `npm run dev`:
   - choose 1 Circuit Board/s with ores supplied;
   - set the budget to 0.5 min;
   - Solve, and wait for done;
@@ -1313,7 +1375,7 @@ export const VERIFIED_MOTIFS: Set<MotifInstance['kind']>;   // spec §6.4: enabl
 
 - **direct-insertion (MX §9 M3):** when an intermediate net has exactly one producer machine and one consumer machine (after the netlist splits nets per consumer group, a 1:k ratio becomes k pairs only when rates allow), place producer and consumer facing each other. Use slot pairs whose `firstOutside` points lie on a line ≤ 3 tiles apart, found by searching relative offsets (dx, dy ∈ [−8, 8], 4 yaws) with the geometry kernel and checking the SORTER_* rules via `checkGeometry` on a 2-building mini layout. Rate check via `sorterRate` (building pick = 1 item/trip). The internal sorter replaces the belt for that pair.
 - **sandwich (MX §9 M1):** two mirrored rows of same-stage machines around a shared belt line at `firstOutside` distance. It proposes only relative offsets (row pitch from a non-collision search: the smallest dx > 0 with no OBB overlap). Taps for both rows land on the same lattice line, so the router can use one straight belt.
-- **lab-stack (MX §4.4, §8):** matrix stages using labs stack up to `effects.labLevel` high (`dz = lapJoint.y / LEVEL` levels). Only the bottom lab gets sorters. Machines in a stack count as one footprint. Requires sim support: extend `MachineSim` for stacked labs (pass ingredients up, products down, per MX §4.4) and add `PlacedBuilding.z > 0` with `stackParentId?: number` to the Layout model (update `layout.ts`, `build.ts`: stacked building records set z and link nothing; and the validator's BUILDING_OVERLAP multiLevel exemption).
+- **lab-stack (MX §4.4, §8):** matrix stages using labs stack up to `effects.labLevel` high (`dz = lapJoint.y / LEVEL` levels). Only the bottom lab gets sorters. Machines in a stack count as one footprint. Requires sim support: extend `MachineSim` for stacked labs (pass ingredients up, products down, per MX §4.4) and add `PlacedBuilding.z > 0` with `stackParentId?: number` to the Layout model (update `geometry/model.ts`, `build.ts`: stacked building records set z and link nothing; and the validator's BUILDING_OVERLAP multiLevel exemption).
 - [ ] **Step 1:** Per motif:
   - write a test that the proposals for a fixture plan are geometrically valid (`checkGeometry` clean on a mini layout) and that a layout using them passes `validateLayout`;
   - implement it.
@@ -1347,11 +1409,13 @@ export const VERIFIED_MOTIFS: Set<MotifInstance['kind']>;   // spec §6.4: enabl
 ### Task 28: Spray coaters and the proliferator network
 
 **Files:**
-- Modify: `netlist.ts` (a proliferator net: source station port, sink deadEnd, taps = coater top inputs), `taps.ts`, `router.ts` (allow routing the proliferator net to coater top ports at z = 1), `assemble.ts` (place coaters on item belts: on each input net's belt, a straight run of ≥ 3 ground nodes before the first consumer tap; coater yaw along the belt), `geometry-checks.ts` (coater must sit on a straight ground belt run; its proliferator input must be fed), `validate/sim/run.ts` (wire CoaterSim)
-- Modify: `layout.ts` (add `coaters: { id: number; beltId: number; node: number; prolifBeltId: number }[]` to `Layout`; default `[]`), `build.ts` (coater records: itemId 2313, at the belt node position, yaw along the belt; the proliferator belt's last node `outputObjIdx` = coater index)
+**Pattern (from the capsule sample, plan review):** the proliferator line is a single elevated (z = 1) dead-end belt whose path passes through each coater's **top-passage point** (prefab addon centre `[0, 1.333, −1.25]` m, i.e. one level up, offset along the coater's axis). Nothing links to the coater: coater records have `outputObjIdx = inputObjIdx = -1` and slot fields `14,15,15,14,0,0`, and no belt has `outputObjIdx` pointing at a coater.
+
+- Modify: `netlist.ts` (a proliferator net: source station port, sink deadEnd, waypoints = coater top-passage points at z = 1), `router.ts` (route the proliferator net to pass through each coater top point at z = 1 along the coater's axis, using vertical lifts from the station port), `assemble.ts` (place coaters on item belts: on each input net's belt, a straight run of ≥ 3 ground nodes before the first consumer tap; coater yaw along the belt; do this before routing the proliferator net), `geometry-checks.ts` (coater must sit on a straight ground belt run; some proliferator belt node must be at its top point), `validate/sim/run.ts` (wire CoaterSim: the coater draws proliferator from the cargo passing its top point)
+- Modify: `geometry/model.ts` (add optional `coaters?: { id: number; beltId: number; node: number; yaw: Yaw }[]` to `Layout`), `build.ts` (coater records: itemId 2313, model from data, at the belt node position, yaw along the belt, links -1, slots `14,15,15,14,0,0`)
 - Test: `app/test/proliferator-e2e.test.ts`, plus new geometry-check cases
 
-**Interfaces:** as described in the Modify bullets. `Layout.coaters` is optional in the type (`coaters?: ...`) so earlier layouts stay valid.
+**Interfaces:** as described in the Modify bullets. `Layout.coaters` is optional so earlier layouts stay valid. The power-coverage rule (Task 15 rule 14) and `placePowerNodes` must include coaters as consumers.
 - [ ] **Step 1:** Geometry tests: a coater on a straight belt passes; a coater on a corner fails (new code `COATER_PLACEMENT`); a coater without a proliferator feed fails (`COATER_UNFED`). Add both codes to `ViolationCode`.
 - [ ] **Step 2:** E2E: Processor with Mk.III proliferator extra mode, budget 60 s:
   - the layout passes;
@@ -1370,6 +1434,23 @@ export const VERIFIED_MOTIFS: Set<MotifInstance['kind']>;   // spec §6.4: enabl
   - Plasma Refining for refined oil with hydrogen as a by-product: hydrogen is exported to a station input port, and there are no SIM_STALLED violations (Review Focus #3 and #4).
 - [ ] **Step 2:** Implement. Run the tests until they pass. Commit `feat(layout): multi-station blocks and by-product export`.
 
+### Task 31: Blueprint importer and in-game regression runner
+
+(Execute **before** Task 30; numbered 31 only to keep earlier numbering stable.)
+
+**Files:**
+- Create: `app/src/lib/blueprint/import.ts`, `app/test/regression.test.ts`, `app/test/fixtures/regression/README.md`
+- Test: `app/src/lib/blueprint/import.test.ts`
+
+**Interfaces:**
+- Produces:
+  - `blueprintToLayout(bp: Blueprint, data: GameDataIndex): { layout: Layout; warnings: string[] }`: the inverse of `layoutToBlueprint` for the entity kinds the planner uses (stations, production buildings, labs, belts, sorters, power nodes, coaters). Belt records are chained via `outputObjIdx` into `BeltPath`s (port-stub records are folded back into `source`/`sink`); sorter endpoints come from `inputObjIdx`/`outputObjIdx` and slot fields; fractional positions are kept. Unknown building kinds are skipped with a warning.
+  - `regressionPlanFor(layout, data, effects)`: builds a minimal `ProductionPlan` from the layout (stages from recipe ids and machine counts; target = the station's supply slot item) so `runSimulation` can run on an imported blueprint.
+  - `app/test/regression.test.ts`: for each `app/test/fixtures/regression/*.json` (`{ blueprint, gameVersion, targetItemId, measuredRates: Record<itemId, perSecond>, notes }`), decode, import, simulate (default ticks) and assert every measured rate is matched within **2 %** (spec §11). With no fixtures the test passes with a logged "no regression fixtures yet".
+- [ ] **Step 1:** `import.test.ts`: `blueprintToLayout(decodeBlueprint(layoutToBlueprintString(L)))` reproduces `L` (buildings, belt node lists, sorter endpoints) for the Task 9 test layouts and for one solver output (Task 24 plan (a)).
+- [ ] **Step 2:** Implement `import.ts` and `regression.test.ts`; README documents how to add a fixture from an in-game measurement.
+- [ ] **Step 3:** Commit `feat(blueprint): blueprint importer and regression runner`.
+
 ### Task 30: User test runbook and final integration check
 
 **Files:**
@@ -1386,9 +1467,10 @@ export const VERIFIED_MOTIFS: Set<MotifInstance['kind']>;   // spec §6.4: enabl
      - (b) generate and paste a 1 Circuit Board/s block;
      - (c) generate and paste the Processor block;
      - (d) for each, note whether paste succeeds, whether everything connects, and the measured output (the station's input count over 60 s).
-  6. How to record a regression entry: `app/test/fixtures/regression/<name>.json`, holding `{ blueprint, gameVersion, measuredRates: {itemId: perSecond}, notes }`.
+  6. How to record a regression entry: `app/test/fixtures/regression/<name>.json`, holding `{ blueprint, gameVersion, targetItemId, measuredRates: {itemId: perSecond}, notes }` (consumed by `app/test/regression.test.ts`, Task 31).
   7. Known approximations to watch for, per BF §10 and MX §10, especially the yaw/axis convention and sorter slot positions.
   - Re-run `dsp-extract --check` after game patches.
+- [ ] **Step 1b:** Add `app/test/mirrors.test.ts`: grep every `// mirrors: X` (and `mirrors: 'X'` violation fields) under `app/src`, and assert each `X` is a key in `tools/extract/src/dsp_extract/mirrored_methods.py` (parse the Python dict keys with a regex). Fix any omissions in `mirrored_methods.py`.
 - [ ] **Step 2:** Final verification:
   - `cd app && npm run lint && npm run check && npm test && npm run build`;
   - `tools/extract/.venv/bin/pytest tools/extract`;
