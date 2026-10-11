@@ -1,4 +1,6 @@
 export { ByteReader, ByteWriter } from './binary';
+export { layoutToBlueprint, layoutToBlueprintString } from './build';
+export type { BuildOptions } from './build';
 export { decodeBlueprint, decodeBody, encodeBlueprint, encodeBody } from './codec';
 export type { DecodeOptions } from './codec';
 export { escapeDataString, unescapeDataString } from './escape';

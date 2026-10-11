@@ -9,7 +9,8 @@
     "test": "vitest run",
     "lint": "eslint .",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "schema": "tsx scripts/export-schema.ts"
+    "schema": "tsx scripts/export-schema.ts",
+    "emit:test-bp": "tsx scripts/emit-test-blueprint.ts"
   },
   "dependencies": {
     "glpk.js": "^5.0.0",

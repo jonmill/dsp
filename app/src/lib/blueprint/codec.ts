@@ -437,6 +437,14 @@ export function encodeBody(body: BlueprintBody): Uint8Array {
   if (body.areas.length > MAX_AREAS) {
     throw new BlueprintError('BODY', `area count ${body.areas.length} exceeds ${MAX_AREAS}`);
   }
+  // primaryAreaIdx must name a real area (BF §3.1: the game needs it >= 0), and so must every
+  // building's areaIndex below; the game rejects or drops what does not.
+  if (!(body.primaryAreaIdx >= 0 && body.primaryAreaIdx < body.areas.length)) {
+    throw new BlueprintError(
+      'BODY',
+      `primaryAreaIdx ${body.primaryAreaIdx} is outside the ${body.areas.length} area(s)`,
+    );
+  }
   w.u8(body.areas.length);
   for (const a of body.areas) writeArea(w, a);
 
@@ -456,6 +464,12 @@ export function encodeBody(body: BlueprintBody): Uint8Array {
       if (link < -1 || link >= count) {
         throw new BlueprintError('BODY', `building ${position}: ${field} ${link} is out of range`);
       }
+    }
+    if (!(b.areaIndex >= 0 && b.areaIndex < body.areas.length)) {
+      throw new BlueprintError(
+        'BODY',
+        `building ${position}: areaIndex ${b.areaIndex} is outside the ${body.areas.length} area(s)`,
+      );
     }
     try {
       writeBuilding(w, b);

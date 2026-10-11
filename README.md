@@ -16,6 +16,7 @@ App (`app/`):
 cd app && npm install && npm test && npm run lint && npm run build
 npm run dev     # dev server
 npm run check   # svelte-check
+npm run emit:test-bp   # hand-made in-game test blueprint -> local/test-blueprints/m0-smelter-row.txt
 ```
 
 Extractor (`tools/extract/`, package `dsp_extract`):

@@ -4,7 +4,7 @@ import { describe, expect, test } from 'vitest';
 import { decodeBlueprint, decodeBody, encodeBlueprint, encodeBody } from './codec';
 import { escapeDataString, unescapeDataString } from './escape';
 import { md5f } from './md5f';
-import type { Blueprint, BlueprintBody, BlueprintBuilding, BuildingMarker } from './model';
+import type { Blueprint, BlueprintArea, BlueprintBody, BlueprintBuilding, BuildingMarker } from './model';
 import { BlueprintError } from './model';
 
 const sample = (name: string) =>
@@ -70,6 +70,13 @@ describe('byte-exact round trip of the hash-valid samples', () => {
   test.each(HASH_VALID)('%s: encode(decode(s)) === s', (name) => {
     const s = sample(name);
     expect(encodeBlueprint(decodeBlueprint(s))).toBe(s);
+  });
+
+  test.each(HASH_VALID)('%s: re-encodes identically with header.rawCells = []', (name) => {
+    const s = sample(name);
+    const bp = decodeBlueprint(s);
+    bp.header.rawCells = [];
+    expect(encodeBlueprint(bp)).toBe(s);
   });
 
   test('characters after the 32-char hash are ignored (the game compares only those 32)', () => {
@@ -519,6 +526,7 @@ function building(over: Partial<BlueprintBuilding> = {}): BlueprintBuilding {
   };
 }
 
+/** A one-area body (encodeBody requires primaryAreaIdx and every areaIndex to name a real area). */
 function bodyOf(buildings: BlueprintBuilding[], over: Partial<BlueprintBody> = {}): BlueprintBody {
   return {
     version: 1,
@@ -528,17 +536,30 @@ function bodyOf(buildings: BlueprintBuilding[], over: Partial<BlueprintBody> = {
     dragBoxSizeX: 5,
     dragBoxSizeY: 6,
     primaryAreaIdx: 0,
-    areas: [],
+    areas: [areaAt(0)],
     buildings,
     ...over,
+  };
+}
+
+function areaAt(index: number): BlueprintArea {
+  return {
+    index,
+    parentIndex: -1,
+    tropicAnchor: 0,
+    areaSegments: 200,
+    anchorLocalOffsetX: 0,
+    anchorLocalOffsetY: 0,
+    width: 4,
+    height: 4,
   };
 }
 
 describe('encodeBody / decodeBody', () => {
   const f = Math.fround;
 
-  /** Prefix size with no areas: version + 6 int32 + areaCount + buildingCount. */
-  const PREFIX = 4 + 24 + 1 + 4;
+  /** Prefix size of bodyOf's one area: version + 6 int32 + areaCount + one 14-byte area + buildingCount. */
+  const PREFIX = 4 + 24 + 1 + 14 + 4;
 
   test('legacy record is 61 bytes + 4 per param; tilt/pitch are not stored', () => {
     const b = building({
@@ -707,13 +728,13 @@ describe('encodeBody / decodeBody', () => {
     };
     const body = bodyOf([], { areas: [area, { ...area, index: 2, parentIndex: 1 }] });
     expect(decodeBody(encodeBody(body)).areas).toEqual(body.areas);
-    expect(encodeBody(body).length).toBe(PREFIX + 28);
+    expect(encodeBody(body).length).toBe(PREFIX + 14);
   });
 
   test('linked buildings keep their link and slot fields', () => {
     const a = building({ index: 0, outputObjIdx: 1, outputToSlot: 3, inputFromSlot: -1, outputFromSlot: 14, inputToSlot: 15, outputOffset: -2, inputOffset: 127 });
     const b = building({ index: 1, inputObjIdx: 0, recipeId: 142, filterId: 1607, modelIndex: -5, areaIndex: 2 });
-    const back = decodeBody(encodeBody(bodyOf([a, b]))).buildings;
+    const back = decodeBody(encodeBody(bodyOf([a, b], { areas: [areaAt(0), areaAt(1), areaAt(2)] }))).buildings;
     expect(back).toEqual([a, b]);
   });
 
@@ -733,6 +754,35 @@ describe('encodeBody / decodeBody', () => {
     expect(codeOf(() => encodeBody(bodyOf([building({ outputObjIdx: 1 })])))).toBe('BODY');
     expect(codeOf(() => encodeBody(bodyOf([building({ marker: -103 as BuildingMarker })])))).toBe('BODY');
     expect(codeOf(() => encodeBody(bodyOf([], { areas: Array.from({ length: 65 }, (_, index) => ({ index, parentIndex: -1, tropicAnchor: 0, areaSegments: 200, anchorLocalOffsetX: 0, anchorLocalOffsetY: 0, width: 1, height: 1 })) })))).toBe('BODY');
+  });
+});
+
+describe('encodeBody area references', () => {
+  const area = areaAt;
+
+  test('primaryAreaIdx must name an existing area', () => {
+    expect(() => encodeBody(bodyOf([], { areas: [area(0)], primaryAreaIdx: 0 }))).not.toThrow();
+    expect(() => encodeBody(bodyOf([], { areas: [area(0), area(1)], primaryAreaIdx: 1 }))).not.toThrow();
+    for (const [areas, primaryAreaIdx] of [
+      [[], 0],
+      [[area(0)], -1],
+      [[area(0)], 1],
+      [[area(0), area(1)], 2],
+    ] as const) {
+      expectFailure(
+        () => encodeBody(bodyOf([], { areas: [...areas], primaryAreaIdx })),
+        'BODY',
+        /primaryAreaIdx .* outside/,
+      );
+    }
+  });
+
+  test('a building areaIndex must name an existing area', () => {
+    const two = [area(0), area(1)];
+    expect(() => encodeBody(bodyOf([building({ areaIndex: 1 })], { areas: two }))).not.toThrow();
+    expectFailure(() => encodeBody(bodyOf([building({ areaIndex: 2 })], { areas: two })), 'BODY', /building 0: areaIndex 2 .* outside/);
+    expectFailure(() => encodeBody(bodyOf([building({ areaIndex: -1 })], { areas: two })), 'BODY', /areaIndex -1 .* outside/);
+    expectFailure(() => encodeBody(bodyOf([building({ areaIndex: 0 })], { areas: [], primaryAreaIdx: 0 })), 'BODY', /outside/);
   });
 });
 

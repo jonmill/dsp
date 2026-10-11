@@ -132,18 +132,6 @@ export class GameDataIndex {
   }
 }
 
-// Eager: false keeps the data out of the main bundle until requested, and an empty match (no
-// extraction output / fixture committed yet) is just an empty record rather than a build error.
-// Paths are relative to this file: app/src/lib/data/ -> repo-root data/.
-const extractedFiles = import.meta.glob<unknown>('../../../../data/dsp-*.json', {
-  eager: false,
-  import: 'default',
-});
-const fixtureFiles = import.meta.glob<unknown>('../../../../data/fixture/*.json', {
-  eager: false,
-  import: 'default',
-});
-
 async function parseAll(files: Record<string, () => Promise<unknown>>): Promise<GameData[]> {
   const parsed: GameData[] = [];
   // Sorted so ties on gameVersion resolve the same way on every machine.
@@ -166,6 +154,20 @@ function newest(all: GameData[]): GameData {
  * validation throws rather than being skipped, so a stale extraction is never silently ignored.
  */
 export async function loadDefaultGameData(): Promise<GameData> {
+  // Vite expands `import.meta.glob` where it is written. It sits inside the function, not at module
+  // scope, so scripts run by tsx (no Vite) can still import GameDataIndex and parseGameData from here.
+  // Eager: false keeps the data out of the main bundle until requested, and an empty match (no
+  // extraction output / fixture committed yet) is just an empty record rather than a build error.
+  // Paths are relative to this file: app/src/lib/data/ -> repo-root data/.
+  const extractedFiles = import.meta.glob<unknown>('../../../../data/dsp-*.json', {
+    eager: false,
+    import: 'default',
+  });
+  const fixtureFiles = import.meta.glob<unknown>('../../../../data/fixture/*.json', {
+    eager: false,
+    import: 'default',
+  });
+
   const extracted = await parseAll(extractedFiles);
   if (extracted.length > 0) return newest(extracted);
 
