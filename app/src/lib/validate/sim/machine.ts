@@ -309,18 +309,10 @@ export class MachineSim implements InsertTarget, PickSource {
     for (let i = 0; i < n; i++) if (this.servedCount[i] < this.inCounts[i]) return false;
     let level = n === 0 ? 0 : MAX_INC_LEVEL;
     for (let i = 0; i < n; i++) {
-      const count = this.servedCount[i];
-      const total = this.servedInc[i];
-      const take = this.inCounts[i];
-      // split_inc_level: see the header.
-      const avg = Math.floor(total / count);
-      const left = count - take;
-      const extra = total - avg * count - left;
-      const removed = extra > 0 ? avg * take + extra : avg * take;
-      this.servedCount[i] = left;
-      this.servedInc[i] = total - removed;
-      const lvl = extra > 0 ? avg + 1 : avg;
-      if (lvl < level) level = lvl;
+      const split = splitIncLevel(this.servedCount[i], this.servedInc[i], this.inCounts[i]);
+      this.servedCount[i] = split.left;
+      this.servedInc[i] = split.leftInc;
+      if (split.level < level) level = split.level;
     }
     level = Math.min(level, MAX_INC_LEVEL);
     const cfg = this.cfg;
@@ -336,6 +328,32 @@ export class MachineSim implements InsertTarget, PickSource {
     this.updateNeeds();
     return true;
   }
+}
+
+/** What is left of an ingredient buffer after a craft took its share, and the proliferator level of what it took. */
+export interface IncSplit {
+  /** The level of the taken items: the points per item the craft runs at, before the cap of 10. */
+  level: number;
+  /** Items left. */
+  left: number;
+  /** Proliferator points left with them. */
+  leftInc: number;
+}
+
+// mirrors: AssemblerComponent.InternalUpdate
+/**
+ * The game's `split_inc_level` step, which the decompile has inline at the start of a craft: take `take` of `count`
+ * served items that hold `total` points between them (see the header for the port's reading). `avg = floor(total /
+ * count)` points per item and `total - avg * count` items hold one more; of those, the ones beyond the `count - take`
+ * items that stay go to the taken ones. The level is `avg`, one more if any of those extra points is taken. Call it
+ * with `count >= take >= 1`.
+ */
+export function splitIncLevel(count: number, total: number, take: number): IncSplit {
+  const avg = Math.floor(total / count);
+  const left = count - take;
+  const extra = total - avg * count - left;
+  const removed = extra > 0 ? avg * take + extra : avg * take;
+  return { level: extra > 0 ? avg + 1 : avg, left, leftInc: total - removed };
 }
 
 /** The most of a product (count `count` per craft) the buffer may hold before a finished craft is held back. */

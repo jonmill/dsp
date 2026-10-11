@@ -1,7 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import { planProduction } from '../calc';
 import type { ProductionPlan } from '../calc';
+import { allTechs, computeTechEffects } from '../data';
 import * as validate from './index';
 import { checkSimulation, validateLayout } from './report';
+import { runSimulation } from './sim/run';
 import type { SimResult } from './sim/run';
 import {
   codesOf,
@@ -148,6 +151,7 @@ describe('checkSimulation thresholds', () => {
   const plan: ProductionPlan = {
     ...planOf([planStage(1, { craftsPerSecond: 2 })]),
     actualTargetRate: 2,
+    exports: [{ itemId: IRON_INGOT, perSecond: 2 }],
   };
   const layout = new LayoutKit().layout();
 
@@ -171,12 +175,58 @@ describe('checkSimulation thresholds', () => {
     expect(check(simOf())).toEqual([]);
   });
 
-  it('SIM_OUTPUT_LOW below 99 % of the plan rate, with one item of slack', () => {
-    expect(codesOf(check(simOf({ measuredTargetRate: 1.96 })))).toEqual(['SIM_OUTPUT_LOW']);
+  it('SIM_OUTPUT_LOW below 99 % of the provisioned rate', () => {
+    expect(codesOf(check(simOf({ measuredTargetRate: 1.97 })))).toEqual(['SIM_OUTPUT_LOW']);
     expect(check(simOf({ measuredTargetRate: 1.99 }))).toEqual([]);
-    // 99 % of 2/s is 1.98; one item over 100 s is 0.01/s of slack, so the line is at 1.97.
-    expect(check(simOf({ measuredTargetRate: 1.975 }))).toEqual([]);
-    expect(codesOf(check(simOf({ measuredTargetRate: 1.965 })))).toEqual(['SIM_OUTPUT_LOW']);
+    expect(check(simOf({ measuredTargetRate: 1.98 }))).toEqual([]); // exactly 99 %
+  });
+
+  describe('the tolerance', () => {
+    const at = (rate: number, seconds: number, measured: number) =>
+      checkSimulation(
+        simOf({ measuredTargetRate: measured, measureSeconds: seconds }),
+        layout,
+        { ...plan, actualTargetRate: rate, exports: [{ itemId: IRON_INGOT, perSecond: rate }] },
+        fixtureData,
+      );
+
+    it('is 1 % of the rate when the window holds many items', () => {
+      expect(at(10, 100, 9.89)).toHaveLength(1);
+      expect(at(10, 100, 9.91)).toEqual([]);
+    });
+
+    it('widens to one item per window at low rates and short windows', () => {
+      // 0.5/s over 120 s: 1 % is 0.005/s, one item is 0.0083/s.
+      expect(at(0.5, 120, 0.4925)).toEqual([]);
+      expect(at(0.5, 120, 0.49)).toHaveLength(1);
+    });
+
+    it('never widens beyond 2 % of the rate', () => {
+      // 0.1/s over 100 s: one item is 0.01/s (10 %), capped at 0.002/s.
+      expect(at(0.1, 100, 0.0981)).toEqual([]);
+      expect(at(0.1, 100, 0.0979)).toHaveLength(1);
+      expect(at(0.1, 100, 0.09)).toHaveLength(1);
+    });
+  });
+
+  describe('the rate it is judged against', () => {
+    it('is the plan\'s export of the target, not the final stage\'s capacity', () => {
+      const chain: ProductionPlan = { ...plan, actualTargetRate: 3, exports: [{ itemId: IRON_INGOT, perSecond: 2 }] };
+      expect(checkSimulation(simOf({ measuredTargetRate: 2 }), layout, chain, fixtureData)).toEqual([]);
+      expect(codesOf(checkSimulation(simOf({ measuredTargetRate: 1.5 }), layout, chain, fixtureData))).toEqual(['SIM_OUTPUT_LOW']);
+    });
+
+    it('falls back to the requested rate when the plan lists no export of the target', () => {
+      const noExport: ProductionPlan = { ...plan, exports: [], request: { ...plan.request, quantity: { kind: 'rate', perSecond: 4 } } };
+      expect(codesOf(checkSimulation(simOf({ measuredTargetRate: 2 }), layout, noExport, fixtureData))).toEqual(['SIM_OUTPUT_LOW']);
+      expect(checkSimulation(simOf({ measuredTargetRate: 4 }), layout, noExport, fixtureData)).toEqual([]);
+    });
+
+    it('falls back to the capacity when the request is in buildings and there is no export', () => {
+      const byBuildings: ProductionPlan = { ...plan, exports: [], request: { ...plan.request, quantity: { kind: 'buildings', count: 2 } } };
+      expect(codesOf(checkSimulation(simOf({ measuredTargetRate: 1 }), layout, byBuildings, fixtureData))).toEqual(['SIM_OUTPUT_LOW']);
+      expect(checkSimulation(simOf({ measuredTargetRate: 2 }), layout, byBuildings, fixtureData)).toEqual([]);
+    });
   });
 
   it('SIM_OUTPUT_LOW says what was measured and carries the wiring warnings', () => {
@@ -230,6 +280,19 @@ describe('checkSimulation thresholds', () => {
     expect(check(simOf({ stageStats: [{ stageIndex: 0, crafts: 181, plannedCrafts: 200 }] }))).toEqual([]);
   });
 
+  it('carries the wiring warnings on SIM_STALLED and SIM_DEADLOCK too', () => {
+    const warning = 'belt 1: station 3 port 0 is not an output port (dir 0); the belt stays empty';
+    const sim = simOf({
+      deadlocked: true,
+      warnings: [warning],
+      stageStats: [{ stageIndex: 0, crafts: 0, plannedCrafts: 200 }],
+    });
+    for (const code of ['SIM_STALLED', 'SIM_DEADLOCK'] as const) {
+      expect(only(check(sim), code)[0].message).toContain(warning);
+    }
+    expect(only(check(simOf({ stageStats: [{ stageIndex: 0, crafts: 0, plannedCrafts: 200 }] })), 'SIM_STALLED')[0].message).not.toContain('Wiring');
+  });
+
   it('judges a stage as a whole: one idle machine does not stall a stage that makes its crafts', () => {
     const sim = simOf({
       machineStats: [
@@ -250,6 +313,69 @@ describe('checkSimulation thresholds', () => {
 
   it('skips a stage that plans no crafts', () => {
     expect(check(simOf({ stageStats: [{ stageIndex: 0, crafts: 0, plannedCrafts: 0 }] }))).toEqual([]);
+  });
+});
+
+describe('a real plan whose final stage has spare capacity', () => {
+  it('is not rejected when the chain delivers what was asked: Gear 1/s on Mk.I assemblers has capacity 1.5/s', async () => {
+    const everything = allTechs(fixtureData.data);
+    const result = await planProduction(
+      {
+        targetItemId: GEAR,
+        quantity: { kind: 'rate', perSecond: 1 },
+        finalFacilityItemId: ITEM.assembler,
+        unlockedTechs: everything,
+        suppliedItemIds: new Set([1001]),
+        facilityOverrides: { 5: ITEM.assembler, 1: ITEM.smelter },
+        recipeOverrides: {},
+        proliferator: { tier: 0, mode: 'extra' },
+        stationKind: 'planetary',
+      },
+      fixtureData,
+      computeTechEffects(fixtureData.data, everything),
+    );
+    if (!result.ok) throw new Error(result.error.message);
+    const plan = result.plan;
+    // Two Mk.I assemblers (0.75x) can make 1.5 gears/s, but one Arc Smelter feeds them 1 ingot/s.
+    expect(plan.actualTargetRate).toBe(1.5);
+    expect(plan.exports[0]).toEqual({ itemId: GEAR, perSecond: 1 });
+    const gearStage = plan.stages.findIndex((st) => st.recipeId === 5);
+    const smeltStage = plan.stages.findIndex((st) => st.recipeId === 1);
+    expect(plan.stages[gearStage].machines).toBe(2);
+    expect(plan.stages[smeltStage].machines).toBe(1);
+
+    // Ore ILS -> smelter -> ingot belt -> 2 assemblers -> gear belt -> ILS, geometry-agnostic.
+    const kit = new LayoutKit();
+    const source = kit.station(0, 0);
+    const sink = kit.station(80, 0);
+    sink.station!.slots[0].itemId = GEAR;
+    sink.station!.ports[1] = { dir: 2, storageIdx: 0 };
+    const ore = kit.belt(1, 1001, line([0, 5], [30, 5]), { source: { buildingId: source.id, port: 0 } });
+    const ingots = kit.belt(1, IRON_INGOT, line([0, 9], [30, 9]));
+    const gears = kit.belt(1, GEAR, line([0, 13], [30, 13]), { sink: { kind: 'port', buildingId: sink.id, port: 1 } });
+    const smelter = kit.smelter(10, 7, 0, 1);
+    smelter.role = `stage:${smeltStage}`;
+    kit.sorter(onNode(ore, 10), onSlot(smelter, 0), 1, { filterItemId: 1001 });
+    kit.sorter(onSlot(smelter, 1), onNode(ingots, 10), 1, { filterItemId: IRON_INGOT });
+    for (const node of [16, 20]) {
+      const asm = kit.assembler(node, 11, 0, 5);
+      asm.role = `stage:${gearStage}`;
+      kit.sorter(onNode(ingots, node), onSlot(asm, 0), 1, { filterItemId: IRON_INGOT });
+      kit.sorter(onSlot(asm, 1), onNode(gears, node), 1, { filterItemId: GEAR });
+    }
+    const layout = kit.layout();
+    const sim = runSimulation(layout, plan, fixtureData, computeTechEffects(fixtureData.data, everything), {
+      warmupTicks: 3600,
+      measureTicks: 7200,
+    });
+    expect(sim.warnings).toEqual([]);
+    expect(Math.abs(sim.measuredTargetRate - 1)).toBeLessThan(0.02);
+    expect(sim.measuredTargetRate).toBeLessThan(0.99 * plan.actualTargetRate); // the old comparison would have failed it
+    expect(checkSimulation(sim, layout, plan, fixtureData)).toEqual([]);
+
+    // And a layout that really delivers less than the 1/s asked for still fails.
+    const starved = { ...sim, measuredTargetRate: 0.9 };
+    expect(codesOf(checkSimulation(starved, layout, plan, fixtureData))).toEqual(['SIM_OUTPUT_LOW']);
   });
 });
 

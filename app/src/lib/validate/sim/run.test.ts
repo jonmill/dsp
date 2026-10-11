@@ -226,6 +226,22 @@ describe('runSimulation: wiring problems', () => {
     expect(sim.machineStats.map((m) => m.buildingId)).toEqual([row.smelters[0].id]);
   });
 
+  it('warns about a building whose recipe GameData does not have, instead of failing or ignoring it silently', () => {
+    const row = smelterRowLayout(1);
+    const odd = row.kit.building(ITEM.smelter, 30, 20, 0, { recipeId: 99999 });
+    const sim = simulate(row, FAST);
+    expect(sim.warnings.join('\n')).toMatch(new RegExp(`building ${odd.id}.*recipe 99999.*does not have`));
+    expect(sim.machineStats.map((m) => m.buildingId)).toEqual([row.smelters[0].id]);
+    expect(sim.measuredTargetRate).toBeGreaterThan(0.9);
+  });
+
+  it('warns about a building whose item is not a building in GameData', () => {
+    const row = smelterRowLayout(1);
+    const odd = row.kit.building(99999, 30, 20, 0, { recipeId: 1 });
+    const sim = simulate(row, FAST);
+    expect(sim.warnings.join('\n')).toMatch(new RegExp(`building ${odd.id}.*item 99999.*not a building`));
+  });
+
   it('throws for a sorter that names a building or belt the layout does not have', () => {
     const row = smelterRowLayout(1);
     row.kit.sorter(onNode(row.ore, 3), { kind: 'building', buildingId: 999, slot: 0 });

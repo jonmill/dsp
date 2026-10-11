@@ -17,7 +17,7 @@
 //    fit the free space ("squeeze"); it never moves other cargo.
 //  - Merges insert the same way. The game shifts the merge index when two paths' update parity differs; paths
 //    here update in a fixed order, so that shift is not modelled.
-import { CARGO_LENGTH as GAME_CARGO_LENGTH, packCargo, packedItem, unpackCargo } from './cargo';
+import { CARGO_LENGTH as GAME_CARGO_LENGTH, packCargo, packedInc, packedItem, packedStack, unpackCargo } from './cargo';
 import type { Cargo } from './cargo';
 
 // A local copy: reading an imported binding in the per-tick loop costs a property lookup in some module systems.
@@ -144,15 +144,15 @@ export class BeltSim {
 
   /**
    * Copy the cargo whose 10 cells cover `cellIndex` into `out`; false if the cell is in a gap. Where a spray coater
-   * looks for the cargo passing it. Allocates nothing.
+   * looks for the cargo passing it. Allocates nothing (it reads the packed fields directly).
    */
   cargoAt(cellIndex: number, out: Cargo): boolean {
     const k = this.coveringAt(cellIndex);
     if (k < 0) return false;
-    const c = unpackCargo(this.packed[k]);
-    out.item = c.item;
-    out.stack = c.stack;
-    out.inc = c.inc;
+    const packed = this.packed[k];
+    out.item = packedItem(packed);
+    out.stack = packedStack(packed);
+    out.inc = packedInc(packed);
     return true;
   }
 

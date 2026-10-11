@@ -10,7 +10,7 @@
 // (`World`). Station charging is not part of that loop: it is reported as a constant at peak (blocks start with empty
 // stations), and `steadyW` leaves it out.
 import type { ProductionPlan, ItemRate } from '../../calc';
-import type { Building, GameDataIndex, TechEffects } from '../../data';
+import type { Building, GameDataIndex, Recipe, TechEffects } from '../../data';
 import type { Endpoint, Layout, PlacedBuilding, Sorter } from '../../geometry';
 import { CoaterSim, coaterConfig } from './coater';
 import { MachineSim, machineConfig } from './machine';
@@ -98,6 +98,14 @@ const itemName = (data: GameDataIndex, itemId: number): string => {
     return data.item(itemId).name;
   } catch {
     return `item ${itemId}`;
+  }
+};
+
+const recipeOrNull = (data: GameDataIndex, recipeId: number): Recipe | null => {
+  try {
+    return data.recipe(recipeId);
+  } catch {
+    return null;
   }
 };
 
@@ -264,17 +272,24 @@ function addMachines(
   const list: MachineEntry[] = [];
   const byBuilding = new Map<number, MachineSim>();
   for (const b of layout.buildings) {
-    const def = data.building(b.itemId);
     if (b.recipeId === undefined) continue;
-    if (def?.kind !== 'production' && def?.kind !== 'lab') {
-      if (def) {
-        warnings.push(
-          `building ${b.id} (${def.name}) has recipe ${b.recipeId} but the simulator has no model for a ${def.kind}; its stage will read as stalled`,
-        );
-      }
+    const def = data.building(b.itemId);
+    if (!def) {
+      warnings.push(`building ${b.id} has recipe ${b.recipeId} but item ${b.itemId} is not a building in GameData; it is not simulated`);
       continue;
     }
-    const machine = new MachineSim(machineConfig(def, data.recipe(b.recipeId), data, b.prolifMode ?? defaultMode));
+    if (def.kind !== 'production' && def.kind !== 'lab') {
+      warnings.push(
+        `building ${b.id} (${def.name}) has recipe ${b.recipeId} but the simulator has no model for a ${def.kind}; its stage will read as stalled`,
+      );
+      continue;
+    }
+    const recipe = recipeOrNull(data, b.recipeId);
+    if (!recipe) {
+      warnings.push(`building ${b.id} (${def.name}) has recipe ${b.recipeId}, which GameData does not have; it is not simulated`);
+      continue;
+    }
+    const machine = new MachineSim(machineConfig(def, recipe, data, b.prolifMode ?? defaultMode));
     const tag = b.role === undefined ? null : STAGE_ROLE.exec(b.role);
     const byRole = tag ? Number(tag[1]) : undefined;
     const stageIndex = byRole !== undefined && plan.stages[byRole] ? byRole : (firstStageOfRecipe.get(b.recipeId) ?? null);

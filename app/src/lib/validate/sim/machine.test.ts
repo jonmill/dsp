@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { fixtureData, ITEM } from '../testkit';
-import { MachineSim, machineConfig } from './machine';
+import { MachineSim, machineConfig, splitIncLevel } from './machine';
 import type { MachineConfig } from './machine';
 
 const ORE = 1001;
@@ -281,6 +281,52 @@ describe('MachineSim proliferator', () => {
     // 2 items with 4 points between them: level 2, so the speed override is 1 + accTable[2] / 1000 = 1.5x.
     m.tick(1);
     expect(m.speedOverride).toBe(15000);
+  });
+});
+
+describe('splitIncLevel (the game\'s split_inc_level)', () => {
+  it.each([
+    // [items, points, taken] -> level, items left, points left
+    [4, 16, 1, 4, 3, 12], // every item holds 4: the level is 4
+    [5, 0, 2, 0, 3, 0], // nothing sprayed
+    [4, 10, 1, 2, 3, 8], // 2 points each and 2 items hold one more: the taken item is a plain 2
+    [3, 2, 2, 1, 1, 1], // 2 items hold 1, 1 holds 0: taking 2 of 3 must include a 1-item, so level 1, 1 point stays
+    [3, 2, 1, 0, 2, 2], // taking 1 of 3 can be the unsprayed one
+    [2, 5, 2, 3, 0, 0], // taking everything takes every point
+    [3, 3, 3, 1, 0, 0],
+    [1, 4, 1, 4, 0, 0],
+  ])('%i items with %i points, taking %i: level %i, %i items and %i points stay', (count, total, take, level, left, leftInc) => {
+    expect(splitIncLevel(count, total, take)).toEqual({ level, left, leftInc });
+  });
+
+  it('conserves items and points, and the level is the floor or ceiling of the average', () => {
+    for (let count = 1; count <= 9; count++) {
+      for (let total = 0; total <= 45; total++) {
+        for (let take = 1; take <= count; take++) {
+          const { level, left, leftInc } = splitIncLevel(count, total, take);
+          expect(left).toBe(count - take);
+          expect(leftInc).toBeGreaterThanOrEqual(0);
+          expect(leftInc).toBeLessThanOrEqual(total);
+          const avg = Math.floor(total / count);
+          expect(level === avg || level === avg + 1).toBe(true);
+          // What stays cannot hold more than 1 point above its share, nor the taken items less than they were given.
+          expect(leftInc).toBeLessThanOrEqual(avg * left + Math.min(left, total - avg * count));
+        }
+      }
+    }
+  });
+
+  it('feeds the machine: a craft on a stack with mixed points runs at the rounded level and leaves the rest', () => {
+    const m = machineOf(ASM_MK2, RECIPE.coil, 1); // 2 magnets + 1 copper per craft, speed-up mode
+    serve(m, MAGNET, 1, 4);
+    serve(m, MAGNET, 1, 0);
+    serve(m, MAGNET, 1, 4); // 3 magnets with 8 points: 2 each and 2 items hold one more
+    serve(m, COPPER, 1, 4); // level 4
+    m.tick(1);
+    // Magnets: taking 2 of 3 with 8 points -> level 3 (the extra points reach the taken ones); copper level 4; min 3.
+    expect(splitIncLevel(3, 8, 2).level).toBe(3);
+    expect(m.speedOverride).toBe(17500); // 1 + accTable[3] / 1000
+    expect(m.served(MAGNET)).toBe(1);
   });
 });
 

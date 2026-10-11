@@ -45,21 +45,46 @@ function itemName(data: GameDataIndex, itemId: number): string {
 }
 
 /**
+ * The target rate the plan provisions: its export of the target item, which is what the user asked for. Not
+ * `actualTargetRate`, which is the rounded-up capacity of the final stage and can exceed it when an upstream stage
+ * limits the chain (Gear at 1/s on two Mk.I assemblers has capacity 1.5/s but one Arc Smelter feeds only 1/s).
+ * Falls back to the requested rate, or to the capacity when the request is in buildings and exports are missing.
+ */
+function provisionedRate(plan: ProductionPlan): number {
+  const exported = plan.exports.find((e) => e.itemId === plan.request.targetItemId)?.perSecond;
+  if (exported !== undefined) return exported;
+  return plan.request.quantity.kind === 'rate' ? plan.request.quantity.perSecond : plan.actualTargetRate;
+}
+
+/**
+ * How far below `rate` a measured rate may fall without being flagged: 1 % of the rate, widened to one item per
+ * window (the edges of the window can cost an item) but never beyond 2 % of the rate.
+ */
+function outputTolerance(rate: number, measureSeconds: number): number {
+  return Math.max((1 - OUTPUT_FACTOR) * rate, Math.min(1 / measureSeconds, 2 * (1 - OUTPUT_FACTOR) * rate));
+}
+
+/** Relative slack for float noise when comparing a measured rate with its threshold. */
+const REL_EPS = 1e-9;
+
+/**
  * Turn a simulation result into violations:
- *  - SIM_OUTPUT_LOW if the target item reached the stations at less than 99 % of the plan rate (with one item of
- *    slack for the window's edges), naming the wiring warnings the simulator collected;
+ *  - SIM_OUTPUT_LOW if the target item reached the stations at less than 99 % of the provisioned target rate (the
+ *    plan's export of the target; see `outputTolerance` for the slack at short windows), naming the wiring warnings
+ *    the simulator collected. Judged only when the plan expects output (`actualTargetRate > 0`);
  *  - SIM_DEADLOCK if the simulator saw no progress for 600 ticks while output was expected;
  *  - SIM_STALLED for every stage whose machines made fewer than 90 % of the planned crafts, listing its machines. A
  *    stage is judged as a whole, so a machine rounded up to be idle part of the time does not trip it, while an
  *    undrained by-product that blocks a refinery does.
+ * The wiring warnings are appended to every one of them: a mis-wired port is often the reason.
  */
 export function checkSimulation(sim: SimResult, layout: Layout, plan: ProductionPlan, data: GameDataIndex): Violation[] {
   const violations: Violation[] = [];
   const warnings = sim.warnings.length > 0 ? ` Wiring: ${sim.warnings.join('; ')}.` : '';
 
-  const wanted = plan.actualTargetRate;
-  const slack = 1 / sim.measureSeconds;
-  if (wanted > 0 && sim.measuredTargetRate < wanted * OUTPUT_FACTOR - slack) {
+  const wanted = provisionedRate(plan);
+  const floor = (wanted - outputTolerance(wanted, sim.measureSeconds)) * (1 - REL_EPS);
+  if (plan.actualTargetRate > 0 && wanted > 0 && sim.measuredTargetRate < floor) {
     const target = plan.request.targetItemId;
     const sinks: ViolationEntity[] = layout.buildings
       .filter((b) => b.station?.slots.some((s) => s.itemId === target) && b.station.ports.some((p) => p.dir === 2))
@@ -69,7 +94,7 @@ export function checkSimulation(sim: SimResult, layout: Layout, plan: Production
       entities: sinks,
       message:
         `${itemName(data, target)} reached the stations at ${rateText(sim.measuredTargetRate)} over ${sim.measureSeconds} s, ` +
-        `below ${pct(OUTPUT_FACTOR)} of the planned ${rateText(wanted)}.${warnings}`,
+        `below ${pct(OUTPUT_FACTOR)} of the provisioned ${rateText(wanted)}.${warnings}`,
     });
   }
 
@@ -100,7 +125,7 @@ export function checkSimulation(sim: SimResult, layout: Layout, plan: Production
       entities: machines.map((m) => ({ kind: 'building', id: m.buildingId })),
       message:
         `stage ${stat.stageIndex} (${recipe} on ${building}) made ${+stat.crafts.toFixed(1)} crafts in ${sim.measureSeconds} s, ` +
-        `below ${pct(STAGE_FACTOR)} of the ${+stat.plannedCrafts.toFixed(1)} planned: ${detail}`,
+        `below ${pct(STAGE_FACTOR)} of the ${+stat.plannedCrafts.toFixed(1)} planned: ${detail}.${warnings}`,
     });
   }
   return violations;
