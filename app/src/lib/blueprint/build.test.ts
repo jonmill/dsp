@@ -4,9 +4,11 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, test } from 'vitest';
 import { buildM0Blueprint, buildM0Layout, insideFootprint, slotCell, writeM0Blueprint } from '../../../scripts/emit-test-blueprint';
+import { assemblerSorters, loadBlueprintSample } from '../../../test/fixtures/blueprintSamples';
 import { GameDataIndex, parseGameData } from '../data';
-import type { BeltPath, Layout, PlacedBuilding, Sorter, StationConfig, StationPortConfig } from '../geometry/model';
-import { layoutToBlueprint, layoutToBlueprintString, prefabToGrid, sorterEnds, TILE } from './build';
+import { headingDeg, portInfos, prefabToGrid, slotInfos, sorterEnds, sorterTapPoint, TILE } from '../geometry';
+import type { BeltPath, Layout, PlacedBuilding, Sorter, StationConfig, StationPortConfig } from '../geometry';
+import { layoutToBlueprint, layoutToBlueprintString } from './build';
 import { decodeBlueprint, encodeBlueprint } from './codec';
 import type { BlueprintBuilding } from './model';
 
@@ -134,70 +136,6 @@ function richLayout(): Layout {
     ],
   });
 }
-
-describe('prefabToGrid', () => {
-  const at = (yaw: 0 | 90 | 180 | 270) => ({ x: 10, y: 20, z: 3, yaw });
-
-  test('rotates prefab metres clockwise from north and scales to tiles and levels', () => {
-    // +pz is forward = north at yaw 0, east at yaw 90, south at yaw 180, west at yaw 270.
-    const p: [number, number, number] = [0, 0, TILE];
-    expect(prefabToGrid(at(0), p)).toEqual({ x: 10, y: 21, z: 3 });
-    expect(prefabToGrid(at(90), p)).toEqual({ x: 11, y: 20, z: 3 });
-    expect(prefabToGrid(at(180), p)).toEqual({ x: 10, y: 19, z: 3 });
-    expect(prefabToGrid(at(270), p)).toEqual({ x: 9, y: 20, z: 3 });
-  });
-
-  test('+px is right: east at yaw 0, south at yaw 90; py is up in levels', () => {
-    const p: [number, number, number] = [TILE, 4 / 3, 0];
-    expect(prefabToGrid(at(0), p)).toEqual({ x: 11, y: 20, z: 4 });
-    expect(prefabToGrid(at(90), p)).toEqual({ x: 10, y: 19, z: 4 });
-  });
-});
-
-describe('sorterEnds', () => {
-  const assembler = { id: 1, itemId: 2303, x: 0, y: 0, z: 0, yaw: 0 as const };
-  const layout = layoutOf({
-    buildings: [assembler],
-    belts: [beltOf(1, [[2, 0], [2, 1], [2, 2]])],
-  });
-
-  test('belt end is the belt point at the slot lateral coordinate, not the tap node', () => {
-    // Slot 3 is the east face, north end: 1.11 m east, 1 m north of the centre.
-    const s = sorterOf({ pick: { kind: 'belt', beltId: 1, node: 1 }, drop: { kind: 'building', buildingId: 1, slot: 3 } });
-    const { pick, drop } = sorterEnds(s, layout, data);
-    expect(pick.x).toBeCloseTo(2, 9);
-    expect(pick.y).toBeCloseTo(1 / TILE, 9);
-    expect(pick.z).toBe(0);
-    expect(drop.x).toBeCloseTo(1.11 / TILE, 9);
-    expect(drop.y).toBeCloseTo(1 / TILE, 9);
-  });
-
-  test('building to building uses both slot positions', () => {
-    const l = layoutOf({ buildings: [assembler, { ...assembler, id: 2, x: 4 }] });
-    const s = sorterOf({
-      pick: { kind: 'building', buildingId: 1, slot: 4 },
-      drop: { kind: 'building', buildingId: 2, slot: 10 },
-    });
-    const { pick, drop } = sorterEnds(s, l, data);
-    expect(pick.x).toBeCloseTo(1.11 / TILE, 9);
-    expect(pick.y).toBeCloseTo(0, 9);
-    expect(drop.x).toBeCloseTo(4 - 1.11 / TILE, 9);
-    expect(drop.y).toBeCloseTo(0, 9);
-  });
-
-  test('a tap node at the end of the belt takes its axis from the one neighbour', () => {
-    const s = sorterOf({ pick: { kind: 'belt', beltId: 1, node: 0 }, drop: { kind: 'building', buildingId: 1, slot: 3 } });
-    expect(sorterEnds(s, layout, data).pick.y).toBeCloseTo(1 / TILE, 9);
-  });
-
-  test('rejects unknown buildings, belts, nodes and slots', () => {
-    const slot3 = { kind: 'building', buildingId: 1, slot: 3 } as const;
-    expect(() => sorterEnds(sorterOf({ pick: { kind: 'belt', beltId: 9, node: 0 }, drop: slot3 }), layout, data)).toThrow(/belt 9/);
-    expect(() => sorterEnds(sorterOf({ pick: { kind: 'belt', beltId: 1, node: 7 }, drop: slot3 }), layout, data)).toThrow(/node 7/);
-    expect(() => sorterEnds(sorterOf({ pick: { kind: 'belt', beltId: 1, node: 1 }, drop: { ...slot3, buildingId: 8 } }), layout, data)).toThrow(/building 8/);
-    expect(() => sorterEnds(sorterOf({ pick: { kind: 'belt', beltId: 1, node: 1 }, drop: { ...slot3, slot: 12 } }), layout, data)).toThrow(/slot 12/);
-  });
-});
 
 describe('layoutToBlueprint', () => {
   test('(a) station with a Mk.III belt leaving port 3: round-trips, links and port params', () => {
@@ -520,6 +458,24 @@ describe('layoutToBlueprint', () => {
     expect(recs.map((r) => r.yaw)).toEqual([90, 90, 90]);
   });
 
+  test('a corner node takes the bisector of the incoming and outgoing headings, straight nodes keep theirs', () => {
+    const recs = records(layoutOf({ belts: [beltOf(1, [[0, 0], [1, 0], [1, -1], [2, -1]])] }));
+    // East, a south turn, an east turn: 90, 135 (bisector of 90 and 180), 135 (of 180 and 90), 90.
+    expect(recs.map((r) => r.yaw)).toEqual([90, 135, 135, 90]);
+    expect(recs.map((r) => r.yaw2)).toEqual([90, 135, 135, 90]);
+    // The turn across north: 0 in, 270 out, bisector 315.
+    expect(records(layoutOf({ belts: [beltOf(1, [[0, 0], [0, 1], [-1, 1]])] })).map((r) => r.yaw)).toEqual([0, 315, 270]);
+  });
+
+  test('a belt that leaves a port and turns at its first node takes the bisector there too', () => {
+    const l = layoutOf({
+      buildings: [ils({ station: station({ ports: ports12({ 1: { dir: 1, storageIdx: 1 } }) }) })],
+      belts: [beltOf(1, [[0, 4], [1, 4], [2, 4]], { source: { buildingId: 1, port: 1 } })],
+    });
+    // Two stubs heading north, then the corner at (0, 4): 0 in, 90 out.
+    expect(records(l).slice(1).map((r) => r.yaw)).toEqual([0, 0, 45, 90, 90]);
+  });
+
   test('building yaw is written in degrees clockwise from north', () => {
     const recs = records(layoutOf({ buildings: [smelter({ yaw: 270 })] }));
     expect(recs[0].yaw).toBe(270);
@@ -629,6 +585,166 @@ describe('layoutToBlueprint', () => {
       expect(build(layoutOf({ buildings: [ils({ station: station({ ports: ports12().slice(0, 11) }) })] }))).toThrow(/12 ports/);
       expect(build(layoutOf({ buildings: [{ ...smelter(), station: station() }] }))).toThrow(/not a station/);
     });
+  });
+});
+
+/** Angle between two headings in degrees, in [0, 180]. */
+const headingGap = (a: number, b: number): number => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+
+describe('real exports as an oracle for what the builder must reproduce', () => {
+  const ILS_ID = 2104;
+  const near = (a: number, b: number, tol: number, what: string) => expect(Math.abs(a - b), `${what}: ${a} vs ${b}`).toBeLessThan(tol);
+  const links = (r: BlueprintBuilding) => [r.outputToSlot, r.inputFromSlot, r.outputFromSlot, r.inputToSlot];
+
+  test('ILS export: a belt leaving each port has the same links, slot fields and stub spacing as the game writes', () => {
+    const sample = loadBlueprintSample('ils-configured-0.9.24.txt').body.buildings;
+    const sampleStation = sample.find((r) => r.itemId === ILS_ID)!;
+    const sampleChains = sample.filter((r) => r.inputObjIdx === sampleStation.index).sort((a, b) => a.inputFromSlot - b.inputFromSlot);
+    expect(sampleChains).toHaveLength(12);
+
+    // The same station with all 12 ports as outputs, each with a one-node Mk.II belt on the first lattice point out.
+    const station12 = ils({
+      x: sampleStation.localOffset[0],
+      y: sampleStation.localOffset[1],
+      station: station({ ports: ports12(Object.fromEntries(Array.from({ length: 12 }, (_, p) => [p, { dir: 1 as const, storageIdx: 1 }]))) }),
+    });
+    const ports = portInfos(station12, data.building(ILS_ID)!);
+    const layout = layoutOf({
+      buildings: [station12],
+      belts: ports.map((p, i) =>
+        beltOf(i + 1, [[p.firstOutside.x, p.firstOutside.y]], { tierItemId: 2002, source: { buildingId: 1, port: p.index } }),
+      ),
+    });
+    const ours = records(layout);
+    expect(ours).toHaveLength(1 + 12 * 3);
+
+    sampleChains.forEach((first, port) => {
+      const theirs = [first, sample[first.outputObjIdx], sample[sample[first.outputObjIdx].outputObjIdx]];
+      const mine = ours.slice(1 + 3 * port, 4 + 3 * port);
+      const label = `port ${port}`;
+      expect(first.inputFromSlot, label).toBe(port);
+      mine.forEach((m, i) => {
+        const t = theirs[i];
+        expect(m.itemId, label).toBe(t.itemId);
+        expect(m.modelIndex, label).toBe(t.modelIndex);
+        // Links: slot pattern 1,0,0,1 in the middle, the port number on the first, an open end on the last.
+        expect(links(m), `${label} record ${i}`).toEqual(links(t));
+        expect(m.inputObjIdx === ours[0].index, `${label} record ${i}`).toBe(t.inputObjIdx === sampleStation.index);
+        expect(m.outputObjIdx === -1, `${label} record ${i}`).toBe(t.outputObjIdx === -1);
+        if (i < 2) expect(m.outputObjIdx, label).toBe(mine[i + 1].index);
+        // Position relative to the station centre, and heading.
+        const tol = i === 1 ? 0.06 : 0.05;
+        near(m.localOffset[0] - ours[0].localOffset[0], t.localOffset[0] - sampleStation.localOffset[0], tol, `${label} record ${i} x`);
+        near(m.localOffset[1] - ours[0].localOffset[1], t.localOffset[1] - sampleStation.localOffset[1], tol, `${label} record ${i} y`);
+        near(m.localOffset[2], t.localOffset[2], 0.05, `${label} record ${i} z`);
+        expect(headingGap(m.yaw, t.yaw), `${label} record ${i} yaw`).toBeLessThan(2);
+        expect(headingGap(m.yaw2, m.yaw)).toBe(0);
+      });
+      // Stub spacing from the station centre along the port's normal: ~2.15 tiles at the port, ~3.02 at the second
+      // record, 4 at the lattice.
+      const [dx, dy] = ports[port].dir;
+      const normal = (r: BlueprintBuilding, c: BlueprintBuilding) => (r.localOffset[0] - c.localOffset[0]) * dx + (r.localOffset[1] - c.localOffset[1]) * dy;
+      near(normal(mine[0], ours[0]), 2.15, 0.05, `${label} port stub`);
+      // The game puts the second record ~0.87 tile past the port; the builder uses the midpoint to the lattice, 3.07.
+      near(normal(mine[1], ours[0]), 3.02, 0.06, `${label} second stub`);
+      near(normal(mine[2], ours[0]), 4, 1e-3, `${label} lattice node`); // float32 on the wire
+      near(normal(theirs[0], sampleStation), 2.15, 0.02, `${label} sample port stub`);
+      near(normal(theirs[1], sampleStation), 3.02, 0.03, `${label} sample second stub`);
+      near(normal(theirs[2], sampleStation), 4, 0.01, `${label} sample lattice node`);
+    });
+  });
+
+  test('capsule export: every belt to assembler sorter has the same fields, yaw and ends as the game wrote', () => {
+    const bp = loadBlueprintSample('capsule-production-v2-reform-0.10.33.txt');
+    const pairs = assemblerSorters(bp, 2304);
+    expect(pairs.length).toBeGreaterThanOrEqual(20);
+    expect(pairs.some((p) => p.kind === 'input') && pairs.some((p) => p.kind === 'output')).toBe(true);
+
+    for (const { sorter: theirs, assembler: theirAsm, kind, slot, span } of pairs) {
+      const label = `sorter ${theirs.index} (${kind}, slot ${slot}, span ${span})`;
+      const asm = { id: 1, itemId: 2304, x: theirAsm.localOffset[0], y: theirAsm.localOffset[1], z: 0, yaw: 0 as const };
+      const info = slotInfos(asm, data.building(2304)!)[slot];
+      // A three-node belt across the slot's row, tapped in the middle at the span's lattice point.
+      const tap = sorterTapPoint(info, span as 1 | 2 | 3);
+      const lateral: [number, number] = [Math.abs(info.dir[1]), Math.abs(info.dir[0])];
+      const belt = beltOf(
+        1,
+        [
+          [tap.x - lateral[0], tap.y - lateral[1]],
+          [tap.x, tap.y],
+          [tap.x + lateral[0], tap.y + lateral[1]],
+        ],
+        { tierItemId: 2003 },
+      );
+      const onBelt = { kind: 'belt', beltId: 1, node: 1 } as const;
+      const onAsm = { kind: 'building', buildingId: 1, slot } as const;
+      const sorter = sorterOf({
+        tierItemId: 2013,
+        span: span as 1 | 2 | 3,
+        pick: kind === 'input' ? onBelt : onAsm,
+        drop: kind === 'input' ? onAsm : onBelt,
+      });
+      const recs = records(layoutOf({ buildings: [asm], belts: [belt], sorters: [sorter] }));
+      const mine = recs[recs.length - 1];
+      const mineAsm = recs[0];
+
+      // Fields.
+      expect(mine.itemId, label).toBe(theirs.itemId);
+      expect(mine.modelIndex, label).toBe(theirs.modelIndex);
+      expect(mine.inputFromSlot, label).toBe(theirs.inputFromSlot);
+      expect(mine.inputFromSlot, label).toBe(kind === 'input' ? -1 : slot);
+      expect(mine.outputToSlot, label).toBe(theirs.outputToSlot);
+      expect(mine.outputToSlot, label).toBe(kind === 'input' ? slot : -1);
+      expect([mine.outputFromSlot, mine.inputToSlot], label).toEqual([0, 1]);
+      expect([mine.outputFromSlot, mine.inputToSlot], label).toEqual([theirs.outputFromSlot, theirs.inputToSlot]);
+      expect(Array.from(mine.parameters), label).toEqual(Array.from(theirs.parameters));
+      expect(Array.from(mine.parameters), label).toEqual([span]);
+      expect(mine.filterId, label).toBe(theirs.filterId);
+      // Links: the assembler on the building side, a belt record on the other.
+      const [buildingSide, beltSide] = kind === 'input' ? [mine.outputObjIdx, mine.inputObjIdx] : [mine.inputObjIdx, mine.outputObjIdx];
+      expect(recs[buildingSide].itemId, label).toBe(2304);
+      expect(recs[beltSide].itemId, label).toBe(2003);
+
+      // Heading: pick toward drop.
+      expect(headingGap(mine.yaw, theirs.yaw), `${label} yaw`).toBeLessThan(0.5);
+      expect(headingGap(mine.yaw2, theirs.yaw2), `${label} yaw2`).toBeLessThan(0.5);
+      // Ends, relative to the assembler: building end at the slot, belt end at the slot's lateral coordinate.
+      for (const [m, t, end] of [
+        [mine.localOffset, theirs.localOffset, 'pick'],
+        [mine.localOffset2, theirs.localOffset2, 'drop'],
+      ] as const) {
+        near(m[0] - mineAsm.localOffset[0], t[0] - theirAsm.localOffset[0], 0.05, `${label} ${end} x`);
+        near(m[1] - mineAsm.localOffset[1], t[1] - theirAsm.localOffset[1], 0.05, `${label} ${end} y`);
+        near(m[2], t[2], 0.05, `${label} ${end} z`);
+      }
+    }
+  });
+
+  test('capsule export: every flat quarter-turn belt node gets the yaw the game wrote, corners included', () => {
+    const recs = loadBlueprintSample('capsule-production-v2-reform-0.10.33.txt').body.buildings;
+    const isBelt = (r: BlueprintBuilding) => r.itemId === 2003;
+    const flat = (a: BlueprintBuilding, b: BlueprintBuilding) => Math.abs(a.localOffset[2] - b.localOffset[2]) < 0.1;
+    // Whole quarter turns only; the sample also has a few curved runs with fractional positions.
+    const quarter = (v: number) => Math.abs(v - Math.round(v / 90) * 90) < 0.5;
+    let straight = 0;
+    let corners = 0;
+    for (const mid of recs.filter(isBelt)) {
+      const next = recs[mid.outputObjIdx];
+      const prevs = recs.filter((r) => isBelt(r) && r.outputObjIdx === mid.index);
+      if (!next || !isBelt(next) || prevs.length !== 1) continue;
+      const prev = prevs[0];
+      if (!flat(prev, mid) || !flat(mid, next)) continue;
+      const hin = headingDeg(mid.localOffset[0] - prev.localOffset[0], mid.localOffset[1] - prev.localOffset[1]);
+      const hout = headingDeg(next.localOffset[0] - mid.localOffset[0], next.localOffset[1] - mid.localOffset[1]);
+      if (!quarter(hin) || !quarter(hout)) continue;
+      const nodes = [prev, mid, next].map((r): [number, number] => [Math.round(r.localOffset[0]), Math.round(r.localOffset[1])]);
+      const built = records(layoutOf({ belts: [beltOf(1, nodes, { tierItemId: 2003 })] }))[1];
+      expect(headingGap(built.yaw, mid.yaw), `belt record ${mid.index}`).toBeLessThan(3);
+      if (headingGap(hin, hout) > 45) corners++;
+      else straight++;
+    }
+    expect(corners).toBeGreaterThanOrEqual(8);
+    expect(straight).toBeGreaterThanOrEqual(100);
   });
 });
 

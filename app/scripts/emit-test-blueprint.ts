@@ -5,18 +5,20 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { layoutToBlueprintString, prefabToGrid, TILE } from '../src/lib/blueprint/build';
+import { layoutToBlueprintString } from '../src/lib/blueprint/build';
 import { GameDataIndex, parseGameData } from '../src/lib/data';
 import type { Building, Pose } from '../src/lib/data';
-import type { BeltPath, Layout, PlacedBuilding, Sorter, StationPortConfig } from '../src/lib/geometry/model';
+import { prefabToGrid, TILE } from '../src/lib/geometry';
+import type { BeltPath, Layout, PlacedBuilding, Sorter, StationPortConfig } from '../src/lib/geometry';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const fixturePath = resolve(repoRoot, 'data/fixture/dsp-fixture.json');
 export const defaultOutPath = resolve(repoRoot, 'local/test-blueprints/m0-smelter-row.txt');
 
 // ---------------------------------------------------------------------------------------------
-// Slot cells. Task 14's `slotInfos` computes the same thing for the solver; this is the small
-// version the hand-placed coordinates below are checked against.
+// Slot cells. `slotInfos` / `portInfos` (src/lib/geometry/endpoints.ts) compute the same thing for the solver;
+// this is the small independent version the hand-placed coordinates below are checked against, and
+// endpoints.test.ts checks the two agree.
 
 export interface SlotCell {
   /** The slot or port position in grid space. */

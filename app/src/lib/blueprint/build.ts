@@ -3,138 +3,36 @@
  * Format reference: docs/research/blueprint-format.md ("BF"), §3.3 records, §4.1 station parameters,
  * §5 coordinates. Output profile: header v0, body version 2, marker -101, patch2 1, no reform (BF §3.4).
  */
-import type { Building, GameDataIndex, Vec3 } from '../data';
-import type { BeltPath, Endpoint, GridPoint, Layout, PlacedBuilding, Sorter, StationConfig, Yaw } from '../geometry/model';
+import type { Building, GameDataIndex } from '../data';
+import {
+  beltNodeAt,
+  beltNodeYaws,
+  buildingDef,
+  headingDeg,
+  LayoutIndex,
+  portPosition,
+  sorterEnds,
+} from '../geometry';
+import type { BeltPath, Endpoint, GridPoint, Layout, PlacedBuilding, Sorter, StationConfig } from '../geometry';
 import { encodeBlueprint } from './codec';
 import type { Blueprint, BlueprintBuilding, BlueprintHeader } from './model';
-
-export const TILE = 1.2566370614359172;
-export const LEVEL = 4 / 3;
 
 /** Appended to `desc` while the geometry the layout was built on is approximate (Review Focus #5). */
 const APPROXIMATE_FLAG = '[geometry: approximate - unverified in game]';
 
-// ---------------------------------------------------------------------------------------------
-// Geometry helpers. Task 14 moves `prefabToGrid` and `sorterEnds` into `app/src/lib/geometry/`.
-
-const YAW_TRIG: Record<Yaw, readonly [cos: number, sin: number]> = {
-  0: [1, 0],
-  90: [0, 1],
-  180: [-1, 0],
-  270: [0, -1],
-};
-
-/**
- * Prefab space (metres; px right, py up, pz forward) to grid space for a building at `b` with yaw
- * `b.yaw` degrees clockwise from north, viewed from above:
- * `east = px·cosθ + pz·sinθ`, `north = −px·sinθ + pz·cosθ`, then metres to tiles and levels.
- * This convention is an assumption until checked in-game (global context, "Coordinates"); keep it here.
- */
-export function prefabToGrid(b: { x: number; y: number; z: number; yaw: Yaw }, p: Vec3): GridPoint {
-  const trig = YAW_TRIG[b.yaw];
-  if (!trig) throw new Error(`unsupported yaw ${String(b.yaw)} (expected 0, 90, 180 or 270)`);
-  const [cos, sin] = trig;
-  const east = p[0] * cos + p[2] * sin;
-  const north = -p[0] * sin + p[2] * cos;
-  return { x: b.x + east / TILE, y: b.y + north / TILE, z: b.z + p[1] / LEVEL };
-}
-
-/** What the builder needs to resolve ids: the layout by id, and the game data. */
+/** What the builder needs to resolve ids: the game data, and the layout by id. */
 interface Context {
   data: GameDataIndex;
-  buildings: Map<number, PlacedBuilding>;
-  belts: Map<number, BeltPath>;
+  index: LayoutIndex;
 }
 
 function makeContext(layout: Layout, data: GameDataIndex): Context {
-  const buildings = new Map<number, PlacedBuilding>();
-  for (const b of layout.buildings) {
-    if (buildings.has(b.id)) throw new Error(`duplicate building id ${b.id}`);
-    buildings.set(b.id, b);
-  }
-  const belts = new Map<number, BeltPath>();
-  for (const belt of layout.belts) {
-    if (belts.has(belt.id)) throw new Error(`duplicate belt id ${belt.id}`);
-    belts.set(belt.id, belt);
-  }
-  return { data, buildings, belts };
-}
-
-function buildingDef(data: GameDataIndex, itemId: number): Building {
-  const def = data.building(itemId);
-  if (!def) throw new Error(`GameData has no building for item ${itemId}`);
-  return def;
-}
-
-function placedBuilding(ctx: Context, id: number, what: string): PlacedBuilding {
-  const b = ctx.buildings.get(id);
-  if (!b) throw new Error(`${what}: building ${id} is not in the layout`);
-  return b;
-}
-
-function placedBelt(ctx: Context, id: number, what: string): BeltPath {
-  const belt = ctx.belts.get(id);
-  if (!belt) throw new Error(`${what}: belt ${id} is not in the layout`);
-  return belt;
-}
-
-function beltNode(belt: BeltPath, node: number, what: string): GridPoint {
-  const p = belt.nodes[node];
-  if (!p) throw new Error(`${what}: belt ${belt.id} has no node ${node} (${belt.nodes.length} nodes)`);
-  return p;
-}
-
-function slotPoint(ctx: Context, e: Extract<Endpoint, { kind: 'building' }>): GridPoint {
-  const b = placedBuilding(ctx, e.buildingId, 'sorter endpoint');
-  const pose = buildingDef(ctx.data, b.itemId).geometry.slots[e.slot];
-  if (!pose) throw new Error(`sorter endpoint: building ${b.id} (item ${b.itemId}) has no slot ${e.slot}`);
-  return prefabToGrid(b, pose.position);
+  return { data, index: new LayoutIndex(layout) };
 }
 
 function portPoint(ctx: Context, buildingId: number, port: number, what: string): GridPoint {
-  const b = placedBuilding(ctx, buildingId, what);
-  const pose = buildingDef(ctx.data, b.itemId).geometry.ports[port];
-  if (!pose) throw new Error(`${what}: building ${b.id} (item ${b.itemId}) has no port ${port}`);
-  return prefabToGrid(b, pose.position);
-}
-
-/**
- * The belt point a building slot taps: the slot's position projected onto the belt's axis line through
- * the tap node (the axis runs between the node's neighbours), so the belt end sits at the slot's own
- * lateral coordinate, not at the node. z is the node's.
- */
-function projectOntoBelt(belt: BeltPath, node: number, slot: GridPoint): GridPoint {
-  const at = beltNode(belt, node, 'sorter endpoint');
-  const prev = belt.nodes[node - 1] ?? at;
-  const next = belt.nodes[node + 1] ?? at;
-  const dx = next.x - prev.x;
-  const dy = next.y - prev.y;
-  const len = Math.hypot(dx, dy);
-  if (len < 1e-9) return { ...at };
-  const ux = dx / len;
-  const uy = dy / len;
-  const along = (slot.x - at.x) * ux + (slot.y - at.y) * uy;
-  return { x: at.x + along * ux, y: at.y + along * uy, z: at.z };
-}
-
-function endpointPoint(ctx: Context, e: Endpoint, opposite: Endpoint): GridPoint {
-  if (e.kind === 'building') return slotPoint(ctx, e);
-  const belt = placedBelt(ctx, e.beltId, 'sorter endpoint');
-  if (opposite.kind === 'building') return projectOntoBelt(belt, e.node, slotPoint(ctx, opposite));
-  return { ...beltNode(belt, e.node, 'sorter endpoint') };
-}
-
-function sorterEndsIn(s: Sorter, ctx: Context): { pick: GridPoint; drop: GridPoint } {
-  return { pick: endpointPoint(ctx, s.pick, s.drop), drop: endpointPoint(ctx, s.drop, s.pick) };
-}
-
-/**
- * Where a sorter's two ends sit in grid space. A building end is the slot position; a belt end is the
- * point on the belt at the opposite building slot's lateral coordinate; building to building uses both
- * slot positions; belt to belt (unused in v1) uses both tap nodes.
- */
-export function sorterEnds(s: Sorter, layout: Layout, data: GameDataIndex): { pick: GridPoint; drop: GridPoint } {
-  return sorterEndsIn(s, makeContext(layout, data));
+  const b = ctx.index.building(buildingId, what);
+  return portPosition(b, buildingDef(ctx.data, b.itemId), port, what);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -170,38 +68,11 @@ function record(itemId: number, modelIndex: number, over: Partial<BlueprintBuild
   };
 }
 
-/** Yaw in degrees clockwise from north, in [0, 360), for a grid-space direction (east, north). */
-function headingDeg(east: number, north: number): number {
-  const deg = Math.round(((Math.atan2(east, north) * 180) / Math.PI) * 1e6) / 1e6;
-  return ((deg % 360) + 360) % 360;
-}
-
 const mid = (a: GridPoint, b: GridPoint): GridPoint => ({
   x: (a.x + b.x) / 2,
   y: (a.y + b.y) / 2,
   z: (a.z + b.z) / 2,
 });
-
-/**
- * Per-point yaw along a polyline: the direction to the next point, or, where the next point is straight
- * above or below (a vertical lift), the heading carried from the previous segment. The last point keeps
- * the heading before it; a belt that starts with a lift takes the first real heading.
- */
-function headings(pts: GridPoint[]): number[] {
-  const out: (number | undefined)[] = [];
-  let carry: number | undefined;
-  for (let i = 0; i < pts.length; i++) {
-    const next = pts[i + 1];
-    if (next) {
-      const east = next.x - pts[i].x;
-      const north = next.y - pts[i].y;
-      if (Math.hypot(east, north) > 1e-9) carry = headingDeg(east, north);
-    }
-    out.push(carry);
-  }
-  const first = out.find((v) => v !== undefined) ?? 0;
-  return out.map((v) => v ?? first);
-}
 
 // Station parameters, BF §4.1.
 const STATION_PARAMS = 2048;
@@ -312,7 +183,7 @@ function beltRecords(
     pts.push(mid(belt.nodes[belt.nodes.length - 1], port), port);
   }
 
-  const yaws = headings(pts);
+  const yaws = beltNodeYaws(pts);
   const modelIndex = buildingDef(ctx.data, belt.tierItemId).modelIndex;
   const recs = pts.map((p, i) =>
     record(belt.tierItemId, modelIndex, {
@@ -337,8 +208,8 @@ function beltRecords(
     last.outputObjIdx = buildingIndex.get(sink.buildingId)!;
     last.outputToSlot = sink.port;
   } else if (sink?.kind === 'belt') {
-    const target = placedBelt(ctx, sink.beltId, `${what} sink`);
-    beltNode(target, sink.node, `${what} sink`);
+    const target = ctx.index.belt(sink.beltId, `${what} sink`);
+    beltNodeAt(target, sink.node, `${what} sink`);
     const t = layouts.get(target.id)!;
     last.outputObjIdx = t.base + t.pre + sink.node;
     last.outputToSlot = 1;
@@ -352,7 +223,7 @@ function sorterRecord(
   layouts: Map<number, BeltLayout>,
   buildingIndex: Map<number, number>,
 ): BlueprintBuilding {
-  const { pick, drop } = sorterEndsIn(s, ctx);
+  const { pick, drop } = sorterEnds(s, ctx.index.layout, ctx.data, ctx.index);
   const yaw = headingDeg(drop.x - pick.x, drop.y - pick.y);
   const target = (e: Endpoint): number => {
     if (e.kind === 'building') return buildingIndex.get(e.buildingId)!;
