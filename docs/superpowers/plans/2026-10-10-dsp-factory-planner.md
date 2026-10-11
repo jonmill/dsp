@@ -15,7 +15,7 @@
 A Svelte 5 UI sits on top. Until the user runs the extractor, everything runs against `data/fixture/dsp-fixture.json`, which is derived from a public proto dump and uses **approximate** building geometry.
 
 **Tech Stack:**
-- App: TypeScript 5, Vite 8, Svelte 5 (runes), Vitest 5, zod 4 (`z.toJSONSchema`), pako 3, glpk.js 5.
+- App: TypeScript 5, Vite 8, Svelte 5 (runes), Vitest 5, zod 4 (`z.toJSONSchema`), pako 2.1, glpk.js 5.
 - Extractor: Python ≥ 3.11, UnityPy ≥ 1.20 + TypeTreeGeneratorAPI ≥ 0.0.10 (optional `game` extra), jsonschema, pytest. `ilspycmd` (needs .NET 10) is only used at extraction time.
 
 **Spec:** `docs/superpowers/specs/2026-10-10-dsp-factory-planner-design.md`
@@ -105,7 +105,7 @@ local/                       gitignored: decompiled sources, extract reports
   - Python package `dsp_extract` installable with `pip install -e 'tools/extract[dev]'`. The `game` extra holds `UnityPy>=1.20` and `TypeTreeGeneratorAPI>=0.0.10`. The `dev` extra holds `pytest` and `jsonschema`.
 
 - [ ] **Step 1:** Scaffold `app/` by hand (not `npm create`, to avoid interactive prompts).
-  - Dependencies: `svelte@^5`, `vite@^8`, `@sveltejs/vite-plugin-svelte`, `typescript`, `vitest`, `svelte-check`, `zod@^4`, `pako@^3`, `@types/pako`, `glpk.js@^5`, `eslint`, `typescript-eslint`, `eslint-plugin-svelte`.
+  - Dependencies: `svelte@^5`, `vite@^8`, `@sveltejs/vite-plugin-svelte`, `typescript`, `vitest`, `svelte-check`, `zod@^4`, `pako@^2.1` (byte-exact gzip verified only with 2.x, BF §1.2), `@types/pako`, `glpk.js@^5`, `eslint`, `typescript-eslint`, `eslint-plugin-svelte`.
   - `vite.config.ts`: Svelte plugin; `test: { environment: 'node', include: ['src/**/*.test.ts','test/**/*.test.ts'] }`; `server.fs.allow: ['..']` so the app can import `../data/*.json`.
 - [ ] **Step 2:** In `eslint.config.js`, add a `no-restricted-imports` rule for files matching `src/lib/validate/**` that forbids patterns `**/lib/layout/**`, `../layout/*`, `../../layout/*` and `$lib/layout/*`, with the message "validator must stay independent of the solver". (`geometry/model.ts` is shared and allowed.) Verify the rule both ways: a temporary file under `src/lib/validate/` importing `../layout/x` fails lint, and one importing `../geometry/model` passes; delete both temporary files afterwards.
 - [ ] **Step 3:** Write the smoke tests:
