@@ -1,0 +1,433 @@
+// Tap assignment: which sorter slot of which machine serves each tap of each net, and which belt port of which
+// station each net starts or ends at (Task 22). The router takes it from there.
+//
+// Sorters. A tap that moves `rate` items/s gets as many sorters as it needs, each on a slot of its own. A slot is
+// used by one sorter ever (the validator's SORTER_SLOT_REUSED). Each slot offers the smallest span (1, 2 or 3) whose
+// tap point works; a tap fills up from span 1 and then 2 and 3 until the sorters' summed `sorterRate` covers the
+// rate, so a span-2 sorter, which is slower, makes the tap use more of them.
+//
+// What makes a tap point work. The belt has to pass the tap point straight, along the axis across the slot facing,
+// with a node before it and a node after it (SORTER_BELT_TANGENT). So three lattice points on the ground are needed:
+// the tap point T and T -/+ axis. They must be free for belts (`Occupancy.blockedForBelt`, which inflates every
+// footprint by half a belt and so is stricter than the slot's own `firstOutside`), and nobody else may need them:
+// not another net's tap, not a station port's two belt nodes. Taps of the same net on the same row may share nodes
+// (the belt just runs past them). The lattice points a span-2 or span-3 sorter reaches over (those between the slot
+// and T) must not lie inside a building (SORTER_IN_BUILDING); a belt may run there.
+//
+// Which slot. Among the free slots at the smallest span: the one facing the centroid of the net's other taps (and
+// station ports) best, then the nearer tap point, then the lower index. Slots next to one already chosen for the same
+// tap, in the same row, get a bonus, so a tap with several sorters takes a straight stretch of one side.
+//
+// Ports. A net that starts or ends at a station takes one of its 12 ports. A station's nets are matched to its ports
+// greedily by cost: the distance from the port's first lattice point outside to the net's tap centroid, plus a
+// penalty when the port faces away from it.
+import type { GameDataIndex, TechEffects } from '../data';
+import { buildingDef, pointInOBBs, portInfos, slotInfos, sorterTapPoint } from '../geometry';
+import type { OBB2, PlacedBuilding, SlotInfo } from '../geometry';
+import { sorterRate } from '../validate/capacity';
+import { netStack } from './netlist';
+import type { BeltNet, NetTap, Netlist } from './netlist';
+import type { Bounds, Occupancy } from './occupancy';
+import { obbsBounds } from './occupancy';
+import { placementBuildingIdOf, stationBuildingId } from './placement';
+import type { Placement } from './placement';
+
+/** ONE per sorter: a tap needing k sorters yields k of these, on k distinct slots, each with its own belt point. */
+export interface AssignedTap {
+  netId: number;
+  machineId: number;
+  slot: number;
+  span: 1 | 2 | 3;
+  /** The belt lattice point (z 0) the sorter taps: `sorterTapPoint(slot, span)`. */
+  point: { x: number; y: number };
+  /** The direction the belt must run through `point`: across the slot facing. */
+  axis: 'x' | 'y';
+  dir: 'in' | 'out';
+  /** 0.. within the tap. */
+  sorterIndex: number;
+  /** This sorter's share of the tap rate. */
+  rate: number;
+}
+
+/** A belt port a net starts at (`end: 'source'`) or ends at (`'sink'`). */
+export interface AssignedStationPort {
+  netId: number;
+  stationBuildingId: number;
+  port: number;
+  /** The port's first lattice point outside, where the belt's first (source) or last (sink) node is, at z 0. */
+  point: { x: number; y: number };
+  end: 'source' | 'sink';
+  /** The unit vector the port faces. The belt leaves (source) or arrives (sink) along this line, `point` first. */
+  dir: [number, number];
+}
+
+export interface TapAssignment {
+  taps: AssignedTap[];
+  stationPorts: AssignedStationPort[];
+}
+
+/** What a cost unit of "the port faces away from the net" is worth, in tiles of distance. */
+const PORT_BACKWARD_PENALTY = 6;
+/** Bonus (in facing-score units, which run from -1 to 1) for a slot beside one already chosen for the same tap. */
+const CONTIGUITY_BONUS = 0.75;
+/** Scores closer than this are equal. */
+const SCORE_EPS = 1e-9;
+/** Relative slack on "the sorters carry the rate". */
+const REL_EPS = 1e-9;
+const SPANS = [1, 2, 3] as const;
+
+/** Thrown inside the assigner for a condition the caller should read as a message, not a crash. */
+class Failure extends Error {}
+
+const KEY_OFFSET = 1 << 20;
+const KEY_STRIDE = 1 << 21;
+const keyOf = (x: number, y: number): number => (x + KEY_OFFSET) * KEY_STRIDE + (y + KEY_OFFSET);
+
+/** Who needs a lattice point on the ground: a tap running along an axis, or a station port. */
+interface Claim {
+  netId: number;
+  kind: 'x' | 'y' | 'port';
+}
+
+interface Candidate {
+  slot: SlotInfo;
+  span: 1 | 2 | 3;
+  point: { x: number; y: number };
+  axis: 'x' | 'y';
+  /** Facing score plus the contiguity bonus. */
+  score: number;
+  distance: number;
+}
+
+interface Box {
+  bounds: Bounds;
+  obbs: OBB2[];
+}
+
+const manhattan = (ax: number, ay: number, bx: number, by: number): number => Math.abs(ax - bx) + Math.abs(ay - by);
+
+class Assigner {
+  private readonly byId = new Map<number, PlacedBuilding>();
+  private readonly boxes: Box[];
+  private readonly blockedCache = new Map<number, boolean>();
+  private readonly claims = new Map<number, Claim[]>();
+  private readonly usedSlots = new Set<string>();
+  private readonly slotCache = new Map<number, SlotInfo[]>();
+  private readonly centers = new Map<number, { x: number; y: number }>();
+  private readonly ports: AssignedStationPort[] = [];
+  private readonly taps: AssignedTap[] = [];
+
+  constructor(
+    private readonly net: Netlist,
+    placement: Placement,
+    private readonly occ: Occupancy,
+    private readonly data: GameDataIndex,
+    private readonly effects: TechEffects,
+  ) {
+    for (const b of placement.buildings) this.byId.set(b.id, b);
+    this.boxes = placement.buildings.map((b) => {
+      const obbs = occ.obbsOf(b);
+      return { bounds: obbsBounds(obbs), obbs };
+    });
+  }
+
+  run(): TapAssignment {
+    this.assignPorts();
+    for (const n of this.net.nets) this.assignNet(n);
+    return { taps: this.taps, stationPorts: this.ports };
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Lookups
+
+  private building(id: number, what: string): PlacedBuilding {
+    const b = this.byId.get(id);
+    if (!b) throw new Failure(`${what}: the placement has no building ${id}`);
+    return b;
+  }
+
+  private nameOf(b: PlacedBuilding): string {
+    return buildingDef(this.data, b.itemId).name;
+  }
+
+  private center(b: PlacedBuilding): { x: number; y: number } {
+    let c = this.centers.get(b.id);
+    if (!c) {
+      const fp = this.occ.footprintOf(b.itemId, b.yaw);
+      c = { x: b.x + (fp.minX + fp.maxX) / 2, y: b.y + (fp.minY + fp.maxY) / 2 };
+      this.centers.set(b.id, c);
+    }
+    return c;
+  }
+
+  private slotsOf(machineId: number): SlotInfo[] {
+    let infos = this.slotCache.get(machineId);
+    if (!infos) {
+      const b = this.building(placementBuildingIdOf(machineId), `machine ${machineId}`);
+      try {
+        infos = slotInfos(b, buildingDef(this.data, b.itemId));
+      } catch (err) {
+        const cause = err instanceof Error ? err.message : String(err);
+        throw new Failure(`machine ${machineId} (${this.nameOf(b)}): its sorter slots cannot be used: ${cause}`);
+      }
+      this.slotCache.set(machineId, infos);
+    }
+    return infos;
+  }
+
+  private blocked(x: number, y: number): boolean {
+    const key = keyOf(x, y);
+    let v = this.blockedCache.get(key);
+    if (v === undefined) {
+      v = this.occ.blockedForBelt(x, y, 0);
+      this.blockedCache.set(key, v);
+    }
+    return v;
+  }
+
+  /** Is the lattice point inside a building footprint (no inflation)? */
+  private insideBuilding(x: number, y: number): boolean {
+    for (const { bounds, obbs } of this.boxes) {
+      if (x <= bounds.minX || x >= bounds.maxX || y <= bounds.minY || y >= bounds.maxY) continue;
+      if (pointInOBBs(x, y, null, obbs, 0)) return true;
+    }
+    return false;
+  }
+
+  private free(netId: number, kind: Claim['kind'], x: number, y: number): boolean {
+    const list = this.claims.get(keyOf(x, y));
+    if (!list) return true;
+    return list.every((c) => c.netId === netId && c.kind === kind && kind !== 'port');
+  }
+
+  private claim(netId: number, kind: Claim['kind'], x: number, y: number): void {
+    const key = keyOf(x, y);
+    const list = this.claims.get(key);
+    if (list) list.push({ netId, kind });
+    else this.claims.set(key, [{ netId, kind }]);
+  }
+
+  /** The centroid of what a net connects, leaving out the machine `exceptMachine`. */
+  private centroid(n: BeltNet, exceptMachine: number): { x: number; y: number } | undefined {
+    let sx = 0;
+    let sy = 0;
+    let count = 0;
+    for (const t of n.taps) {
+      if (t.machineId === exceptMachine) continue;
+      const c = this.center(this.building(placementBuildingIdOf(t.machineId), `net ${n.id}`));
+      sx += c.x;
+      sy += c.y;
+      count++;
+    }
+    for (const p of this.ports) {
+      if (p.netId !== n.id) continue;
+      sx += p.point.x;
+      sy += p.point.y;
+      count++;
+    }
+    return count > 0 ? { x: sx / count, y: sy / count } : undefined;
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Station ports
+
+  private assignPorts(): void {
+    interface Want {
+      net: BeltNet;
+      end: 'source' | 'sink';
+      stationIdx: number;
+    }
+    const wants: Want[] = [];
+    for (const n of this.net.nets) {
+      if (n.source.kind === 'station') wants.push({ net: n, end: 'source', stationIdx: n.source.stationIdx });
+      if (n.sink.kind === 'station') wants.push({ net: n, end: 'sink', stationIdx: n.sink.stationIdx });
+    }
+    const stationIdxs = [...new Set(wants.map((w) => w.stationIdx))].sort((a, b) => a - b);
+    for (const idx of stationIdxs) {
+      const station = this.building(stationBuildingId(idx), `station ${idx}`);
+      let infos: SlotInfo[];
+      try {
+        infos = portInfos(station, buildingDef(this.data, station.itemId));
+      } catch (err) {
+        const cause = err instanceof Error ? err.message : String(err);
+        throw new Failure(`station ${idx} (${this.nameOf(station)}): its belt ports cannot be used: ${cause}`);
+      }
+      const usable = infos.filter((info) => {
+        const { x, y } = info.firstOutside;
+        return !this.blocked(x, y) && !this.blocked(x + info.dir[0], y + info.dir[1]);
+      });
+      const mine = wants.filter((w) => w.stationIdx === idx);
+      const taken = new Set<number>();
+      const done = new Set<Want>();
+      const stationCenter = this.center(station);
+      // the pairs by cost, cheapest first; a net takes its cheapest free port, nets in the order of their best cost
+      while (done.size < mine.length) {
+        let best: { want: Want; info: SlotInfo; cost: number } | undefined;
+        for (const want of mine) {
+          if (done.has(want)) continue;
+          const g = this.centroid(want.net, -1) ?? stationCenter;
+          for (const info of usable) {
+            if (taken.has(info.index)) continue;
+            const { x, y } = info.firstOutside;
+            const forward = (g.x - x) * info.dir[0] + (g.y - y) * info.dir[1];
+            const cost = manhattan(x, y, g.x, g.y) + (forward < 0 ? PORT_BACKWARD_PENALTY : 0);
+            if (!best || cost < best.cost - SCORE_EPS) best = { want, info, cost };
+          }
+        }
+        if (!best) {
+          const left = mine.filter((w) => !done.has(w));
+          throw new Failure(
+            `net ${left[0].net.id}: station ${idx} (${this.nameOf(station)}) has no free usable belt port ` +
+              `(${mine.length} nets need one; ${usable.length} of its ${infos.length} ports are clear of buildings)`,
+          );
+        }
+        const { want, info } = best;
+        done.add(want);
+        taken.add(info.index);
+        const { x, y } = info.firstOutside;
+        this.claim(want.net.id, 'port', x, y);
+        this.claim(want.net.id, 'port', x + info.dir[0], y + info.dir[1]);
+        this.ports.push({
+          netId: want.net.id,
+          stationBuildingId: station.id,
+          port: info.index,
+          point: { x, y },
+          end: want.end,
+          dir: [info.dir[0], info.dir[1]],
+        });
+      }
+    }
+    this.ports.sort((a, b) => a.netId - b.netId || (a.end === b.end ? 0 : a.end === 'source' ? -1 : 1));
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Taps
+
+  private assignNet(n: BeltNet): void {
+    const stack = netStack(n.source.kind === 'station', this.effects);
+    for (const tap of n.taps) this.assignTap(n, tap, stack);
+  }
+
+  /** Does a sorter of `span` on `slot` work for net `netId`? Returns where it taps, or undefined. */
+  private tapAt(netId: number, slot: SlotInfo, span: 1 | 2 | 3): { point: { x: number; y: number }; axis: 'x' | 'y' } | undefined {
+    for (let k = 0; k < span - 1; k++) {
+      if (this.insideBuilding(slot.firstOutside.x + k * slot.dir[0], slot.firstOutside.y + k * slot.dir[1])) return undefined;
+    }
+    const point = sorterTapPoint(slot, span);
+    const axis = slot.dir[0] !== 0 ? 'y' : 'x';
+    for (const k of [-1, 0, 1]) {
+      const x = point.x + (axis === 'x' ? k : 0);
+      const y = point.y + (axis === 'y' ? k : 0);
+      if (this.blocked(x, y) || !this.free(netId, axis, x, y)) return undefined;
+    }
+    return { point, axis };
+  }
+
+  private assignTap(n: BeltNet, tap: NetTap, stack: number): void {
+    const b = this.building(placementBuildingIdOf(tap.machineId), `net ${n.id}`);
+    const slots = this.slotsOf(tap.machineId);
+    const goal = this.centroid(n, tap.machineId);
+    const fromBelt = tap.dir === 'in' ? stack : 0;
+    const tier = this.net.sorterTierItemId;
+    const chosen: Candidate[] = [];
+    let capacity = 0;
+    const caps: number[] = [];
+
+    while (capacity < tap.rate * (1 - REL_EPS)) {
+      let best: Candidate | undefined;
+      for (const slot of slots) {
+        if (this.usedSlots.has(`${tap.machineId}:${slot.index}`)) continue;
+        for (const span of SPANS) {
+          const at = this.tapAt(n.id, slot, span);
+          if (!at) continue;
+          const c = this.score(slot, span, at, goal, chosen);
+          if (!best || this.better(c, best)) best = c;
+          break;
+        }
+      }
+      if (!best) {
+        throw new Failure(
+          `net ${n.id}: machine ${tap.machineId} (${this.nameOf(b)}) has no usable sorter slot left for item ` +
+            `${tap.itemId} (${tap.dir === 'in' ? 'input' : 'output'} of ${+tap.rate.toFixed(3)}/s: ` +
+            `${chosen.length} sorter${chosen.length === 1 ? '' : 's'} placed carry ${+capacity.toFixed(3)}/s; ` +
+            `each of its ${slots.length} slots is taken, blocked, or needs ground another net uses)`,
+        );
+      }
+      chosen.push(best);
+      this.usedSlots.add(`${tap.machineId}:${best.slot.index}`);
+      for (const k of [-1, 0, 1]) {
+        this.claim(n.id, best.axis, best.point.x + (best.axis === 'x' ? k : 0), best.point.y + (best.axis === 'y' ? k : 0));
+      }
+      const cap = sorterRate(tier, best.span, fromBelt, this.effects, this.data);
+      caps.push(cap);
+      capacity += cap;
+    }
+    chosen.forEach((c, i) => {
+      this.taps.push({
+        netId: n.id,
+        machineId: tap.machineId,
+        slot: c.slot.index,
+        span: c.span,
+        point: c.point,
+        axis: c.axis,
+        dir: tap.dir,
+        sorterIndex: i,
+        rate: (tap.rate * caps[i]) / capacity,
+      });
+    });
+  }
+
+  private score(
+    slot: SlotInfo,
+    span: 1 | 2 | 3,
+    at: { point: { x: number; y: number }; axis: 'x' | 'y' },
+    goal: { x: number; y: number } | undefined,
+    chosen: Candidate[],
+  ): Candidate {
+    let facing = 0;
+    let distance = 0;
+    if (goal) {
+      const dx = goal.x - slot.pos.x;
+      const dy = goal.y - slot.pos.y;
+      const len = Math.hypot(dx, dy);
+      if (len > 1e-9) facing = (dx * slot.dir[0] + dy * slot.dir[1]) / len;
+      distance = manhattan(at.point.x, at.point.y, goal.x, goal.y);
+    }
+    const beside = chosen.some((c) => {
+      if (c.axis !== at.axis) return false;
+      const along = at.axis === 'x' ? c.point.x - at.point.x : c.point.y - at.point.y;
+      const across = at.axis === 'x' ? c.point.y - at.point.y : c.point.x - at.point.x;
+      return across === 0 && Math.abs(along) === 1;
+    });
+    return { slot, span, point: at.point, axis: at.axis, score: facing + (beside ? CONTIGUITY_BONUS : 0), distance };
+  }
+
+  /** `a` beats `b`: smaller span, then the better score, then the nearer tap point, then the lower slot index. */
+  private better(a: Candidate, b: Candidate): boolean {
+    if (a.span !== b.span) return a.span < b.span;
+    if (Math.abs(a.score - b.score) > SCORE_EPS) return a.score > b.score;
+    if (a.distance !== b.distance) return a.distance < b.distance;
+    return a.slot.index < b.slot.index;
+  }
+}
+
+/**
+ * Picks the sorter slots and station ports of a placed netlist (see the file comment). `occ` must hold the buildings
+ * of `placement`. Returns `{ failed }` with a message when a machine runs out of usable slots, a station out of
+ * usable ports, or a building's slots or ports cannot be read (one pose that does not face along an axis makes all
+ * of that building's unusable). The taps come back in net order, then the order of the net's taps, then sorter index.
+ */
+export function assignTaps(
+  net: Netlist,
+  placement: Placement,
+  occ: Occupancy,
+  data: GameDataIndex,
+  effects: TechEffects,
+): TapAssignment | { failed: string } {
+  try {
+    return new Assigner(net, placement, occ, data, effects).run();
+  } catch (err) {
+    if (err instanceof Failure) return { failed: err.message };
+    throw err;
+  }
+}

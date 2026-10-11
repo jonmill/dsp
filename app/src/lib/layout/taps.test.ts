@@ -1,0 +1,304 @@
+import { describe, expect, it } from 'vitest';
+import { buildingDef, buildingOBBs, pointInOBBs, portInfos, slotInfos, sorterTapPoint } from '../geometry';
+import type { PlacedBuilding } from '../geometry';
+import { sorterRate } from '../validate/capacity';
+import { fixtureData, patchBuilding } from '../validate/testkit';
+import { netStack } from './netlist';
+import type { Netlist } from './netlist';
+import { constructivePlacement, placementBuildingIdOf, stationBuildingId } from './placement';
+import type { Placement } from './placement';
+import { assignTaps } from './taps';
+import type { AssignedTap, TapAssignment } from './taps';
+import {
+  ASSEMBLER,
+  BlockingOccupancy,
+  data,
+  effects,
+  occupancyOf,
+  PLS,
+  processorNetlist,
+  spanOnePoints,
+  synthNetlist,
+} from './testkit';
+
+const REFINERY = 2308;
+const SMELTER = 2302;
+
+/** One machine of `itemId` at the origin, in a placement that holds only it. */
+function lone(itemId: number): { buildings: PlacedBuilding[]; placement: Placement } {
+  const b: PlacedBuilding = { id: placementBuildingIdOf(1), itemId, x: 0, y: 0, z: 0, yaw: 0, recipeId: 100, role: 'stage:0' };
+  return { buildings: [b], placement: { buildings: [b], cost: 0 } };
+}
+
+const key = (x: number, y: number): string => `${x},${y}`;
+/** The lattice points a tap needs on the ground: the tap point and the nodes before and after it along its axis. */
+const needed = (t: AssignedTap): string[] =>
+  [-1, 0, 1].map((k) => key(t.point.x + (t.axis === 'x' ? k : 0), t.point.y + (t.axis === 'y' ? k : 0)));
+
+function ok(r: TapAssignment | { failed: string }): TapAssignment {
+  if ('failed' in r) throw new Error(`assignTaps failed: ${r.failed}`);
+  return r;
+}
+
+describe('assignTaps on the constructive Processor placement (margin 2)', () => {
+  it('gives every netlist tap enough sorters on distinct slots, with room to route', async () => {
+    const net: Netlist = await processorNetlist();
+    const placement = constructivePlacement(net, data, 2);
+    const occ = occupancyOf(placement.buildings);
+    const res = ok(assignTaps(net, placement, occ, data, effects));
+    const byId = new Map(placement.buildings.map((b) => [b.id, b]));
+
+    // one slot, one sorter
+    const slots = new Set<string>();
+    for (const t of res.taps) {
+      const k = `${t.machineId}:${t.slot}`;
+      expect(slots.has(k), `slot ${k} is used twice`).toBe(false);
+      slots.add(k);
+    }
+
+    for (const n of net.nets) {
+      const stack = netStack(n.source.kind === 'station', effects);
+      for (const tap of n.taps) {
+        const mine = res.taps.filter((t) => t.netId === n.id && t.machineId === tap.machineId && t.dir === tap.dir);
+        expect(mine.length, `net ${n.id} machine ${tap.machineId}`).toBeGreaterThanOrEqual(1);
+        expect(mine.map((t) => t.sorterIndex)).toEqual(mine.map((_, i) => i));
+        const total = mine.reduce((s, t) => s + t.rate, 0);
+        expect(total).toBeGreaterThanOrEqual(tap.rate * (1 - 1e-9));
+        for (const t of mine) {
+          const cap = sorterRate(net.sorterTierItemId, t.span, tap.dir === 'in' ? stack : 0, effects, data);
+          expect(t.rate).toBeLessThanOrEqual(cap * (1 + 1e-9));
+          // a span-1 count is a lower bound on the count
+          expect(mine.length).toBeGreaterThanOrEqual(1);
+        }
+        if (mine.every((t) => t.span === 1)) expect(mine.length).toBe(tap.sorters);
+      }
+    }
+
+    // tap points are real lattice points of the slot, off every building and free for belts
+    const allObbs = placement.buildings.flatMap((b) => buildingOBBs(b, buildingDef(data, b.itemId)));
+    for (const t of res.taps) {
+      const b = byId.get(placementBuildingIdOf(t.machineId)) as PlacedBuilding;
+      const info = slotInfos(b, buildingDef(data, b.itemId))[t.slot];
+      expect(t.point).toEqual(sorterTapPoint(info, t.span));
+      expect(t.axis).toBe(info.dir[0] !== 0 ? 'y' : 'x');
+      expect(pointInOBBs(t.point.x, t.point.y, null, allObbs, 0), `tap ${JSON.stringify(t)} in a building`).toBe(false);
+      expect(occ.blockedForBelt(t.point.x, t.point.y, 0), `tap ${JSON.stringify(t)} blocked`).toBe(false);
+    }
+
+    // the ground a tap needs (itself and the nodes before and after it) is not another net's
+    const owner = new Map<string, { net: number; axis: string }>();
+    for (const t of res.taps) {
+      for (const c of needed(t)) {
+        const o = owner.get(c);
+        if (o) {
+          expect(o.net, `cell ${c} is needed by nets ${o.net} and ${t.netId}`).toBe(t.netId);
+          expect(o.axis).toBe(t.axis);
+        }
+        owner.set(c, { net: t.netId, axis: t.axis });
+      }
+    }
+  });
+
+  it('gives each station end of a net one port of its station, at the port first lattice point outside', async () => {
+    const net = await processorNetlist();
+    const placement = constructivePlacement(net, data, 2);
+    const res = ok(assignTaps(net, placement, occupancyOf(placement.buildings), data, effects));
+
+    const expected: { netId: number; end: 'source' | 'sink'; idx: number }[] = [];
+    for (const n of net.nets) {
+      if (n.source.kind === 'station') expected.push({ netId: n.id, end: 'source', idx: n.source.stationIdx });
+      if (n.sink.kind === 'station') expected.push({ netId: n.id, end: 'sink', idx: n.sink.stationIdx });
+    }
+    expect(expected.length).toBeGreaterThan(0);
+    expect(res.stationPorts).toHaveLength(expected.length);
+    const used = new Set<string>();
+    for (const e of expected) {
+      const p = res.stationPorts.find((x) => x.netId === e.netId && x.end === e.end);
+      expect(p, `net ${e.netId} ${e.end}`).toBeDefined();
+      expect(p!.stationBuildingId).toBe(stationBuildingId(e.idx));
+      const k = `${p!.stationBuildingId}:${p!.port}`;
+      expect(used.has(k), `port ${k} used twice`).toBe(false);
+      used.add(k);
+      const st = placement.buildings.find((b) => b.id === p!.stationBuildingId) as PlacedBuilding;
+      const info = portInfos(st, buildingDef(data, st.itemId))[p!.port];
+      expect(p!.point).toEqual(info.firstOutside);
+      expect(p!.dir).toEqual(info.dir);
+    }
+  });
+
+  it('is deterministic', async () => {
+    const net = await processorNetlist();
+    const placement = constructivePlacement(net, data, 2);
+    const a = assignTaps(net, placement, occupancyOf(placement.buildings), data, effects);
+    const b = assignTaps(net, placement, occupancyOf(placement.buildings), data, effects);
+    expect(a).toEqual(b);
+  });
+});
+
+describe('assignTaps spans', () => {
+  const oneTap = (rate: number, dir: 'in' | 'out' = 'out'): Netlist =>
+    synthNetlist(
+      [{ building: ASSEMBLER, count: 1 }],
+      [],
+      [{ taps: [{ machineId: 1, itemId: 1001, dir, rate, sorters: 1 }], rate }],
+      2011,
+    );
+
+  it('uses span 1 when it can', () => {
+    const { buildings, placement } = lone(ASSEMBLER);
+    const res = ok(assignTaps(oneTap(1.0), placement, occupancyOf(buildings), data, effects));
+    expect(res.taps).toHaveLength(1);
+    expect(res.taps[0].span).toBe(1);
+    expect(res.taps[0].rate).toBeCloseTo(1.0, 9);
+  });
+
+  it('a span-2 choice raises the sorter count when one span-2 sorter cannot carry the rate', () => {
+    const { buildings, placement } = lone(ASSEMBLER);
+    // Mk.I from a building: 1.5/s at span 1, 0.75/s at span 2
+    expect(sorterRate(2011, 1, 0, effects, data)).toBeCloseTo(1.5, 9);
+    expect(sorterRate(2011, 2, 0, effects, data)).toBeCloseTo(0.75, 9);
+    const occ = new BlockingOccupancy(buildings, spanOnePoints(buildings[0]));
+    const res = ok(assignTaps(oneTap(1.0), placement, occ, data, effects));
+    expect(res.taps).toHaveLength(2);
+    for (const t of res.taps) {
+      expect(t.span).toBe(2);
+      expect(t.rate).toBeLessThanOrEqual(0.75 * (1 + 1e-9));
+    }
+    expect(res.taps.reduce((s, t) => s + t.rate, 0)).toBeCloseTo(1.0, 9);
+    expect(new Set(res.taps.map((t) => t.slot)).size).toBe(2);
+    // the sorters are listed in order
+    expect(res.taps.map((t) => t.sorterIndex)).toEqual([0, 1]);
+  });
+
+  it('falls back to span 3 when spans 1 and 2 are blocked', () => {
+    const { buildings, placement } = lone(ASSEMBLER);
+    const info = slotInfos(buildings[0], buildingDef(data, ASSEMBLER));
+    const blocked = info.flatMap((s) => [sorterTapPoint(s, 1), sorterTapPoint(s, 2)]);
+    const res = ok(assignTaps(oneTap(0.5), placement, new BlockingOccupancy(buildings, blocked), data, effects));
+    expect(res.taps.every((t) => t.span === 3)).toBe(true);
+    expect(res.taps.reduce((s, t) => s + t.rate, 0)).toBeCloseTo(0.5, 9);
+  });
+
+  it('counts sorters picking from a belt at the belt stack, not as building picks', () => {
+    const { buildings, placement } = lone(ASSEMBLER);
+    // Mk.I from a stack-1 belt carries 1 item per trip, as from a building: still 1.5/s at span 1
+    const res = ok(assignTaps(oneTap(1.4, 'in'), placement, occupancyOf(buildings), data, effects));
+    expect(res.taps).toHaveLength(1);
+    expect(res.taps[0].dir).toBe('in');
+  });
+
+  it('allocates more slots when the rate needs them', () => {
+    const { buildings, placement } = lone(ASSEMBLER);
+    const res = ok(assignTaps(oneTap(4.0), placement, occupancyOf(buildings), data, effects));
+    // 4.0 / 1.5 -> 3 sorters at span 1
+    expect(res.taps).toHaveLength(3);
+    expect(new Set(res.taps.map((t) => t.slot)).size).toBe(3);
+  });
+});
+
+describe('assignTaps slot rules', () => {
+  it('skips slots whose tap point is blocked for belts by their own building (Oil Refinery north face)', () => {
+    const { buildings, placement } = lone(REFINERY);
+    const net = synthNetlist(
+      [{ building: REFINERY, count: 1 }],
+      [],
+      [{ taps: [{ machineId: 1, itemId: 1001, dir: 'out', rate: 3, sorters: 2 }], rate: 3 }],
+      2011,
+    );
+    const occ = occupancyOf(buildings);
+    // premise: the refinery north slots' first lattice point outside is blocked for belts
+    const info = slotInfos(buildings[0], buildingDef(data, REFINERY));
+    expect(occ.blockedForBelt(info[1].firstOutside.x, info[1].firstOutside.y, 0)).toBe(true);
+    const res = ok(assignTaps(net, placement, occ, data, effects));
+    expect(res.taps.length).toBeGreaterThanOrEqual(2);
+    for (const t of res.taps) {
+      expect(occ.blockedForBelt(t.point.x, t.point.y, 0)).toBe(false);
+      if (t.slot <= 2) expect(t.span).toBeGreaterThanOrEqual(2);
+    }
+    // span-1 slots exist elsewhere, so none of the north slots is used at span 1
+    expect(res.taps.filter((t) => t.slot <= 2 && t.span === 1)).toEqual([]);
+  });
+
+  it('prefers slots facing the other taps of the net', () => {
+    const net = synthNetlist(
+      [{ building: ASSEMBLER, count: 2 }],
+      [],
+      [
+        {
+          taps: [
+            { machineId: 1, itemId: 1001, dir: 'out', rate: 0.5, sorters: 1 },
+            { machineId: 2, itemId: 1001, dir: 'in', rate: 0.5, sorters: 1 },
+          ],
+        },
+      ],
+    );
+    const a: PlacedBuilding = { id: placementBuildingIdOf(1), itemId: ASSEMBLER, x: 0, y: 0, z: 0, yaw: 0 };
+    const b: PlacedBuilding = { id: placementBuildingIdOf(2), itemId: ASSEMBLER, x: 20, y: 0, z: 0, yaw: 0 };
+    const placement: Placement = { buildings: [a, b], cost: 0 };
+    const res = ok(assignTaps(net, placement, occupancyOf([a, b]), data, effects));
+    const fromA = res.taps.find((t) => t.machineId === 1) as AssignedTap;
+    const fromB = res.taps.find((t) => t.machineId === 2) as AssignedTap;
+    const infoA = slotInfos(a, buildingDef(data, ASSEMBLER))[fromA.slot];
+    const infoB = slotInfos(b, buildingDef(data, ASSEMBLER))[fromB.slot];
+    expect(infoA.dir).toEqual([1, 0]);
+    expect(infoB.dir).toEqual([-1, 0]);
+  });
+
+  it('gives two taps of the same item from different nets distinct slots and keeps their ground apart', () => {
+    const tap = (dir: 'in' | 'out') => ({ machineId: 1, itemId: 1001, dir, rate: 0.5, sorters: 1 });
+    const net = synthNetlist([{ building: SMELTER, count: 1 }], [], [{ taps: [tap('out')] }, { taps: [tap('out')] }]);
+    const { buildings, placement } = lone(SMELTER);
+    const res = ok(assignTaps(net, placement, occupancyOf(buildings), data, effects));
+    expect(res.taps).toHaveLength(2);
+    expect(res.taps[0].slot).not.toBe(res.taps[1].slot);
+    const [a, b] = res.taps.map(needed);
+    expect(a.filter((c) => b.includes(c))).toEqual([]);
+  });
+
+  it('fails with a message naming the machine when it runs out of slots', () => {
+    const { buildings, placement } = lone(SMELTER);
+    const net = synthNetlist(
+      [{ building: SMELTER, count: 1 }],
+      [],
+      [{ taps: [{ machineId: 1, itemId: 1001, dir: 'out', rate: 100, sorters: 67 }], rate: 100 }],
+    );
+    const res = assignTaps(net, placement, occupancyOf(buildings), data, effects);
+    expect(res).toHaveProperty('failed');
+    expect((res as { failed: string }).failed).toMatch(/machine 1/);
+    expect((res as { failed: string }).failed).toMatch(/slot/);
+  });
+
+  it('treats the slots of a skew building as unusable, with a clear message', () => {
+    const skew = { position: [1.11, 0, 0] as [number, number, number], rotation: [0, Math.sin(Math.PI / 12), 0, Math.cos(Math.PI / 12)] as [number, number, number, number] };
+    const patched = patchBuilding(fixtureData, ASSEMBLER, (b) => ({
+      ...b,
+      geometry: { ...b.geometry, slots: b.geometry.slots.map((s, i) => (i === 3 ? skew : s)) },
+    }));
+    const { buildings, placement } = lone(ASSEMBLER);
+    const net = synthNetlist(
+      [{ building: ASSEMBLER, count: 1 }],
+      [],
+      [{ taps: [{ machineId: 1, itemId: 1001, dir: 'out', rate: 0.5, sorters: 1 }] }],
+    );
+    const res = assignTaps(net, placement, occupancyOf(buildings), patched, effects);
+    expect(res).toHaveProperty('failed');
+    expect((res as { failed: string }).failed).toMatch(/machine 1/);
+    expect((res as { failed: string }).failed).toMatch(/axis/);
+  });
+
+  it('fails when a station has no free port', () => {
+    const net = synthNetlist(
+      [{ building: ASSEMBLER, count: 1 }],
+      [PLS],
+      Array.from({ length: 13 }, () => ({
+        source: { kind: 'station' as const, stationIdx: 0 },
+        taps: [{ machineId: 1, itemId: 1001, dir: 'in' as const, rate: 0.01, sorters: 1 }],
+      })),
+    );
+    const station: PlacedBuilding = { id: stationBuildingId(0), itemId: PLS, x: 0, y: 0, z: 0, yaw: 0, role: 'station:0' };
+    const m: PlacedBuilding = { id: placementBuildingIdOf(1), itemId: ASSEMBLER, x: 30, y: 0, z: 0, yaw: 0 };
+    const res = assignTaps(net, { buildings: [station, m], cost: 0 }, occupancyOf([station, m]), data, effects);
+    expect(res).toHaveProperty('failed');
+    expect((res as { failed: string }).failed).toMatch(/port/);
+  });
+});
