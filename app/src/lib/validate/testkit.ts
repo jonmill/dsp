@@ -3,6 +3,7 @@
 // rest of the validator.
 import { computeTechEffects, GameDataIndex } from '../data';
 import type { Building, TechEffects } from '../data';
+import type { ProductionPlan, Stage } from '../calc';
 import { loadFixtureGameData } from '../../../test/fixtures/fixtureGameData';
 import { slotInfos, sorterTapPoint } from '../geometry';
 import type {
@@ -86,6 +87,53 @@ export function stationConfig(slots = 1): StationConfig {
     ports: Array.from({ length: 12 }, (_, i) => ({ dir: i === 0 && slots > 0 ? 1 : 0, storageIdx: i === 0 && slots > 0 ? 1 : 0 })),
     chargePerTick: 0,
     pilerCount: 1,
+  };
+}
+
+/** A plan stage for `recipeId` with one machine at full utilization; `over` sets the rest (inputs, machines, ...). */
+export function planStage(recipeId: number, over: Partial<Stage> = {}): Stage {
+  return {
+    recipeId,
+    buildingItemId: ITEM.assembler,
+    machines: 1,
+    exactMachines: 1,
+    craftsPerSecond: 1,
+    utilization: 1,
+    inputs: [],
+    outputs: [],
+    perMachineCraftsPerSecond: 1,
+    proliferated: false,
+    effectiveSpeed: 1,
+    workPowerW: 0,
+    idlePowerW: 0,
+    ...over,
+  };
+}
+
+/** A minimal plan around `stages`: only the stages are meaningful, the rest is empty. */
+export function planOf(stages: Stage[]): ProductionPlan {
+  return {
+    request: {
+      targetItemId: 1101,
+      quantity: { kind: 'rate', perSecond: 1 },
+      finalFacilityItemId: ITEM.assembler,
+      unlockedTechs: new Set(),
+      suppliedItemIds: new Set(),
+      facilityOverrides: {},
+      recipeOverrides: {},
+      proliferator: { tier: 0, mode: 'extra' },
+      stationKind: 'interstellar',
+    },
+    stages,
+    flows: [],
+    imports: [],
+    exports: [],
+    actualTargetRate: 1,
+    stationSlots: [],
+    stationsNeeded: 1,
+    proliferatorPerSecond: 0,
+    power: { productionWorkW: 0, productionIdleW: 0, sortersW: 0, coatersW: 0, stationChargeW: 0, steadyW: 0, peakW: 0 },
+    warnings: [],
   };
 }
 
