@@ -87,6 +87,18 @@ def find_ilspycmd() -> str | None:
     return shutil.which("ilspycmd")
 
 
+def _first_line(*streams: bytes | str | None) -> str:
+    """The first non-empty line (at most 300 characters) of the first stream that has text; `""` if none does."""
+    for data in streams:
+        if data is None:
+            continue
+        text = data if isinstance(data, str) else data.decode("utf-8", errors="replace")
+        for line in text.splitlines():
+            if line.strip():
+                return line.strip()[:300]
+    return ""
+
+
 def decompile_types(
     ilspy: str,
     managed_dir: Path,
@@ -99,9 +111,11 @@ def decompile_types(
 
     Runs `ilspycmd --disable-updatecheck -r <managed_dir> -t <Type> <managed_dir>/Assembly-CSharp.dll` once per
     type. A type that fails (not in this game version, ilspycmd error, no output, `timeout` seconds exceeded)
-    is a warning on `report` and is left out of the result; the others still decompile. Only the problems that
-    affect every type raise `ExtractError`: no Assembly-CSharp.dll, or an ilspycmd that cannot be started.
-    The result maps type name -> written file. Files are written with `\\n` line endings.
+    is a warning on `report` (with the first line of ilspycmd's stderr, or of its stdout when stderr is empty,
+    also on a timeout) and is left out of the result; the others still decompile. Problems that affect every
+    type raise `ExtractError`: no Assembly-CSharp.dll, an ilspycmd that cannot be started, or no type at all
+    decompiling (the message carries the first failure). The result maps type name -> written file. Files are
+    written with `\\n` line endings.
     """
     managed_dir = Path(managed_dir)
     out_dir = Path(out_dir)
@@ -127,15 +141,14 @@ def decompile_types(
         command = [ilspy, "--disable-updatecheck", "-r", str(managed_dir), "-t", type_name, str(dll)]
         try:
             proc = subprocess.run(command, capture_output=True, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            fail(type_name, f"timed out after {timeout:g} s")
+        except subprocess.TimeoutExpired as exc:
+            partial = _first_line(exc.stderr, exc.stdout)
+            fail(type_name, f"timed out after {timeout:g} s" + (f": {partial}" if partial else ""))
             continue
         except OSError as exc:
             raise ExtractError(f"cannot run ilspycmd ({ilspy}): {exc}") from exc
         if proc.returncode != 0:
-            stderr_lines = proc.stderr.decode("utf-8", errors="replace").strip().splitlines()
-            message = stderr_lines[0][:300] if stderr_lines else "no error text"
-            fail(type_name, f"exit code {proc.returncode}: {message}")
+            fail(type_name, f"exit code {proc.returncode}: {_first_line(proc.stderr, proc.stdout) or 'no error text'}")
             continue
         text = proc.stdout.decode("utf-8-sig", errors="replace").replace("\r\n", "\n")
         if not text.strip():
@@ -147,6 +160,9 @@ def decompile_types(
     if report is not None:
         report.set("decompile", {"ilspycmd": ilspy, "decompiled": list(result), "failed": failed})
         report.info(f"decompiled {len(result)} of {len(types)} types with ilspycmd")
+    if types and not result:
+        first_type, first_reason = next(iter(failed.items()))
+        raise ExtractError(f"ilspycmd produced no output for any type: {first_type}: {first_reason}")
     return result
 
 

@@ -383,10 +383,12 @@ def test_drift_report_accepts_the_empty_file_on_either_side():
 
 
 def test_the_committed_fingerprints_file_is_accepted():
+    # `{}` until a real extraction run commits fingerprints; afterwards the documented format
     committed = json.loads((REPO_ROOT / "data" / "fingerprints.json").read_text(encoding="utf-8"))
-    assert committed == {}
-    assert drift_report(committed, committed, MIRRORED) == []
-    assert {e.status for e in drift_report(committed, doc(**{"CargoPath.Update": "aa"}), MIRRORED)} == {"new"}
+    assert isinstance(committed, dict)
+    assert committed == {} or (isinstance(committed["gameVersion"], str) and isinstance(committed["methods"], dict))
+    entries = drift_report(committed, committed, MIRRORED)
+    assert [e for e in entries if e.status in ("changed", "missing")] == []
 
 
 def test_malformed_fingerprint_files_fail_loudly():
@@ -452,9 +454,30 @@ def test_build_fingerprints_hashes_every_found_method_and_warns_about_the_rest()
 
 # ---- mirrored methods / type list -------------------------------------------------------------------
 
+INITIAL_MIRRORED = {
+    "BlueprintData.Export",
+    "BlueprintData.Import",
+    "MD5F.Compute",
+    "CargoPath.Update",
+    "CargoPath.TryInsertItem",
+    "CargoPath.TryPickItem",
+    "CargoPath.TryInsertItemAtHeadAndFillBlank",
+    "InserterComponent.InternalUpdate",
+    "AssemblerComponent.InternalUpdate",
+    "AssemblerComponent.UpdateNeeds",
+    "SpraycoaterComponent.InternalUpdate",
+    "StationComponent.UpdateOutputSlots",
+    "StationComponent.UpdateInputSlots",
+    "PowerSystem.GameTick",
+    "LabComponent.InternalUpdateAssemble",
+    "BuildTool_Click.CheckBuildConditions",
+    "BuildTool_Path.CheckBuildConditions",
+    "BuildTool_Inserter.CheckBuildConditions",
+}
+
 
 def test_every_mirrored_method_is_named_type_dot_method_and_has_a_ts_module():
-    assert len(MIRRORED) == 18
+    assert INITIAL_MIRRORED <= set(MIRRORED)  # later tasks append entries
     for method, module in MIRRORED.items():
         type_name, _, name = method.rpartition(".")
         assert type_name and name, method
@@ -502,6 +525,13 @@ if type_name == "Boom":
     sys.exit(70)
 if type_name == "Empty":
     sys.exit(0)
+if type_name == "Silent":
+    sys.stdout.write("ERROR: type Silent was not found\\n")
+    sys.exit(1)
+if type_name == "Chatty":
+    sys.stderr.write("Loading assemblies for Chatty...\\n")
+    sys.stderr.flush()
+    time.sleep(30)
 sys.stdout.write("public class " + type_name + "\\r\\n{{\\r\\n\\tpublic int " + type_name.lower() + ";\\r\\n}}\\r\\n")
 """
 
@@ -567,8 +597,32 @@ def test_decompile_types_works_without_a_report_and_rejects_unsafe_type_names(fa
     assert list(result) == ["CargoPath"]
     assert not (tmp_path / "escape.cs").exists()
     report = Report()
-    decompile_types(str(exe), managed, ["../escape"], tmp_path / "out", report)
+    with pytest.raises(ExtractError, match="no output for any type"):
+        decompile_types(str(exe), managed, ["../escape"], tmp_path / "out", report)
     assert any("../escape" in w for w in report.warnings)
+
+
+def test_failures_report_stdout_when_stderr_is_empty_and_partial_stderr_on_timeout(fake_ilspy, tmp_path):
+    exe, managed, _ = fake_ilspy
+    report = Report()
+    result = decompile_types(str(exe), managed, ["Silent", "Chatty", "CargoPath"], tmp_path / "out", report, timeout=1.5)
+    assert list(result) == ["CargoPath"]
+    assert any("Silent" in w and "exit code 1" in w and "ERROR: type Silent was not found" in w for w in report.warnings)
+    assert any("Chatty" in w and "timed out" in w and "Loading assemblies for Chatty" in w for w in report.warnings)
+    assert report.get("decompile")["failed"]["Silent"].startswith("exit code 1")
+
+
+def test_no_type_decompiling_at_all_is_an_error_carrying_the_first_failure(fake_ilspy, tmp_path):
+    exe, managed, _ = fake_ilspy
+    report = Report()
+    with pytest.raises(ExtractError, match="produced no output for any type") as raised:
+        decompile_types(str(exe), managed, ["Boom", "Empty"], tmp_path / "out", report)
+    assert "Boom" in str(raised.value) and "Could not find type definition Boom" in str(raised.value)
+    assert len(report.warnings) == 2  # the per-type detail is still in the report
+    assert sorted(report.get("decompile")["failed"]) == ["Boom", "Empty"]
+    with pytest.raises(ExtractError, match="no output"):
+        decompile_types(str(exe), managed, ["Empty"], tmp_path / "out")
+    assert decompile_types(str(exe), managed, [], tmp_path / "out") == {}  # nothing asked for, nothing failed
 
 
 def test_missing_assembly_or_unrunnable_ilspycmd_fails_loudly(fake_ilspy, tmp_path):
