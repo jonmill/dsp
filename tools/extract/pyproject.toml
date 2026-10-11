@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dsp-extract"
+version = "0.1.0"
+description = "Extract Dyson Sphere Program game data into the DSP Factory Planner GameData JSON"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+game = [
+  "UnityPy>=1.20",
+  "TypeTreeGeneratorAPI>=0.0.10",
+]
+dev = [
+  "pytest",
+  "jsonschema",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

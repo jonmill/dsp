@@ -19,3 +19,9 @@ docs/research/datasets/
 
 # SDD workspace
 .superpowers/
+
+# Scaffold build/test artifacts
+app/node_modules/
+app/dist/
+tools/extract/.venv/
+.pytest_cache/
