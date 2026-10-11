@@ -31,10 +31,55 @@ class FakeTarget implements InsertTarget {
   }
 }
 
+/** A target that also answers `needsAny`, as a building model should. */
+class AnyTarget extends FakeTarget {
+  /** Whether the building needs anything at all. */
+  wantAny = true;
+  needsAny(): boolean {
+    return this.wantAny;
+  }
+}
+
+/**
+ * A two-ingredient assembler (1 s recipe, buffers capped by the `needs` threshold of 4) that implements the target
+ * interface the way a building model should: per-item `needs`, and `needsAny` for the sorter's wait.
+ */
+class Assembler implements InsertTarget {
+  readonly careNeeds = true;
+  readonly served = new Map<number, number>([
+    [1, 0],
+    [2, 0],
+  ]);
+  progress = 0;
+  crafts = 0;
+  needsAny?: () => boolean;
+  constructor(withNeedsAny: boolean) {
+    if (withNeedsAny) this.needsAny = () => this.needs(1) || this.needs(2);
+  }
+  needs(item: number): boolean {
+    return (this.served.get(item) ?? 0) < 4;
+  }
+  insert(item: number, count: number): boolean {
+    this.served.set(item, (this.served.get(item) ?? 0) + count);
+    return true;
+  }
+  tick(): void {
+    if (this.served.get(1)! >= 1 && this.served.get(2)! >= 1) {
+      if (++this.progress >= 60) {
+        this.progress = 0;
+        this.crafts++;
+        this.served.set(1, this.served.get(1)! - 1);
+        this.served.set(2, this.served.get(2)! - 1);
+      }
+    }
+  }
+}
+
 /** A building output with `left` single products (or stacks of `stack`) to give away. */
 class Supply implements PickSource {
   pickCalls = 0;
-  firstPickCallTick = -1;
+  /** `tick` at each `pickProduct` call. */
+  callTicks: number[] = [];
   lastAccept: ((item: number) => boolean) | null = null;
   tick = 0;
   constructor(
@@ -45,7 +90,7 @@ class Supply implements PickSource {
   ) {}
   pickProduct(filter: number, accept: (item: number) => boolean) {
     this.pickCalls++;
-    if (this.firstPickCallTick < 0) this.firstPickCallTick = this.tick;
+    this.callTicks.push(this.tick);
     this.lastAccept = accept;
     if (this.left <= 0 || (filter !== 0 && filter !== this.item) || !accept(this.item)) return null;
     this.left--;
@@ -105,13 +150,22 @@ describe('sorterSettings', () => {
     expect(settings(ITEM.sorter.mk3, 3)).toEqual({ grade: 3, stt: 150000, delay: 0, stackInput: 1, stackOutput: 1 });
   });
 
-  it('does not scale the pile sorter stt by span, and takes its stacking from the tech state', () => {
-    expect(settings(ITEM.sorter.pile, 1)).toEqual({ grade: 4, stt: 30000, delay: 40000, stackInput: 2, stackOutput: 1 });
-    expect(settings(ITEM.sorter.pile, 3).stt).toBe(30000);
+  it('scales the pile sorter stt by span too (controller ruling), and takes its stacking from the tech state', () => {
+    expect(settings(ITEM.sorter.pile, 1, fixtureEffects)).toEqual({
+      grade: 4,
+      stt: 30000,
+      delay: 40000,
+      stackInput: 2,
+      stackOutput: 1,
+    });
+    expect(settings(ITEM.sorter.pile, 2).stt).toBe(60000);
+    expect(settings(ITEM.sorter.pile, 3).stt).toBe(90000);
     const maxed = settings(ITEM.sorter.pile, 1, { ...fixtureEffects, inserterStackInput: 4, inserterStackOutput: 3 });
     expect(maxed).toMatchObject({ stackInput: 4, stackOutput: 3, delay: 40000 });
     const single = settings(ITEM.sorter.pile, 1, { ...fixtureEffects, inserterStackInput: 1 });
     expect(single).toMatchObject({ stackInput: 1, delay: 0 });
+    const capped = settings(ITEM.sorter.pile, 1, { ...fixtureEffects, inserterStackInput: 6 });
+    expect(capped.stackInput).toBe(4);
   });
 
   it('never lets stt fall below one tick', () => {
@@ -283,7 +337,7 @@ describe('SorterSim target needs', () => {
     expect(belt.cargoCount()).toBe(1); // the unwanted cargo went on to the rear
   });
 
-  it('backs off 10 ticks after finding that a filtered item is not needed, then polls again', () => {
+  it('skips 9 ticks (idleTick = 9) after finding that a filtered item is not needed, then polls again', () => {
     const supply = new Supply();
     const target = new FakeTarget();
     const sorter = new SorterSim(configOf(ITEM.sorter.mk3, 1, supply, target, ORE));
@@ -294,7 +348,7 @@ describe('SorterSim target needs', () => {
       target.needing = t >= 5;
       t++;
     });
-    expect(supply.firstPickCallTick).toBe(10);
+    expect(supply.callTicks[0]).toBe(10);
     expect(supply.pickCalls).toBeGreaterThanOrEqual(1);
     expect(sorter.stage).toBe('sending');
   });
@@ -349,6 +403,135 @@ describe('SorterSim target needs', () => {
   });
 });
 
+describe('SorterSim back-off', () => {
+  it('skips 10 ticks (idleTick = 10, not 9) when a pile sorter holding an item finds the target needs nothing', () => {
+    const supply = new Supply();
+    const target = new FakeTarget();
+    const settings = configOf(ITEM.sorter.pile, 1, supply, target, ORE, { ...fixtureEffects, inserterStackInput: 2 });
+    const sorter = new SorterSim(settings);
+    let t = 0;
+    run(sorter, 20, [], 1, () => {
+      supply.tick = t;
+      target.needing = t !== 1; // wanted on tick 0 (the first pick), not on tick 1, wanted again from tick 2
+      t++;
+    });
+    // Tick 1 sees needs false while holding one item: idleTick = 10, so ticks 2 to 11 are skipped.
+    expect(supply.callTicks.slice(0, 2)).toEqual([0, 12]);
+  });
+
+  it('delays the next pick by 10 ticks after a blocked insert, because Inserting also sets idleTick', () => {
+    const supply = new Supply();
+    const target = new FakeTarget();
+    const sorter = new SorterSim(configOf(ITEM.sorter.mk3, 1, supply, target, ORE));
+    let t = 0;
+    run(sorter, 30, [], 1, () => {
+      supply.tick = t;
+      target.needing = t !== 5; // not wanted on the first Inserting tick only
+      t++;
+    });
+    // Picked on tick 0, Inserting from tick 5: blocked on tick 5, inserts on tick 6, Picking again from tick 11. The
+    // Inserting stage left idleTick at 10, so the pick that would come on tick 11 comes on tick 21.
+    expect(target.calls.length).toBeGreaterThanOrEqual(1);
+    expect(supply.callTicks.slice(0, 2)).toEqual([0, 21]);
+  });
+});
+
+describe('SorterSim with a target that reports needsAny', () => {
+  it('backs off when the target needs nothing even though it has no filter', () => {
+    const supply = new Supply();
+    const target = new AnyTarget();
+    target.wantAny = false;
+    const sorter = new SorterSim(configOf(ITEM.sorter.mk3, 1, supply, target, 0));
+    let t = 0;
+    run(sorter, 14, [], 1, () => {
+      supply.tick = t;
+      target.wantAny = t >= 5;
+      t++;
+    });
+    expect(supply.callTicks).toEqual([10]); // looked on tick 0 (idleTick = 9), skipped ticks 1 to 9
+  });
+
+  it('inserts what it holds as soon as the target needs anything, whatever that item is', () => {
+    const supply = new Supply();
+    const target = new AnyTarget();
+    target.only = 9999; // the held item is no longer wanted...
+    const sorter = new SorterSim(configOf(ITEM.sorter.mk3, 1, supply, target, ORE));
+    target.only = null;
+    run(sorter, 4); // pick on tick 0, Sending
+    target.only = 9999;
+    target.wantAny = true; // ...but something else is
+    run(sorter, 20);
+    expect(target.calls[0]).toEqual({ item: ORE, count: 1, inc: 0 });
+  });
+
+  it('waits to insert only while the target needs nothing at all', () => {
+    const supply = new Supply();
+    const target = new AnyTarget();
+    const sorter = new SorterSim(configOf(ITEM.sorter.mk3, 1, supply, target, ORE));
+    run(sorter, 4);
+    target.wantAny = false;
+    run(sorter, 20);
+    expect(sorter.stage).toBe('inserting');
+    expect(target.items).toBe(0);
+    target.wantAny = true;
+    run(sorter, 1);
+    expect(target.items).toBe(1);
+  });
+
+  describe('a stacking sorter on a belt that alternates two ingredients', () => {
+    // Pile sorter loading 3 from a belt of 1-stack cargo, 6 of item 1 then 6 of item 2, into a two-ingredient
+    // assembler. With the per-item gate it picks 3 of item 1, inserts one, and then waits for "item 1 needed" while
+    // the assembler waits for item 2: a deadlock. With `needsAny` it delivers all three and carries on.
+    function mixedBeltRun(withNeedsAny: boolean) {
+      const belt = new BeltSim(600, 5);
+      const asm = new Assembler(withNeedsAny);
+      asm.served.set(1, 3);
+      const sorter = new SorterSim({
+        pick: { belt, cell: 300 },
+        drop: asm,
+        filter: 0,
+        grade: 4,
+        stt: 30000,
+        delay: 40000,
+        stackInput: 3,
+        stackOutput: 1,
+      });
+      let k = 0;
+      const trace: string[] = [];
+      for (let t = 0; t < 6000; t++) {
+        if (t % 2 === 0) belt.tryInsertAtHead({ item: (Math.floor(k++ / 6) % 2) + 1, stack: 1, inc: 0 });
+        sorter.tick(1);
+        asm.tick();
+        belt.update();
+        belt.tryPickRear(0);
+        if (t % 50 === 0) trace.push(`${sorter.stage}:${sorter.itemsMoved}:${asm.crafts}`);
+      }
+      return { asm, sorter, trace };
+    }
+
+    it('does not deadlock', () => {
+      const { asm, sorter } = mixedBeltRun(true);
+      expect(asm.crafts).toBeGreaterThan(50); // 100 crafts is the assembler's limit in 6000 ticks
+      expect(sorter.itemsMoved).toBeGreaterThan(100);
+    });
+
+    it('is deterministic: two identical runs end in the same state', () => {
+      const a = mixedBeltRun(true);
+      const b = mixedBeltRun(true);
+      expect(b.trace).toEqual(a.trace);
+      expect(b.asm.crafts).toBe(a.asm.crafts);
+      expect([...b.asm.served]).toEqual([...a.asm.served]);
+      expect(b.sorter.itemsMoved).toBe(a.sorter.itemsMoved);
+    });
+
+    it('stalls without needsAny, which is why building models implement it', () => {
+      const { asm, sorter } = mixedBeltRun(false);
+      expect(asm.crafts).toBe(0);
+      expect(sorter.stage).toBe('inserting');
+    });
+  });
+});
+
 describe('SorterSim pile sorter', () => {
   const pileConfig = (
     pick: SorterConfig['pick'],
@@ -383,28 +566,46 @@ describe('SorterSim pile sorter', () => {
     expect(target.items % 4).toBe(0);
   });
 
-  it('unloads a saturated Mk.III belt of 1-stack cargo at base upgrade level at 12 to 15 items/s (wiki: 800/min)', () => {
-    // A cargo every 2 ticks passes the sorter, which loads 2 and unstacks 2: 8 or 9 ticks per trip depending on
-    // how the stream's phase meets the 5-cell pick window.
+  /**
+   * Items/s a base-level pile sorter (loads 2, unstacks 1) takes from a saturated Mk.III belt of 1-stack cargo at
+   * `span`, with its pick cell at `cell`. A cargo passes every 2 ticks; how the stream's phase meets the 5-cell pick
+   * window decides whether the second pick follows one tick or more after the first.
+   */
+  function pileRate(span: number, cell: number): number {
     const belt = new BeltSim(300, 5);
     const target = new FakeTarget();
-    const sorter = new SorterSim(
-      configOf(ITEM.sorter.pile, 1, { belt, cell: 100 }, target, 0, {
-        ...fixtureEffects,
-        inserterStackInput: 2,
-        inserterStackOutput: 1,
-      }),
-    );
+    const config = configOf(ITEM.sorter.pile, span, { belt, cell }, target, 0, {
+      ...fixtureEffects,
+      inserterStackInput: 2,
+      inserterStackOutput: 1,
+    });
+    const sorter = new SorterSim(config);
     const feed = () => {
       belt.tryInsertAtHead({ item: ORE, stack: 1, inc: 0 });
       belt.tryPickRear(0);
     };
     run(sorter, WARMUP, [belt], 1, feed);
     const before = target.items;
-    run(sorter, MEASURE, [belt], 1, feed);
-    const rate = ((target.items - before) * 60) / MEASURE;
-    expect(rate).toBeGreaterThanOrEqual(12 * 0.97);
-    expect(rate).toBeLessThanOrEqual(15 * 1.03);
+    run(sorter, 6000, [belt], 1, feed);
+    return ((target.items - before) * 60) / 6000;
+  }
+
+  it.each([
+    // [span, items/s with back-to-back picks, items/s with the slowest phase, wiki Lv0 items/min]
+    { span: 1, fast: 15, slow: 12, wiki: 800 },
+    { span: 2, fast: 60 / 7, slow: 7.5, wiki: 480 },
+    { span: 3, fast: 6, slow: 60 / 11, wiki: 343 },
+  ])('at span $span unloads a saturated belt at $fast to $slow items/s, around the wiki\'s $wiki/min', ({ span, fast, slow, wiki }) => {
+    // Trip = 2 picks + (2·stt/10000) ticks + 2 inserts: 8, 14, 20 ticks with back-to-back picks.
+    const quick = pileRate(span, 100);
+    expect(quick).toBeGreaterThanOrEqual(fast * 0.99);
+    expect(quick).toBeLessThanOrEqual(fast * 1.01);
+    const lagging = pileRate(span, 102);
+    expect(lagging).toBeGreaterThanOrEqual(slow * 0.99);
+    expect(lagging).toBeLessThanOrEqual(slow * 1.01);
+    // The player-measured figure lies between the two phases.
+    expect(wiki / 60).toBeGreaterThanOrEqual(lagging * 0.99);
+    expect(wiki / 60).toBeLessThanOrEqual(quick * 1.01);
   });
 
   it('leaves after Delay without a new pick, with the items it has', () => {

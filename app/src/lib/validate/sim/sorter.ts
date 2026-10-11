@@ -10,9 +10,12 @@
 // What this port settles where MX §3.2 is open:
 //  - One stage per tick. A tick that ends a stage does no work of the next one, which gives the cycle times the
 //    spec states (Mk.I 40 ticks, Mk.III 10, pile 6).
-//  - "Target needs all zero" is only askable per item through `InsertTarget.needs`. Picking with a filter asks
-//    for that item. Picking with no filter cannot tell, so it skips the back-off and lets the belt scan reject
-//    unwanted items through the `needs` filter. Inserting asks for the held item.
+//  - "Target needs all zero" is `!InsertTarget.needsAny()` when the target offers it (the game's `needs[]` array,
+//    all zero). A target without it can only answer per item through `needs(item)`: picking with a filter then asks
+//    for that item, picking with no filter cannot tell (no back-off; the `needs` filter on the pick rejects unwanted
+//    items), and inserting asks for the held item. That fallback can deadlock a stacking sorter on a mixed belt
+//    (it holds three of an item the target stopped needing while the target waits for another), so building
+//    models should implement `needsAny`.
 //  - Inserting hands the target `itemCount / stackCount` items per tick and repeats until nothing is held (a
 //    non-pile sorter has one stack, so one insertion of the whole cargo; a pile sorter with `StackOutput = 1` thus
 //    unstacks onto a belt, one item per tick, which MX §3.4 says an un-upgraded pile sorter does). With
@@ -38,6 +41,12 @@ export interface InsertTarget {
   needs(item: number): boolean;
   /** True if the sorter must only pick what `needs` allows (assemblers, labs, ...). */
   careNeeds: boolean;
+  /**
+   * Whether the building needs any item at all (the game's `needs[]` is not all zero). Gates the Picking back-off and
+   * the Inserting wait. Without it the sorter falls back to `needs(item)` for one item, which can deadlock a stacking
+   * sorter on a mixed belt.
+   */
+  needsAny?(): boolean;
   /** Add `count` items of `item` carrying `inc` proliferator points. False if the building refuses them. */
   insert(item: number, count: number, inc: number): boolean;
 }
@@ -102,15 +111,17 @@ const ACCEPT_ALL = (): boolean => true;
 /**
  * Timing and stacking for sorter `sorter` placed at `span` grid lengths (1 to 3) under the tech state `effects`.
  *
- * `stt = max(10000, prefab.stt · span)`. The pile sorter's `stt` is not multiplied by span: BF/CYING report that
- * its speed does not depend on length, against the wiki's measured table (MX §3.1, flagged C3; the choice matches
- * `sorterRate` in capacity.ts). Grades 1 to 3 pick and drop one cargo (Mk.III's `inserterStackCountObsolete` is 1 in
- * new saves, so no Delay). The pile sorter loads `inserterStackInput` (at most a cargo, 4), feeds out
+ * `stt = max(10000, prefab.stt · span)` for every grade, the pile sorter included. That is a ruling, not a
+ * measurement: BF/CYING claim the pile sorter's speed does not depend on length, which is unverified (MX §3.1, C3),
+ * while the wiki's player-measured pile table falls with distance. Scaling is the conservative choice, and with a
+ * dense belt it reproduces that table (800 / 480 / 343 items/min at span 1 / 2 / 3). `sorterRate` in capacity.ts
+ * makes the same choice. Grades 1 to 3 pick and drop one cargo (Mk.III's `inserterStackCountObsolete` is 1 in new
+ * saves, so no Delay). The pile sorter loads `inserterStackInput` (at most a cargo, 4), feeds out
  * `inserterStackOutput`, and waits 40000 for more when it loads more than one (MX §3.2).
  */
 export function sorterSettings(sorter: NonNullable<Building['sorter']>, span: number, effects: TechEffects): SorterSettings {
   const pile = sorter.grade === PILE_SORTER_GRADE;
-  const stt = Math.max(MIN_STT, pile ? sorter.stt : sorter.stt * span);
+  const stt = Math.max(MIN_STT, sorter.stt * span);
   if (!pile) return { grade: sorter.grade, stt, delay: sorter.delay, stackInput: 1, stackOutput: 1 };
   const stackInput = Math.min(Math.max(1, effects.inserterStackInput), MAX_CARGO_STACK);
   return {
@@ -255,6 +266,16 @@ export class SorterSim {
     return this.stageNo === SENDING || this.stageNo === RETURNING;
   }
 
+  /**
+   * The "target.needs all zero" test of MX §3.2: `needsAny` says so directly; without it, `item` (0 = unknown, never
+   * a reason to wait) is the only thing that can be asked about.
+   */
+  private needsNothing(item: number): boolean {
+    const target = this.dropTarget!;
+    if (target.needsAny) return !target.needsAny();
+    return item !== 0 && !target.needs(item);
+  }
+
   private tickPicking(step: number): void {
     let filter: number;
     if (this.itemId === 0) {
@@ -263,7 +284,7 @@ export class SorterSim {
           this.idleTick--;
           return;
         }
-        if (this.filter !== 0 && !this.dropTarget!.needs(this.filter)) {
+        if (this.needsNothing(this.filter)) {
           this.idleTick = IDLE_EMPTY;
           return;
         }
@@ -275,7 +296,7 @@ export class SorterSim {
           this.idleTick--;
           return;
         }
-        if (!this.dropTarget!.needs(this.itemId)) {
+        if (this.needsNothing(this.itemId)) {
           this.idleTick = IDLE_HOLDING;
           return;
         }
@@ -322,7 +343,7 @@ export class SorterSim {
   }
 
   private tickInserting(step: number): void {
-    if (this.careNeeds && !this.dropTarget!.needs(this.itemId)) {
+    if (this.careNeeds && this.needsNothing(this.itemId)) {
       this.idleTick = IDLE_HOLDING;
       return;
     }

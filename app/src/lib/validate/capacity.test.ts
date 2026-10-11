@@ -102,10 +102,12 @@ describe('sorterRate', () => {
     expect(sorterRate(ITEM.sorter.mk3, 3, 1, fixtureEffects, data)).toBeCloseTo(20, 12);
   });
 
-  test('a pile sorter ignores span and moves min(inserterStackInput, 4) items per trip from a belt', () => {
-    // stt 30000 -> 6 ticks per round trip -> 10 trips/s, x2 items (base inserterStackInput).
+  test('a pile sorter slows with span like any sorter and moves min(inserterStackInput, 4) items per trip from a belt', () => {
+    // stt 30000 -> 6 ticks per round trip at span 1 -> 10 trips/s, x2 items (base inserterStackInput).
     expect(sorterRate(ITEM.sorter.pile, 1, 1, fixtureEffects, fixtureData)).toBeCloseTo(20, 12);
-    expect(sorterRate(ITEM.sorter.pile, 3, 1, fixtureEffects, fixtureData)).toBeCloseTo(20, 12);
+    // Span 2: stt 60000, 12 ticks, 5 trips/s. Span 3: stt 90000, 18 ticks, 10/3 trips/s (ruling: conservative).
+    expect(sorterRate(ITEM.sorter.pile, 2, 1, fixtureEffects, fixtureData)).toBeCloseTo(10, 12);
+    expect(sorterRate(ITEM.sorter.pile, 3, 1, fixtureEffects, fixtureData)).toBeCloseTo(20 / 3, 12);
     expect(sorterRate(ITEM.sorter.pile, 1, 4, fixtureEffects, fixtureData)).toBeCloseTo(20, 12);
     expect(sorterRate(ITEM.sorter.pile, 1, 1, effectsWith({ inserterStackInput: 3 }), fixtureData)).toBeCloseTo(30, 12);
     expect(sorterRate(ITEM.sorter.pile, 1, 1, effectsWith({ inserterStackInput: 6 }), fixtureData)).toBeCloseTo(40, 12);
@@ -113,6 +115,7 @@ describe('sorterRate', () => {
 
   test('picking from a building moves one item per trip, pile sorter included (stackFromBelt 0)', () => {
     expect(sorterRate(ITEM.sorter.pile, 1, 0, fixtureEffects, fixtureData)).toBeCloseTo(10, 12);
+    expect(sorterRate(ITEM.sorter.pile, 3, 0, fixtureEffects, fixtureData)).toBeCloseTo(10 / 3, 12);
     expect(sorterRate(ITEM.sorter.mk3, 1, 0, fixtureEffects, fixtureData)).toBeCloseTo(6, 12);
   });
 
@@ -215,12 +218,20 @@ describe('RATE_SORTER', () => {
     expect(codesOf(check(lone('plain-belt', ITEM.sorter.mk3, 1, 7).kit, stacked))).toEqual(['RATE_SORTER']);
   });
 
-  test('a pile sorter from a belt moves min(inserterStackInput, 4) per trip; from a building one', () => {
-    expect(check(lone('plain-belt', ITEM.sorter.pile, 2, 20).kit)).toEqual([]);
-    expect(codesOf(check(lone('plain-belt', ITEM.sorter.pile, 2, 21).kit))).toEqual(['RATE_SORTER']);
-    expect(check(lone('plain-belt', ITEM.sorter.pile, 2, 40).kit, effectsWith({ inserterStackInput: 5 }))).toEqual([]);
-    expect(check(lone('building', ITEM.sorter.pile, 2, 10).kit)).toEqual([]);
-    expect(codesOf(check(lone('building', ITEM.sorter.pile, 2, 11).kit))).toEqual(['RATE_SORTER']);
+  test('a pile sorter from a belt moves min(inserterStackInput, 4) per trip; from a building one; span slows it', () => {
+    expect(check(lone('plain-belt', ITEM.sorter.pile, 1, 20).kit)).toEqual([]);
+    expect(codesOf(check(lone('plain-belt', ITEM.sorter.pile, 1, 21).kit))).toEqual(['RATE_SORTER']);
+    expect(check(lone('plain-belt', ITEM.sorter.pile, 2, 10).kit)).toEqual([]);
+    expect(codesOf(check(lone('plain-belt', ITEM.sorter.pile, 2, 11).kit))).toEqual(['RATE_SORTER']);
+    // inserterStackInput 5 is capped at a cargo of 4: span 2 gives 5 trips/s x 4 items.
+    expect(check(lone('plain-belt', ITEM.sorter.pile, 2, 20).kit, effectsWith({ inserterStackInput: 5 }))).toEqual([]);
+    expect(
+      codesOf(check(lone('plain-belt', ITEM.sorter.pile, 2, 21).kit, effectsWith({ inserterStackInput: 5 }))),
+    ).toEqual(['RATE_SORTER']);
+    expect(check(lone('building', ITEM.sorter.pile, 1, 10).kit)).toEqual([]);
+    expect(codesOf(check(lone('building', ITEM.sorter.pile, 1, 11).kit))).toEqual(['RATE_SORTER']);
+    expect(check(lone('building', ITEM.sorter.pile, 2, 5).kit)).toEqual([]);
+    expect(codesOf(check(lone('building', ITEM.sorter.pile, 2, 6).kit))).toEqual(['RATE_SORTER']);
   });
 
   test('a sorter that picks from a belt the layout does not contain is judged at stack 1, not thrown on', () => {

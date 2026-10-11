@@ -45,8 +45,11 @@ export function beltCapacity(tierItemId: number, stack: number, data: GameDataIn
  * Items per second a sorter moves. A round trip takes `2 · max(10000, stt · span) / 10000` ticks and carries
  * `itemsPerTrip` items (MX §3.1, §3.4):
  *  - a non-pile sorter picking from a belt carries that belt's stack (`stackFromBelt`) and one item from a building;
- *  - the pile sorter's `stt` does not grow with span (BF/CYING, flagged C3 in MX §3.1) and it accumulates
- *    `min(effects.inserterStackInput, 4)` items from a belt, one from a building.
+ *  - the pile sorter accumulates `min(effects.inserterStackInput, 4)` items from a belt, one from a building.
+ *
+ * `stt` grows with span for every grade, the pile sorter included. That is a ruling: BF/CYING claim the pile
+ * sorter's speed does not depend on length, but that is unverified (MX §3.1, C3) and the wiki's player-measured pile
+ * table falls with distance, so scaling is the conservative choice (`sorterSettings` in sim/sorter.ts agrees).
  *
  * `stackFromBelt` is the stack of the belt the sorter picks from; pass 0 when it picks from a building.
  * Throws if the item is not a sorter.
@@ -62,7 +65,7 @@ export function sorterRate(
   if (!sorter) throw new Error(`GameData has no sorter for item ${tierItemId}`);
   const pile = sorter.grade === PILE_SORTER_GRADE;
   const fromBelt = stackFromBelt > 0;
-  const stt = pile ? sorter.stt : sorter.stt * span;
+  const stt = sorter.stt * span;
   const roundTripTicks = (2 * Math.max(STT_PER_TICK, stt)) / STT_PER_TICK;
   let itemsPerTrip = 1;
   if (fromBelt) itemsPerTrip = pile ? Math.min(effects.inserterStackInput, MAX_CARGO_STACK) : stackFromBelt;
