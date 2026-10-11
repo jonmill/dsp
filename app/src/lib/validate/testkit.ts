@@ -266,3 +266,29 @@ export function compositeLayout(kit: LayoutKit = new LayoutKit()): Composite {
   const link = kit.sorter(onSlot(asmA, 4), onSlot(asmB, 10));
   return { kit, station, asmA, asmB, tesla, belt, feedA, feedB, outB, link };
 }
+
+/** The pieces of `stationPairLayout`. */
+export interface StationPair {
+  kit: LayoutKit;
+  /** Output port 0 supplies item 1001. */
+  source: PlacedBuilding;
+  /** Input port 1 takes the belt. */
+  sink: PlacedBuilding;
+  /** From the source's port 0 to the sink's port 1, `nodes` nodes long. */
+  belt: BeltPath;
+}
+
+/**
+ * A station that feeds one belt of tier `tier` (`nodes` nodes, east along y = 5) into the input port of a second
+ * station. Geometry-agnostic: for simulator tests, which only look at the topology.
+ */
+export function stationPairLayout(tier: 1 | 2 | 3 = 1, nodes = 10, kit: LayoutKit = new LayoutKit()): StationPair {
+  const source = kit.station(0, 0);
+  const sink = kit.station(40, 0);
+  sink.station!.ports[1] = { dir: 2, storageIdx: 0 };
+  const belt = kit.belt(tier, 1001, line([0, 5], [nodes - 1, 5]), {
+    source: { buildingId: source.id, port: 0 },
+    sink: { kind: 'port', buildingId: sink.id, port: 1 },
+  });
+  return { kit, source, sink, belt };
+}

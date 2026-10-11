@@ -22,6 +22,7 @@ MIRRORED: dict[str, str] = {
     "CargoPath.Update": "app/src/lib/validate/sim/belt.ts",
     "CargoPath.TryInsertItem": "app/src/lib/validate/sim/belt.ts",
     "CargoPath.TryPickItem": "app/src/lib/validate/sim/belt.ts",
+    "CargoPath.TryPickItemAtRear": "app/src/lib/validate/sim/belt.ts",
     "CargoPath.TryInsertItemAtHeadAndFillBlank": "app/src/lib/validate/sim/belt.ts",
     "StationComponent.UpdateOutputSlots": "app/src/lib/validate/sim/station.ts",
     "StationComponent.UpdateInputSlots": "app/src/lib/validate/sim/station.ts",
