@@ -565,6 +565,30 @@ describe('layoutToBlueprint', () => {
     expect(ms).toBeLessThanOrEqual(Date.now() + 1000);
   });
 
+  describe('lab records (BF §4: research mode, proliferator mode)', () => {
+    // A lab with no parameters arrives in game with research mode 0 ("none") and makes nothing.
+    const labRecord = (b: Partial<PlacedBuilding>) =>
+      records(layoutOf({ buildings: [{ id: 1, itemId: 2901, x: 0, y: 0, z: 0, yaw: 0, recipeId: 9, ...b }, tower(2, 4, 0)] }))[0];
+
+    test.each([
+      { name: 'Matrix Lab, extra products by default', over: {}, params: [1, 0] },
+      { name: 'Matrix Lab, extra products', over: { prolifMode: 0 as const }, params: [1, 0] },
+      { name: 'Matrix Lab, speed-up', over: { prolifMode: 1 as const }, params: [1, 1] },
+      { name: 'Self-evolution Lab, speed-up', over: { itemId: 2902, prolifMode: 1 as const }, params: [1, 1] },
+    ])('$name: matrix synthesis (1) then the proliferator mode, the recipe in recipeId', ({ over, params }) => {
+      const rec = labRecord(over);
+      expect(Array.from(rec.parameters)).toEqual(params);
+      expect(rec.recipeId).toBe(9);
+      expect(rec.itemId).toBe(over.itemId ?? 2901);
+      expect(rec.modelIndex).toBe(data.building(over.itemId ?? 2901)?.modelIndex);
+    });
+
+    test('a production building still writes one parameter, the proliferator mode', () => {
+      const rec = records(layoutOf({ buildings: [smelter({ prolifMode: 1 })] }))[0];
+      expect(Array.from(rec.parameters)).toEqual([1]);
+    });
+  });
+
   describe('rejects layouts it cannot express', () => {
     const build = (l: Layout) => () => layoutToBlueprint(l, data, OPTS);
 

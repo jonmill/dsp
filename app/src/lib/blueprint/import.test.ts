@@ -772,7 +772,16 @@ describe('blueprintToLayout: labs', () => {
     expect(layout.buildings[0]).toMatchObject({ itemId: MATRIX_LAB, recipeId: RECIPE, prolifMode });
   });
 
-  test('a lab without parameters has no proliferator mode (the builder writes none)', () => {
+  test.each([0, 1] as const)('a lab the builder wrote reads back with its proliferator mode %i', (prolifMode) => {
+    const layout = layoutOf({
+      buildings: [{ id: 1, itemId: MATRIX_LAB, x: 0, y: 0, z: 0, yaw: 0, recipeId: RECIPE, prolifMode }, tower(2, 4, 0)],
+    });
+    const { bp, layout: back } = roundTrip(layout);
+    expect(Array.from(bp.body.buildings[0].parameters)).toEqual([1, prolifMode]);
+    expect(back.buildings[0]).toMatchObject({ itemId: MATRIX_LAB, recipeId: RECIPE, prolifMode });
+  });
+
+  test('a lab without parameters has no proliferator mode (an old export or a hand edit carries none)', () => {
     const { layout } = blueprintToLayout(labBlueprint([]), data);
     expect(layout.buildings[0].recipeId).toBe(RECIPE);
     expect(layout.buildings[0].prolifMode).toBeUndefined();

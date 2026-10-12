@@ -80,6 +80,9 @@ const STATION_PORTS = 12;
 const STATION_MAX_STORAGES = 5;
 const DRONE_RANGE_50_DEG = 64278761; // round(cos(50°) · 1e8)
 
+/** Lab parameter 0 (BF §4): 0 none, 1 matrix synthesis, 2 research. The planner's labs make matrices from a recipe. */
+const LAB_MODE_MATRIX_SYNTHESIS = 1;
+
 function setParam(p: Int32Array, index: number, value: number, what: string): void {
   if (!Number.isInteger(value) || value < -0x80000000 || value > 0x7fffffff) {
     throw new Error(`${what}: ${value} is not an int32`);
@@ -125,6 +128,8 @@ function buildingRecord(b: PlacedBuilding, ctx: Context): BlueprintBuilding {
   let parameters: Int32Array = new Int32Array(0);
   if (def.kind === 'station') parameters = stationParameters(b, def, b.station);
   else if (def.kind === 'production') parameters = Int32Array.of(b.prolifMode ?? 0);
+  // BF §4: a lab carries [research mode, proliferator mode]. Mode 0 is "none": a lab without it makes nothing in game.
+  else if (def.kind === 'lab') parameters = Int32Array.of(LAB_MODE_MATRIX_SYNTHESIS, b.prolifMode ?? 0);
   return record(b.itemId, def.modelIndex, {
     localOffset: [b.x, b.y, b.z],
     localOffset2: [b.x, b.y, b.z],
