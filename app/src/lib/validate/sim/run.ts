@@ -49,6 +49,14 @@ export interface SimOptions {
    * layout it passes is one that the run without the cap passes too. Ignored when `warmupTicks` is given.
    */
   warmupCapTicks?: number;
+  /**
+   * Whether a result needs no more waiting (for `validateLayout`: that it passes). Asked after each measurement of an
+   * adaptive warm-up. When it says no and a belt or a machine's product buffer was still filling over the window (it
+   * gained a share of its capacity and was not full when the window began), the run warms up on for 36000 ticks and
+   * measures again, up to `MAX_FILL_WARMUP_TICKS` in all: a start-up that is still going on has not been judged.
+   * Omitted: the first measurement stands. Ignored when `warmupTicks` is given.
+   */
+  acceptable?: (result: SimResult) => boolean;
 }
 
 /** `SimOptions.shouldAbort` said yes. */
@@ -133,6 +141,22 @@ const WARMUP_WINDOW_TICKS = 3600;
  * rate by then; the measurement that follows judges a block that is still short.
  */
 export const MAX_WARMUP_TICKS = 72000;
+/**
+ * The longest a run with `SimOptions.acceptable` warms up (200 game minutes). A producer with slack fills the belt of its
+ * product at its surplus, and a stage that shares a scarce input with it runs short meanwhile: a proliferated plan sized
+ * to 98 % of its Refined Oil starves the Plastic stage for 80 game minutes while the Sulfuric Acid belt (232 cargo, 0.06
+ * cargo/s of surplus) fills, and then reads 103 %. The first 20 game minutes of that read 95 % of a layout that is right.
+ */
+export const MAX_FILL_WARMUP_TICKS = 720000;
+/** Ticks a run with `SimOptions.acceptable` warms up on for when a belt still fills (10 game minutes). */
+const FILL_STEP_TICKS = 36000;
+/**
+ * A stock (a belt, or the product buffer of a machine) still fills if it gained this share of its capacity per
+ * `FILL_STEP_TICKS` over the measurement window...
+ */
+const FILL_GAIN = 0.08;
+/** ...and held less than this share of its capacity when it began (the window that fills it up is still a start-up). */
+const FILL_FULL = 0.97;
 /** `SimOptions.shouldAbort` is asked this often (10 game seconds). */
 export const ABORT_CHECK_TICKS = 600;
 /** Two consecutive warm-up windows that each make this share of the provisioned rate end the adaptive warm-up. */
@@ -284,57 +308,92 @@ export function runSimulation(
     }
     if (!settled && opts.warmupCapTicks !== undefined && opts.warmupCapTicks < MAX_WARMUP_TICKS) throw new WarmupNotSettled(warmupTicksUsed);
   }
-  for (const m of machines.list) m.machine.resetStats();
-  const coatersAtStart = coaters.map((c) => ({ sprayed: c.sprayedItems, taken: c.proliferatorTaken }));
-  const receivedAtStart = new Map<number, number>();
-  for (const id of [targetItem, ...exportItems]) receivedAtStart.set(id, received(id));
-  measuring = true;
-  runTicks(measureTicks);
+  // What can fill during a start-up: the belts, and the product buffers of the machines (a smelter holds 100 items).
+  const stocks: { level: () => number; capacity: number }[] = [
+    ...[...world.belts.values()].map((b) => ({ level: () => b.cargoCount(), capacity: b.capacity() })),
+    ...machines.list.map((m) => ({ level: () => m.machine.outputLevel(), capacity: m.machine.outputCapacity() })),
+  ];
+  /** Measure `measureTicks` more ticks: the counters start from zero, the block from the state it is in. */
+  const measure = (): { result: SimResult; filling: boolean } => {
+    for (const m of machines.list) m.machine.resetStats();
+    const coatersAtStart = coaters.map((c) => ({ sprayed: c.sprayedItems, taken: c.proliferatorTaken }));
+    const receivedAtStart = new Map<number, number>();
+    for (const id of [targetItem, ...exportItems]) receivedAtStart.set(id, received(id));
+    const fillAtStart = stocks.map((s) => s.level());
+    sumTick = 0;
+    sumIdleTick = 0;
+    streak = 0;
+    longestStreak = 0;
+    measuring = true;
+    runTicks(measureTicks);
+    measuring = false;
+    const filling = stocks.some(
+      (stock, i) =>
+        fillAtStart[i] < FILL_FULL * stock.capacity &&
+        stock.level() - fillAtStart[i] >= FILL_GAIN * stock.capacity * (measureTicks / FILL_STEP_TICKS),
+    );
 
-  const rate = (itemId: number): number => (received(itemId) - (receivedAtStart.get(itemId) ?? 0)) / measureSeconds;
+    const rate = (itemId: number): number => (received(itemId) - (receivedAtStart.get(itemId) ?? 0)) / measureSeconds;
+    const machineStats: MachineStat[] = machines.list.map((m) => ({
+      buildingId: m.buildingId,
+      stageIndex: m.stageIndex,
+      crafts: m.machine.crafts,
+      busyFraction: m.machine.busyTicks / measureTicks,
+      outputBlockedFraction: m.machine.stalledTicks / measureTicks,
+      starvedFraction: m.machine.starvedTicks / measureTicks,
+    }));
+    const stageStats: StageStat[] = plan.stages.map((stage, stageIndex) => ({
+      stageIndex,
+      crafts: machineStats.reduce((sum, m) => (m.stageIndex === stageIndex ? sum + m.crafts : sum), 0),
+      plannedCrafts: stage.craftsPerSecond * measureSeconds,
+    }));
 
-  const machineStats: MachineStat[] = machines.list.map((m) => ({
-    buildingId: m.buildingId,
-    stageIndex: m.stageIndex,
-    crafts: m.machine.crafts,
-    busyFraction: m.machine.busyTicks / measureTicks,
-    outputBlockedFraction: m.machine.stalledTicks / measureTicks,
-    starvedFraction: m.machine.starvedTicks / measureTicks,
-  }));
-  const stageStats: StageStat[] = plan.stages.map((stage, stageIndex) => ({
-    stageIndex,
-    crafts: machineStats.reduce((sum, m) => (m.stageIndex === stageIndex ? sum + m.crafts : sum), 0),
-    plannedCrafts: stage.craftsPerSecond * measureSeconds,
-  }));
+    let chargePerTick = 0;
+    for (const b of layout.buildings) chargePerTick += b.station?.chargePerTick ?? 0;
+    const stationChargeW = chargePerTick * tps;
 
-  let chargePerTick = 0;
-  for (const b of layout.buildings) chargePerTick += b.station?.chargePerTick ?? 0;
-  const stationChargeW = chargePerTick * tps;
+    let sprayedItems = 0;
+    let proliferatorTaken = 0;
+    coaters.forEach((c, i) => {
+      sprayedItems += c.sprayedItems - coatersAtStart[i].sprayed;
+      proliferatorTaken += c.proliferatorTaken - coatersAtStart[i].taken;
+    });
 
-  let sprayedItems = 0;
-  let proliferatorTaken = 0;
-  coaters.forEach((c, i) => {
-    sprayedItems += c.sprayedItems - coatersAtStart[i].sprayed;
-    proliferatorTaken += c.proliferatorTaken - coatersAtStart[i].taken;
-  });
-
-  return {
-    measuredTargetRate: rate(targetItem),
-    measuredExports: exportItems.map((itemId) => ({ itemId, perSecond: rate(itemId) })),
-    machineStats,
-    stageStats,
-    coaters: { count: coaters.length, sprayedItems, proliferatorPerSecond: proliferatorTaken / measureSeconds },
-    deadlocked: expectsOutput && longestStreak >= DEADLOCK_TICKS,
-    power: {
-      steadyW: (sumTick / measureTicks) * tps,
-      idleW: (sumIdleTick / measureTicks) * tps,
-      peakW: peakTick * tps + stationChargeW,
-      stationChargeW,
-    },
-    measureSeconds,
-    warmupTicksUsed,
-    warnings,
+    return {
+      filling,
+      result: {
+        measuredTargetRate: rate(targetItem),
+        measuredExports: exportItems.map((itemId) => ({ itemId, perSecond: rate(itemId) })),
+        machineStats,
+        stageStats,
+        coaters: { count: coaters.length, sprayedItems, proliferatorPerSecond: proliferatorTaken / measureSeconds },
+        deadlocked: expectsOutput && longestStreak >= DEADLOCK_TICKS,
+        power: {
+          steadyW: (sumTick / measureTicks) * tps,
+          idleW: (sumIdleTick / measureTicks) * tps,
+          peakW: peakTick * tps + stationChargeW,
+          stationChargeW,
+        },
+        measureSeconds,
+        warmupTicksUsed,
+        warnings,
+      },
+    };
   };
+
+  let measured = measure();
+  const acceptable = opts.acceptable;
+  if (acceptable && opts.warmupTicks === undefined) {
+    // A start-up still going on (a belt filling) has not been judged: warm up on and measure again, until the result
+    // is acceptable, nothing fills any more or the limit is reached. The ticks of a window that is judged short were
+    // warm-up as far as the next one is concerned.
+    while (measured.filling && !acceptable(measured.result) && warmupTicksUsed + measureTicks + FILL_STEP_TICKS <= MAX_FILL_WARMUP_TICKS) {
+      runTicks(FILL_STEP_TICKS);
+      warmupTicksUsed += measureTicks + FILL_STEP_TICKS;
+      measured = measure();
+    }
+  }
+  return measured.result;
 }
 
 /** One tick's power demand, in J/tick, and the part of it that is idle draw. Reports to the world as it is added. */

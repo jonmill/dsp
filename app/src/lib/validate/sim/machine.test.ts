@@ -194,6 +194,19 @@ describe('MachineSim output blocking', () => {
     expect(m.state).toBe('blocked');
   });
 
+  it('reports how much product it holds and how much it can: what a start-up fills', () => {
+    const smelter = machineOf(SMELTER, RECIPE.ingot);
+    expect([smelter.outputLevel(), smelter.outputCapacity()]).toEqual([0, 100]);
+    run(smelter, 7000, { drain: false });
+    expect(smelter.outputLevel()).toBe(100);
+    // an assembler holds 10 crafts of gears, 1 gear a craft; a refinery 20 crafts of each of its two products
+    const assembler = machineOf(ASM_MK2, RECIPE.gear);
+    expect([assembler.outputLevel(), assembler.outputCapacity()]).toEqual([0, 10]);
+    run(assembler, 2000, { drain: false });
+    expect(assembler.outputLevel()).toBe(assembler.produced(GEAR));
+    expect(machineOf(REFINERY, RECIPE.refine).outputCapacity()).toBe(20 + 40);
+  });
+
   it('a refinery stops at 20 crafts of any one product: an undrained byproduct stalls it', () => {
     const m = machineOf(REFINERY, RECIPE.refine); // 1 hydrogen + 2 refined oil per craft
     let oil = 0;

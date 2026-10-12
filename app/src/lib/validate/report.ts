@@ -149,6 +149,7 @@ export function validateLayout(
     measureTicks: opts.measureTicks,
     shouldAbort: opts.shouldAbort,
     warmupCapTicks: opts.warmupCapTicks,
+    acceptable: (result) => checkSimulation(result, layout, plan, data).length === 0,
   });
   const violations = checkSimulation(sim, layout, plan, data);
   return { pass: violations.length === 0, violations, sim, checkedAt, stage: 'simulation' };

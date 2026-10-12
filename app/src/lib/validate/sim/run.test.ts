@@ -3,7 +3,7 @@ import { GameDataIndex } from '../../data';
 import type { Layout } from '../../geometry';
 import { checkSimulation } from '../report';
 import { codesOf, fixtureData, fixtureEffects, ITEM, LayoutKit, line, only, onNode, onSlot, planOf, refineryLayout, smelterRowLayout, stationConfig, stationPairLayout } from '../testkit';
-import { ABORT_CHECK_TICKS, MAX_WARMUP_TICKS, runSimulation, SimulationAborted, WarmupNotSettled } from './run';
+import { ABORT_CHECK_TICKS, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, runSimulation, SimulationAborted, WarmupNotSettled } from './run';
 import type { SimResult } from './run';
 
 const TPS = 60;
@@ -185,6 +185,75 @@ describe('runSimulation: the warm-up', () => {
 
   it('is the same on every run', () => {
     expect(run(500)).toEqual(run(500));
+  });
+});
+
+describe('runSimulation: a start-up that is still going on', () => {
+  /**
+   * Six smelters take all 6 ore/s of a Mk.I belt. A decoy upstream of them makes 0.12 ingots/s into a dead-end belt of
+   * `storeNodes` nodes (2 cargo each) and takes 0.12 ore/s from the six until the store is full: they make 98 % of the
+   * plan in the meantime, 100 % after. A 200-node store fills in 3300 s (200000 ticks); a 2000-node one does not within
+   * the longest warm-up.
+   */
+  function decoyRow(storeNodes: number): { layout: Layout; plan: Parameters<typeof runSimulation>[1]; data: GameDataIndex } {
+    const raw = structuredClone(fixtureData.data);
+    raw.recipes.push({ ...raw.recipes.find((r) => r.id === 1)!, id: 9001, timeTicks: 500 });
+    const row = smelterRowLayout(6);
+    const store = row.kit.belt(1, 1101, line([0, 20], [storeNodes - 1, 20]));
+    const decoy = row.kit.smelter(2, 8, 0, 9001);
+    row.kit.sorter(onNode(row.ore, 2), onSlot(decoy, 0), 1, { filterItemId: 1001 });
+    row.kit.sorter(onSlot(decoy, 1), onNode(store, 2), 1, { filterItemId: 1101 });
+    return { layout: row.kit.layout(), plan: row.plan, data: new GameDataIndex(raw) };
+  }
+  const passes = (sim: SimResult, row: ReturnType<typeof decoyRow>): boolean =>
+    checkSimulation(sim, row.layout, row.plan, row.data).length === 0;
+
+  it('is measured as it is when nobody asks: the 20-minute warm-up ends with the belt still filling, and the plan reads short', () => {
+    const row = decoyRow(200);
+    const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, {});
+    expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
+    expect(sim.measuredTargetRate).toBeCloseTo(5.88, 2);
+    expect(passes(sim, row)).toBe(false);
+  });
+
+  it('warms up on while a belt fills and the result is not acceptable, then measures the finished start-up', () => {
+    const row = decoyRow(200);
+    const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: (r) => passes(r, row) });
+    expect(sim.warmupTicksUsed).toBeGreaterThan(200000);
+    expect(sim.warmupTicksUsed).toBeLessThan(MAX_FILL_WARMUP_TICKS);
+    expect(sim.measuredTargetRate).toBeGreaterThan(5.99);
+    expect(passes(sim, row)).toBe(true);
+  });
+
+  it('stops asking once the result is acceptable, and leaves a result that is acceptable at the first window alone', () => {
+    const row = decoyRow(200);
+    let asked = 0;
+    const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, {
+      acceptable: () => ++asked >= 3,
+    });
+    expect(asked).toBe(3);
+    // 72000 of warm-up, then each rejected window of 18000 and a step of 36000 more
+    expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS + 2 * (18000 + 36000));
+    const settled = smelterRowLayout(3);
+    const first = simulate(settled, {});
+    const again = simulate(settled, { acceptable: () => false });
+    expect(again).toEqual(first); // nothing fills, so there is nothing to wait for
+  });
+
+  it('stops waiting when nothing fills any more, whatever the verdict, and never passes MAX_FILL_WARMUP_TICKS', () => {
+    const row = decoyRow(200);
+    const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: () => false });
+    expect(sim.warmupTicksUsed).toBeGreaterThan(200000); // the store is full at 3300 s
+    expect(sim.warmupTicksUsed).toBeLessThanOrEqual(MAX_FILL_WARMUP_TICKS);
+    expect(sim.measuredTargetRate).toBeGreaterThan(5.99); // the last window began with the store full
+  });
+
+  it('does not extend an explicit warm-up, and does not wait without a verdict to wait for', () => {
+    const row = decoyRow(200);
+    const fixed = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { warmupTicks: 7200, acceptable: () => false });
+    expect(fixed.warmupTicksUsed).toBe(7200);
+    const plain = runSimulation(row.layout, row.plan, row.data, fixtureEffects, {});
+    expect(plain.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
   });
 });
 
