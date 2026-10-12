@@ -3,7 +3,7 @@
 `decompile.build_fingerprints` hashes these methods from the decompiled `Assembly-CSharp.dll`, and
 `decompile.drift_report` names the TS modules to re-check when one of the hashes changes after a game
 patch. Every `// mirrors: Type.Method` comment in `app/src` must have its `Type.Method` here (the
-consistency test in Task 30 checks that), and the type must be listed in `decompile.TYPES_TO_DECOMPILE`.
+test `app/test/mirrors.test.ts` checks that), and the type must be listed in `decompile.TYPES_TO_DECOMPILE`.
 Paths are relative to the repository root.
 """
 
