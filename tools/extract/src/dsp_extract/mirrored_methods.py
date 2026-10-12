@@ -17,7 +17,10 @@ MIRRORED: dict[str, str] = {
     # Build-condition checks (Task 15)
     "BuildTool_Click.CheckBuildConditions": "app/src/lib/validate/geometry-checks.ts",
     "BuildTool_Path.CheckBuildConditions": "app/src/lib/validate/geometry-checks.ts",
-    "BuildTool_Inserter.CheckBuildConditions": "app/src/lib/validate/geometry-checks.ts",
+    # The sorter's length and skew rules (rules 8 and 10) live in geometry/sorter-rules.ts, shared with the layout solver
+    # (Task 24b); the validator's other sorter rules (lattice tap, slots, in-building, belt end) that carry the same
+    # `// mirrors:` marker are still in validate/geometry-checks.ts, so re-check that file too when this method drifts.
+    "BuildTool_Inserter.CheckBuildConditions": "app/src/lib/geometry/sorter-rules.ts",
     # Tick simulator: belts, stations and power (Task 17)
     "CargoPath.Update": "app/src/lib/validate/sim/belt.ts",
     "CargoPath.TryInsertItem": "app/src/lib/validate/sim/belt.ts",

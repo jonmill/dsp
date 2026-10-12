@@ -46,7 +46,10 @@
 // present factor, the present factor grows, and so on until no cell is shared and every net has a route, or
 // maxIterations is reached (or a round changes nothing). A net whose new route fails keeps its old one. Scaling the
 // history with the present factor keeps a cell that stays shared from being cheaper to hold than a detour across two
-// cells others hold, which left the last conflicts of large layouts unresolved. The result is the round with the
+// cells others hold, which left the last conflicts of large layouts unresolved. When the same nets are in conflict for
+// `STUCK_ROUNDS` rounds in a row, every other round routes them in the opposite order (the net routed first takes the
+// cell the others need, round after round; Planetary Logistics Station at margin 3 stalled on 3 cells for 30 rounds
+// once its split consumers were routed last). The result is the round with the
 // fewest nets without a route and, among those, the fewest shared cells. The forced nodes of a stop (the node before
 // and after a tap, the step out of a port) count as the net's cells like any other, so the other nets are steered
 // off them.
@@ -118,6 +121,8 @@ const ELEVATION_COST = 0.5;
 const TIE_BREAK = 1e-6;
 /** Searches check `shouldStop` every this many expansions. */
 const STOP_CHECK_MASK = 4095;
+/** Rounds with the same nets in conflict after which every other such round routes them in the opposite order. */
+const STUCK_ROUNDS = 3;
 /** The present factor stops growing here: past it every shared cell is as good as forbidden. */
 const MAX_PRESENT_FACTOR = 1e4;
 /** A leg whose best path crosses itself is searched again with the repeated cells closed, at most this often. */
@@ -853,6 +858,8 @@ class Router {
 
     try {
       let todo = order;
+      let lastHot = '';
+      let stuck = 0;
       for (let iter = 0; iter < Math.max(1, this.p.maxIterations); iter++) {
         let gained = false;
         for (const i of todo) {
@@ -887,6 +894,12 @@ class Router {
           );
         }
         todo = order.filter((i) => snap.hot.has(i) || (routes[i].length === 0 && routable(i)));
+        // The same nets in conflict round after round: whichever of them is routed first takes the cell the others
+        // need, every time. Routing them in the opposite order every other round lets the other one have it.
+        const hotKey = todo.join(',');
+        stuck = hotKey === lastHot ? stuck + 1 : 0;
+        lastHot = hotKey;
+        if (stuck >= STUCK_ROUNDS && stuck % 2 === 1) todo.reverse();
         if (todo.length === 0) break;
       }
     } catch (err) {

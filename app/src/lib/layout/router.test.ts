@@ -595,7 +595,8 @@ describe('split consumers (a machine that takes one item on two nets)', () => {
     { machineId: 8, dir: 'in', x: 15, y: 12 },
   ] as const;
 
-  const routes = (specs: (typeof net1 | typeof net2)[], over: Partial<RouteParams> = {}) => {
+  type TapSpec = readonly { machineId: number; dir: 'in' | 'out'; x: number; y: number }[];
+  const routes = (specs: readonly TapSpec[], over: Partial<RouteParams> = {}) => {
     const net = synthNetlist([{ building: ASSEMBLER, count: 12 }], [], specs.map((s) => netOf([...s])));
     const taps = specs.flatMap((s, i) => s.map((t) => assigned(i + 1, t)));
     return routeNets(net, { taps, stationPorts: [] }, occupancyOf([]), params(over), never);
@@ -620,5 +621,103 @@ describe('split consumers (a machine that takes one item on two nets)', () => {
     const nodes = routeOf(res, 1);
     const order = [...net1].sort((a, b) => at(nodes, a.x, a.y) - at(nodes, b.x, b.y)).map((t) => t.machineId);
     expect(order).toEqual([1, 4, 3, 5, 6]);
+  });
+
+  /** The machine ids of a net's taps in the order its route passes them. */
+  const visited = (res: { routes: RoutedNet[] }, netId: number, spec: TapSpec): number[] => {
+    const nodes = routeOf(res, netId);
+    return [...spec].sort((a, b) => at(nodes, a.x, a.y) - at(nodes, b.x, b.y)).map((t) => t.machineId);
+  };
+
+  it('in a run with a producer stay where the producer is: producers come before every consumer', () => {
+    // machine 3 is two nodes from the producer on one row, so one straight pass serves both: producer first, then 3
+    const a: TapSpec = [
+      { machineId: 1, dir: 'out', x: 2, y: 3 },
+      { machineId: 3, dir: 'in', x: 4, y: 3 },
+      { machineId: 5, dir: 'in', x: 11, y: 3 },
+      { machineId: 6, dir: 'in', x: 15, y: 3 },
+    ];
+    const b: TapSpec = [
+      { machineId: 2, dir: 'out', x: 2, y: 12 },
+      { machineId: 3, dir: 'in', x: 4, y: 12 },
+      { machineId: 7, dir: 'in', x: 11, y: 12 },
+      { machineId: 8, dir: 'in', x: 15, y: 12 },
+    ];
+    const res = routes([a, b]);
+    expect(res.ok).toBe(true);
+    expect(visited(res, 1, a)).toEqual([1, 3, 5, 6]);
+    expect(visited(res, 2, b)).toEqual([2, 3, 7, 8]);
+  });
+
+  it('in a run with a plain consumer take it along to the end of the belt', () => {
+    // 3 and 9 (plain) are two nodes apart on one row: one pass, and it is the last one on each net
+    const a: TapSpec = [
+      { machineId: 1, dir: 'out', x: 2, y: 3 },
+      { machineId: 3, dir: 'in', x: 4, y: 6 },
+      { machineId: 9, dir: 'in', x: 6, y: 6 },
+      { machineId: 5, dir: 'in', x: 11, y: 3 },
+      { machineId: 6, dir: 'in', x: 15, y: 3 },
+    ];
+    const b: TapSpec = [
+      { machineId: 2, dir: 'out', x: 2, y: 12 },
+      { machineId: 3, dir: 'in', x: 4, y: 15 },
+      { machineId: 10, dir: 'in', x: 6, y: 15 },
+      { machineId: 7, dir: 'in', x: 11, y: 12 },
+      { machineId: 8, dir: 'in', x: 15, y: 12 },
+    ];
+    const res = routes([a, b]);
+    expect(res.ok).toBe(true);
+    const first = visited(res, 1, a);
+    expect(first.slice(0, 3)).toEqual([1, 5, 6]);
+    expect(first.slice(3).sort((x, y) => x - y)).toEqual([3, 9]);
+    const second = visited(res, 2, b);
+    expect(second.slice(0, 3)).toEqual([2, 7, 8]);
+    expect(second.slice(3).sort((x, y) => x - y)).toEqual([3, 10]);
+  });
+});
+
+describe('a negotiation that stalls', () => {
+  // Four nets of 3-6 taps in a 16 x 16 window, found by a random search: with every round routing the nets in
+  // conflict in the same order the same single cell stays shared for all 40 rounds; routing them in the opposite
+  // order every other round resolves it.
+  const TAPS: [net: number, machine: number, x: number, y: number, dir: 'in' | 'out'][] = [
+    [1, 101, 12, 13, 'out'],
+    [1, 102, 4, 14, 'in'],
+    [1, 103, 3, 12, 'in'],
+    [2, 201, 13, 9, 'out'],
+    [2, 202, 13, 14, 'in'],
+    [2, 203, 10, 11, 'in'],
+    [2, 204, 11, 15, 'in'],
+    [3, 301, 11, 7, 'out'],
+    [3, 302, 14, 5, 'out'],
+    [3, 303, 5, 1, 'in'],
+    [3, 304, 7, 5, 'in'],
+    [3, 305, 4, 7, 'in'],
+    [3, 306, 11, 10, 'in'],
+    [4, 401, 6, 3, 'out'],
+    [4, 402, 9, 4, 'in'],
+    [4, 403, 5, 2, 'in'],
+  ];
+
+  it('is resolved by routing the nets in conflict in the opposite order every other round', () => {
+    const nets: Partial<BeltNet>[] = [1, 2, 3, 4].map((id) => ({
+      source: { kind: 'taps' },
+      sink: { kind: 'deadEnd' },
+      taps: TAPS.filter((t) => t[0] === id).map((t) => ({ machineId: t[1], itemId: 1001, dir: t[4], rate: 1, sorters: 1 })),
+    }));
+    const net = synthNetlist([{ building: ASSEMBLER, count: 1 }], [], nets);
+    const taps: AssignedTap[] = TAPS.map(([netId, machineId, x, y, dir]) => ({
+      netId,
+      machineId,
+      slot: 0,
+      span: 1,
+      point: { x, y },
+      axis: 'x',
+      dir,
+      sorterIndex: 0,
+      rate: 1,
+    }));
+    const res = routeNets(net, { taps, stationPorts: [] }, occupancyOf([]), params({ allowElevation: false, maxLevel: 0, bounds: { minX: 0, minY: 0, maxX: 16, maxY: 16 } }), never);
+    expect(res.ok).toBe(true);
   });
 });
