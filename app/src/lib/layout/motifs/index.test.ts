@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'vitest';
+import { sorterRate } from '../../validate/capacity';
+import { netStack } from '../netlist';
 import { data, effects, matrixNetlist, processorNetlist } from '../testkit';
 import { directInsertionMotif } from './direct-insertion';
 import { applyMotifs, enabledMotifKinds, MOTIFS, proposeMotifs, VERIFIED_MOTIFS } from './index';
@@ -58,14 +60,31 @@ describe('applyMotifs with lab stacks', () => {
     expect(applied.nets.map((n) => n.rate)).toEqual(net.nets.map((n) => n.rate));
   });
 
-  it('gives every merged tap the sorters its rate needs', async () => {
-    const net = await matrixNetlist(2, at(3));
-    const applied = applyMotifs(net, proposeMotifs(net, data, at(3), new Set(['labStack'])), data, at(3));
-    for (const n of applied.nets) for (const t of n.taps) expect(t.sorters).toBeGreaterThanOrEqual(1);
-    const board = applied.nets.find((n) => n.itemId === 1301)!;
-    const merged = board.taps.find((t) => t.dir === 'in')!;
+  it('gives every merged tap the sorters its rate needs: a stack of 6 on Mk.I sorters takes 2 where a lab alone takes 1', async () => {
+    // Mk.I sorters move 1.5 items/s from a belt of stack 1 and from a building: 2 items/s take two of them
+    const fx = { ...at(6), availableBuildings: new Set([...effects.availableBuildings].filter((id) => ![2012, 2013, 2014].includes(id))) };
+    const net = await matrixNetlist(2, fx);
+    expect(net.sorterTierItemId).toBe(2011);
     const lone = net.nets.find((n) => n.itemId === 1301)!.taps.find((t) => t.dir === 'in')!;
-    expect(merged.sorters).toBeGreaterThanOrEqual(lone.sorters);
+    expect(lone.sorters).toBe(1);
+
+    const instances = proposeMotifs(net, data, fx, new Set(['labStack']));
+    expect(instances.map((i) => i.machineIds.length)).toEqual([6]);
+    const applied = applyMotifs(net, instances, data, fx);
+    const leader = instances[0].machineIds[0];
+    for (const itemId of [1202, 1301, 6001]) {
+      const tap = applied.nets.find((n) => n.itemId === itemId)!.taps.find((t) => t.machineId === leader)!;
+      expect(tap.rate).toBeCloseTo(2, 9);
+      expect(tap.sorters).toBe(2);
+    }
+    // and every tap, merged or not, has exactly the sorters its rate implies on its own pick side
+    for (const n of applied.nets) {
+      const stack = netStack(n.source.kind === 'station', fx);
+      for (const t of n.taps) {
+        const per = sorterRate(applied.sorterTierItemId, 1, t.dir === 'in' ? stack : 0, fx, data);
+        expect(t.sorters, `net ${n.id} ${t.machineId} ${t.dir}`).toBe(Math.max(1, Math.ceil(t.rate / per - 1e-9)));
+      }
+    }
   });
 
   it('records the groups for placement: leader first, the others on top of it', async () => {

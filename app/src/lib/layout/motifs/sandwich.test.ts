@@ -80,6 +80,14 @@ describe('sandwichMotif.propose', () => {
     expect(found.some((i) => i.machineIds.some((id) => iron.includes(id)))).toBe(false);
   });
 
+  it('looks machines up by id, not by position: ids that do not run from 1 make the same modules', async () => {
+    const net = await processorNetlist(1);
+    const shifted = { ...net, machines: net.machines.slice().reverse().map((m) => ({ ...m, id: m.id + 500 })) };
+    const found = sandwichMotif.propose(shifted, data, effects);
+    const plain = sandwichMotif.propose(net, data, effects);
+    expect(found.map((i) => i.machineIds)).toEqual(plain.map((i) => i.machineIds.map((id) => id + 500)));
+  });
+
   it('a module is geometrically clean on its own: the validator finds no overlap and nothing else wrong with the buildings', async () => {
     const net = await processorNetlist(1);
     for (const m of sandwichMotif.propose(net, data, effects)) {

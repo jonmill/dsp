@@ -16,7 +16,7 @@ import { buildNetlist } from '../src/lib/layout/netlist';
 import { Rng } from '../src/lib/layout/rng';
 import { DEFAULT_SOLVE_OPTIONS, footprintOf, solve } from '../src/lib/layout/solver';
 import type { SolveOptions, SolveResult } from '../src/lib/layout/solver';
-import { data, effects, everything, matrixPlan, planFor, processorPlan, SMELTER } from '../src/lib/layout/testkit';
+import { ASSEMBLER, data, effects, everything, matrixPlan, planFor, processorPlan, SMELTER } from '../src/lib/layout/testkit';
 import { runSimulation, validateLayout } from '../src/lib/validate';
 import type { ValidationReport } from '../src/lib/validate';
 
@@ -128,42 +128,58 @@ const MOTIF_ITERATIONS = 24;
  * therefore get the same budget of ordinary iterations; the ordinary chain draws from its own random source, so it
  * does exactly the same in both, and the run with motifs can only have more candidates to choose its best from.
  */
-function solveCounted(name: string, plan: ProductionPlan, over: Partial<SolveOptions>, fx = effects): SolveResult {
+function solveCounted(
+  name: string,
+  plan: ProductionPlan,
+  over: Partial<SolveOptions>,
+  fx = effects,
+): SolveResult & { emitted: Layout[]; phases: string[] } {
   const clock = { t: 0 };
   const t0 = performance.now();
+  const emitted: Layout[] = [];
+  const phases: string[] = [];
   const result = solve(
     plan,
     data,
     fx,
     { ...DEFAULT_SOLVE_OPTIONS, seed: 1, timeBudgetMs: MOTIF_ITERATIONS * 1000, minRunMs: 1e9, ...over, now: () => clock.t },
     (p) => {
+      phases.push(p.phase);
       if (p.phase !== 'done' && !p.phase.startsWith('motif')) clock.t += 1000;
     },
-    () => {},
+    (layout) => emitted.push(layout),
     () => false,
   );
-  const sorters = result.layout?.sorters.filter((s) => s.pick.kind === 'building' && s.drop.kind === 'building').length;
+  const sorters = result.layout?.sorters.filter(isDirect).length;
   const stacked = result.layout?.buildings.filter((b) => b.stackParentId !== undefined).length;
   log(
     `${name}: footprint ${result.footprint?.toFixed(0)} tiles; ${result.attempts} attempts, ${result.validated} validated; ` +
       `${sorters} sorters between buildings, ${stacked} stacked labs; ${((performance.now() - t0) / 1000).toFixed(1)} s`,
   );
-  return result;
+  return { ...result, emitted, phases };
 }
 
+/** A sorter between two buildings: direct insertion. */
+const isDirect = (s: Layout['sorters'][number]): boolean => s.pick.kind === 'building' && s.drop.kind === 'building';
+
 describe('solver with dense motifs end to end [slow]', () => {
-  it('(d) 1 Processor/s with useUnverifiedMotifs passes the validator and is no larger than without (same seed, same budget)', async () => {
+  it('(d) 1 Processor/s with useUnverifiedMotifs passes the validator and is smaller than without (same seed, same budget)', async () => {
     const plan = await processorPlan(1);
     const without = solveCounted('processor 1/s without motifs', plan, {});
     const withMotifs = solveCounted('processor 1/s with motifs', plan, { useUnverifiedMotifs: true });
     expectAcceptable('processor 1/s without motifs', plan, without);
     const layout = expectAcceptable('processor 1/s with motifs', plan, withMotifs);
-    expect(withMotifs.footprint as number).toBeLessThanOrEqual(without.footprint as number);
+    expect(withMotifs.footprint as number).toBeLessThan(without.footprint as number);
     log(`processor: ${(without.footprint as number).toFixed(0)} tiles without motifs, ${(withMotifs.footprint as number).toFixed(0)} with`);
-    // the motif layout is the one that was asked for: the same machines
+    // the smaller layout is a motif layout: the Processor's cluster of a circuit board assembler and the smelters that feed it
+    expect(layout.sorters.filter(isDirect).length).toBeGreaterThanOrEqual(1);
+    expect(without.layout!.sorters.filter(isDirect)).toEqual([]);
+    // the same machines, motifs or not
     expect(layout.buildings.filter((b) => b.recipeId !== undefined)).toHaveLength(
       without.layout!.buildings.filter((b) => b.recipeId !== undefined).length,
     );
+    // and a motif chain found it
+    expect(withMotifs.phases.some((p) => /^motif [a-zA-Z+]+: margin \d, footprint \d+$/.test(p))).toBe(true);
   }, 600_000);
 
   it('(e) 2 Electromagnetic Matrix/s: the six labs stack up to labLevel, the layout passes, and it is smaller than without motifs', async () => {
@@ -182,6 +198,72 @@ describe('solver with dense motifs end to end [slow]', () => {
     // the same layout is not valid where labs may only stack 2 high
     const tooTall = validateLayout(layout, plan, data, { ...fx, labLevel: 2 }, { simulate: false });
     expect(tooTall.pass).toBe(false);
+    // every layout the run emitted passes at labLevel 3, and the stacked ones fail where labs may only stack 2 high
+    const stacked = withMotifs.emitted.filter((l) => l.buildings.some((b) => b.stackParentId !== undefined));
+    expect(stacked.length).toBeGreaterThan(0);
+    for (const l of withMotifs.emitted) expect(validateLayout(l, plan, data, fx, { simulate: false }).pass).toBe(true);
+    for (const l of stacked) expect(validateLayout(l, plan, data, { ...fx, labLevel: 2 }, { simulate: false }).pass).toBe(false);
+    expect(withMotifs.phases.some((p) => /^motif [a-zA-Z+]+: margin \d, footprint \d+$/.test(p))).toBe(true);
+  }, 600_000);
+
+  it('(f) 1 Magnetic Coil/s: one direct-insertion cluster holds all four machines, and it is smaller than without', async () => {
+    const plan = await planFor({
+      targetItemId: 1202,
+      suppliedItemIds: new Set([1001, 1002]),
+      finalFacilityItemId: ASSEMBLER,
+      facilityOverrides: { 6: ASSEMBLER, 1: SMELTER, 2: SMELTER, 3: SMELTER },
+    });
+    const without = solveCounted('coil 1/s without motifs', plan, {});
+    const withMotifs = solveCounted('coil 1/s with motifs', plan, { useUnverifiedMotifs: true });
+    expectAcceptable('coil 1/s without motifs', plan, without);
+    expectAcceptable('coil 1/s with motifs', plan, withMotifs);
+    expect(withMotifs.footprint as number).toBeLessThan(without.footprint as number);
+    for (const l of withMotifs.emitted) expect(validateLayout(l, plan, data, effects).pass).toBe(true);
+    expect(withMotifs.phases.some((p) => /^motif [a-zA-Z+]+: margin \d, footprint \d+$/.test(p))).toBe(true);
+  }, 600_000);
+});
+
+describe('early stop with motif chains end to end [slow]', () => {
+  it('(g) counts from the last time the overall best got smaller, not from a candidate that did not beat it', async () => {
+    // Seed 5 on the matrix plan (labLevel 3): the motif chain finds the best at 4 s, the ordinary chain adopts layouts
+    // that are valid but larger at 4 s and 9 s, and the motif chain finds a smaller one again at 10 s.
+    const plan = await matrixPlan(2);
+    const fx = { ...effects, labLevel: 3 };
+    const step = 1000;
+    const fraction = 0.58;
+    const clock = { t: 0 };
+    const emitted: number[] = [];
+    const result = solve(
+      plan,
+      data,
+      fx,
+      {
+        ...DEFAULT_SOLVE_OPTIONS,
+        seed: 5,
+        simWarmupTicks: 7_200,
+        simMeasureTicks: 3_600,
+        useUnverifiedMotifs: true,
+        minRunMs: 0,
+        earlyStopFraction: fraction,
+        timeBudgetMs: 60 * step,
+        now: () => clock.t,
+      },
+      (p) => {
+        if (p.phase !== 'done' && !p.phase.startsWith('motif')) clock.t += step;
+      },
+      () => emitted.push(clock.t),
+      () => false,
+    );
+    expect(result.stoppedBy).toBe('early');
+    const T = clock.t;
+    log(`early stop with motifs: stopped at ${T / 1000} s; layouts emitted at ${emitted.map((t) => t / 1000).join(', ')} s`);
+    // The rule is checked before each iteration, so it sees the layouts emitted before that moment. It must not have
+    // held at any check before the run stopped (the run would have stopped), and must hold at the check that stopped it.
+    const lastBefore = (t: number): number => emitted.filter((e) => e < t).reduce((m, e) => Math.max(m, e), 0);
+    for (let t = emitted[0] + step; t < T; t += step) {
+      expect(t - lastBefore(t), `at ${t / 1000} s`).toBeLessThan(fraction * t);
+    }
+    expect(T - lastBefore(T)).toBeGreaterThanOrEqual(fraction * T);
   }, 600_000);
 });
 

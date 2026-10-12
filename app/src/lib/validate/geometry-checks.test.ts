@@ -275,6 +275,15 @@ describe('1 BUILDING_OVERLAP', () => {
       expect(only(check(kit), 'BUILDING_OVERLAP').some((x) => /kind/.test(x.message))).toBe(true);
     });
 
+    test('fail: a Self-evolution Lab stacked on a Matrix Lab (the same kind, but not the same building)', () => {
+      const kit = new LayoutKit(tall, effectsAt(3));
+      const lab = kit.building(ITEM.matrixLab, 0, 0, 0);
+      kit.building(2902, 0, 0, 0, { z: lapLevels, stackParentId: lab.id });
+      const v = only(check(kit), 'BUILDING_OVERLAP').filter((x) => /different buildings/.test(x.message));
+      expect(v).toHaveLength(1);
+      expect(v[0].entities).toEqual([{ kind: 'building', id: 2 }, { kind: 'building', id: lab.id }]);
+    });
+
     test('a sorter on the bottom lab is fine; a sorter on a stacked lab is not (multiLevelAllowInserter is false)', () => {
       const kit = new LayoutKit(fixtureData, effectsAt(3));
       const labs = labStack(kit, 2);
@@ -297,7 +306,7 @@ describe('1 BUILDING_OVERLAP', () => {
       expect(v[0].message).toMatch(/stacked/);
     });
 
-    test('power: a node that covers the bottom lab covers the whole stack (same x and y)', () => {
+    test('power (an unverified in-game assumption, a 2D range): a node that covers the bottom lab covers the whole stack (same x and y)', () => {
       const kit = new LayoutKit(fixtureData, effectsAt(3));
       labStack(kit, 3);
       kit.tesla(8, 0);

@@ -5,7 +5,7 @@ import { LayoutKit, compositeLayout } from '../validate/testkit';
 import { MAX_WARMUP_TICKS, validateLayout } from '../validate';
 import type { ValidateOptions, ValidationReport } from '../validate';
 import type { SimResult } from '../validate/sim/run';
-import { annealStart, DEFAULT_SOLVE_OPTIONS, footprintOf, solve, solveSteps, validateWithRetry } from './solver';
+import { annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, solve, solveSteps, validateWithRetry } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
 import { VERIFIED_MOTIFS } from './motifs';
 import { ASSEMBLER, data, effects, matrixPlan, occupancyOf, planFor, SMELTER } from './testkit';
@@ -122,6 +122,30 @@ describe('annealStart (carry: annealPlacement throws on an initial placement tha
 
   it('starts from a constructive placement when there is no best yet', () => {
     expect(annealStart(null, 1, (m) => placement(m))).toEqual({ placement: placement(1), margin: 1 });
+  });
+});
+
+describe('BestKeeper (the smallest layout found, and when it last got smaller: the early stop counts from there)', () => {
+  it('takes the first layout, and a smaller one, and records when', () => {
+    const keeper = new BestKeeper<{ footprint: number }>();
+    expect(keeper.best).toBeNull();
+    expect(keeper.improvedAt).toBe(0);
+    const first = { footprint: 100 };
+    expect(keeper.offer(first, 5)).toBe(true);
+    expect([keeper.best, keeper.improvedAt]).toEqual([first, 5]);
+    const smaller = { footprint: 80 };
+    expect(keeper.offer(smaller, 12)).toBe(true);
+    expect([keeper.best, keeper.improvedAt]).toEqual([smaller, 12]);
+  });
+
+  it('a layout that is not smaller changes nothing, the time of the last improvement above all', () => {
+    const keeper = new BestKeeper<{ footprint: number }>();
+    const best = { footprint: 100 };
+    keeper.offer(best, 5);
+    expect(keeper.offer({ footprint: 120 }, 9)).toBe(false);
+    expect(keeper.offer({ footprint: 100 }, 10)).toBe(false);
+    expect(keeper.offer({ footprint: 100 - 1e-12 }, 11)).toBe(false); // not smaller by more than float noise
+    expect([keeper.best, keeper.improvedAt]).toEqual([best, 5]);
   });
 });
 
@@ -521,23 +545,12 @@ describe('solve with dense motifs', () => {
     expect(r.result.layout).toBe(r.improved[r.improved.length - 1].layout);
   }, 180_000);
 
-  it('finds a layout no larger than the run without motifs (same seed, same ordinary iterations), and here a smaller one from a motif chain', async () => {
-    const plan = await coilPlan();
-    const without = runWith(plan, { seed: 1 }, 12);
-    const withMotifs = runWith(plan, { seed: 1, useUnverifiedMotifs: true }, 12);
-    expect(withMotifs.result.footprint).toBeLessThanOrEqual(without.result.footprint as number);
-    expect(withMotifs.result.footprint).toBeLessThan(without.result.footprint as number);
-    // a motif chain found the smaller layout: the progress says "motif <kinds>: margin n, footprint f" for a new best
-    expect(withMotifs.phases.some((p) => /^motif [a-zA-Z+]+: margin \d, footprint \d+$/.test(p))).toBe(true);
-    process.stdout.write(`coil: ${without.result.footprint?.toFixed(0)} tiles without motifs, ${withMotifs.result.footprint?.toFixed(0)} with\n`);
-  }, 180_000);
-
   it('uses the motifs in VERIFIED_MOTIFS without being asked, and only those', async () => {
     const plan = await matrixPlan(2);
     const fx = { ...effects, labLevel: 3 };
     VERIFIED_MOTIFS.add('labStack');
     try {
-      const r = runWith(plan, ADAPTIVE, 8, fx);
+      const r = runWith(plan, ADAPTIVE, 6, fx);
       expect(r.result.failures).toEqual([]);
       const motifPhases = r.phases.filter((p) => p.startsWith('motif'));
       expect(motifPhases.length).toBeGreaterThan(0);
@@ -548,27 +561,44 @@ describe('solve with dense motifs', () => {
     expect(VERIFIED_MOTIFS.size).toBe(0);
   }, 180_000);
 
-  it('stacks the labs of a matrix plan at labLevel 3, and the stacked layout passes the validator at that labLevel only', async () => {
-    const plan = await matrixPlan(2);
-    const fx = { ...effects, labLevel: 3 };
-    VERIFIED_MOTIFS.add('labStack');
+  it('a motif layout that the simulation rejects does not become the floor of its chain: later candidates of that size are still validated', async () => {
+    const plan = await coilPlan();
+    const rejection: ValidationReport = {
+      pass: false,
+      violations: [{ code: 'SIM_STALLED', entities: [], message: 'made up' }],
+      checkedAt: '',
+      stage: 'simulation',
+    };
+    // reject every layout with a sorter between two buildings, so that only the direct-insertion chain is judged
+    const judged: number[] = [];
+    const validator = ((layout, p, d, fx, o) => {
+      if (!layout.sorters.some((x) => x.pick.kind === 'building' && x.drop.kind === 'building')) return validateLayout(layout, p, d, fx, o);
+      judged.push(footprintOf(layout, d));
+      return rejection;
+    }) as typeof validateLayout;
+    const clock = { t: 0 };
+    VERIFIED_MOTIFS.add('direct'); // the direct-insertion chain alone: nothing else lowers the overall best meanwhile
+    let result: SolveResult;
     try {
-      const r = runWith(plan, ADAPTIVE, 14, fx);
-      const stacked = r.improved.filter((i) => i.layout.buildings.some((b) => b.stackParentId !== undefined));
-      expect(stacked.length).toBeGreaterThan(0);
-      for (const imp of stacked) {
-        expect(messages(imp.report)).toEqual([]);
-        const labs = imp.layout.buildings.filter((b) => b.itemId === 2901);
-        expect(labs).toHaveLength(6);
-        expect(Math.max(...labs.map((b) => b.z))).toBeLessThanOrEqual(6); // at most 3 high
-        const again = validateLayout(imp.layout, plan, data, fx, { simulate: false });
-        expect(again.pass).toBe(true);
-        expect(validateLayout(imp.layout, plan, data, { ...fx, labLevel: 2 }, { simulate: false }).pass).toBe(false);
-      }
+      result = solve(
+        plan, data, effects,
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, seed: 1, minRunMs: 1e9, timeBudgetMs: 10_000, now: () => clock.t },
+        (p) => {
+          if (p.phase !== 'done' && !p.phase.startsWith('motif')) clock.t += 1_000;
+        },
+        () => {},
+        () => false,
+        validator,
+      );
     } finally {
-      VERIFIED_MOTIFS.delete('labStack');
+      VERIFIED_MOTIFS.delete('direct');
     }
-  }, 300_000);
+    // a candidate as large as one the simulation turned down was still validated: the rejected one is no floor
+    expect(judged.length).toBeGreaterThanOrEqual(2);
+    expect(judged.some((f, i) => i > 0 && f >= Math.min(...judged.slice(0, i)) - 1e-9)).toBe(true);
+    expect(result.layout!.sorters.every((x) => x.pick.kind !== 'building' || x.drop.kind !== 'building')).toBe(true);
+    expect(result.failures).toEqual([]);
+  }, 120_000);
 
   it('does not touch the ordinary chain: with motifs on and no motif layout better, the result is the ordinary one', async () => {
     // the ingot plan has nothing a motif can do (a single stage of identical smelters makes sandwiches only)

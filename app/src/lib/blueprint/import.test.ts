@@ -830,6 +830,16 @@ describe('blueprintToLayout: labs', () => {
       expect(imported.buildings.map((b) => b.stackParentId)).toEqual([undefined, undefined, undefined, undefined]);
     });
 
+    test('a Self-evolution Lab standing on a Matrix Lab is not linked to it (only the same building stacks)', () => {
+      const layout = layoutOf({
+        buildings: [
+          { id: 1, itemId: MATRIX_LAB, x: 0, y: 0, z: 0, yaw: 0, recipeId: RECIPE },
+          { id: 2, itemId: 2902, x: 0, y: 0, z: 3, yaw: 0, recipeId: RECIPE },
+        ],
+      });
+      expect(roundTrip(layout).layout.buildings.map((b) => b.stackParentId)).toEqual([undefined, undefined]);
+    });
+
     test('a blueprint the game exported (no builder, no ids to trust) is read by position alone', () => {
       const { bp } = roundTrip(stackLayout());
       const shuffled = reorder(bp, [3, 2, 0, 1, 4]);

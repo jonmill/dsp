@@ -740,12 +740,33 @@ describe('placement with motif groups', () => {
       expect(() => annealPlacement(net, data, broken, params({ iterations: 100 }), never)).toThrow(/group/);
     });
 
-    it('is the same as before for a netlist without motifs (the Processor, seed 1)', async () => {
-      const net = await netlistOf(processorRequest(1));
+    it('is exactly what it was before motif groups existed, for a netlist without motifs (pinned from commit 98f64b8)', () => {
+      const machines: Netlist['machines'] = [];
+      [{ building: SMELTER, count: 3 }, { building: ASSEMBLER, count: 2 }, { building: CHEM_PLANT, count: 1 }].forEach((s, stageIndex) => {
+        for (let i = 0; i < s.count; i++) {
+          machines.push({ id: machines.length + 1, stageIndex, recipeId: 100 + stageIndex, buildingItemId: s.building, inputs: [], outputs: [] });
+        }
+      });
+      const tap = (machineId: number, dir: 'in' | 'out') => ({ machineId, itemId: 1001, dir, rate: 1, sorters: 1 });
+      const net: Netlist = {
+        machines,
+        nets: [
+          { id: 1, itemId: 1001, tierItemId: 2001, rate: 1, source: { kind: 'station', stationIdx: 0 }, sink: { kind: 'deadEnd' }, taps: [tap(1, 'in'), tap(2, 'in'), tap(3, 'in')] },
+          { id: 2, itemId: 1001, tierItemId: 2001, rate: 1, source: { kind: 'taps' }, sink: { kind: 'deadEnd' }, taps: [tap(1, 'out'), tap(2, 'out'), tap(4, 'in'), tap(5, 'in')] },
+          { id: 3, itemId: 1001, tierItemId: 2001, rate: 1, source: { kind: 'taps' }, sink: { kind: 'station', stationIdx: 0 }, taps: [tap(4, 'out'), tap(5, 'out'), tap(6, 'in')] },
+        ],
+        stations: [{ kind: 'planetary', buildingItemId: PLS, slots: [], portsNeeded: 0 }],
+        sorterTierItemId: 2011,
+        beltTierItemId: 2001,
+        warnings: [],
+      };
+      const row = (p: Placement) => p.buildings.map((b) => [b.id, b.x, b.y, b.yaw]);
       const init = constructivePlacement(net, data, 2);
-      const a = annealPlacement(net, data, init, params(), never);
-      const b = annealPlacement({ ...net, motifs: { groups: [], sorters: [] } }, data, init, params(), never);
-      expect(b).toEqual(a);
+      expect(init.cost).toBeCloseTo(908.9016003003084, 9);
+      expect(row(init)).toEqual([[1, 0, 0, 0], [1001, 13, -1, 0], [1002, 20, -1, 0], [1003, 27, -1, 0], [1004, 13, 9, 0], [1005, 21, 9, 0], [1006, 15, 20, 0]]);
+      const out = annealPlacement(net, data, init, params({ seed: 3, iterations: 6000 }), never);
+      expect(out.cost).toBeCloseTo(504.3123288488873, 9);
+      expect(row(out)).toEqual([[1, 0, 0, 0], [1001, 26, 8, 180], [1002, 24, 0, 270], [1003, 9, 0, 0], [1004, 16, 0, 90], [1005, 19, 8, 0], [1006, 10, 9, 180]]);
     });
   });
 });

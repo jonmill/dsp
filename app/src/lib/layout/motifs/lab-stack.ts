@@ -7,6 +7,10 @@
 // bottom lab for more sorters than fit beside it: each of its taps (the stack's rate on a net, at span 1) at most
 // `MAX_SORTERS_PER_TAP` sorters, and all of them together at most the lab's slots; otherwise the stacks are one lab
 // lower. The bottom lab is the anchor; the others stand on the one below at `lapJoint / LEVEL` levels each.
+//
+// Power. The layout powers a stack as it powers any building: by its x and y, which every lab of the stack shares, so a
+// tower that covers the bottom lab covers all of them. That rests on the range being 2D in game (as the validator
+// assumes); it is an unverified assumption, and a tall stack could exceed a tower's vertical reach.
 import type { Building, GameDataIndex, TechEffects } from '../../data';
 import { LEVEL } from '../../geometry';
 import { MAX_SORTERS_PER_TAP, netStack, sortersNeeded } from '../netlist';

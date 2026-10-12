@@ -110,9 +110,11 @@ export const sandwichMotif: Motif = {
       else stages.set(m.stageIndex, [m.id]);
     }
 
+    const itemOf = new Map(net.machines.map((m) => [m.id, m.buildingItemId] as const));
     const found: MotifInstance[] = [];
-    for (const [, ids] of [...stages].sort((a, b) => a[0] - b[0])) {
-      const itemId = net.machines[ids[0] - 1].buildingItemId;
+    for (const [, unsorted] of [...stages].sort((a, b) => a[0] - b[0])) {
+      const ids = unsorted.slice().sort((a, b) => a - b);
+      const itemId = itemOf.get(ids[0]) as number;
       const spacing = sandwichSpacing(itemId, data, effects);
       if (!spacing) continue;
       for (let at = 0; ids.length - at >= 2; ) {

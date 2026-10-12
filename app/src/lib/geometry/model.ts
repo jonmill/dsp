@@ -45,7 +45,9 @@ export interface PlacedBuilding {
   /**
    * The building this one stands on, one lapJoint below (labs: MX §4.4, §8). The stacked building has the parent's
    * x, y and yaw and `z = parent.z + lapJoint / LEVEL`. Only the bottom building of a stack takes sorters; the validator
-   * exempts exactly such pairs from BUILDING_OVERLAP and holds the stack to `effects.labLevel` high.
+   * exempts exactly such pairs from BUILDING_OVERLAP and holds the stack to `effects.labLevel` high. A stack is powered
+   * through its bottom lab's x and y (a 2D range): an unverified in-game assumption, a tall stack may exceed a tower's
+   * vertical reach.
    */
   stackParentId?: number;
   /** Free-form tag, e.g. "stage:51". */

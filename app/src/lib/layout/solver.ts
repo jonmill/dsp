@@ -237,6 +237,27 @@ export function annealStart(
 }
 
 // ---------------------------------------------------------------------------------------------
+// The best layout
+
+/**
+ * The smallest layout found by any chain, and when it last got smaller: the early stop counts from that moment. A
+ * layout that is not smaller (by more than float noise) changes nothing, the time included.
+ */
+export class BestKeeper<T extends { footprint: number }> {
+  best: T | null = null;
+  /** When `best` last got smaller (0 before the first layout). */
+  improvedAt = 0;
+
+  /** Takes `candidate`, found at time `at`, if it is smaller than the best; says whether it was. */
+  offer(candidate: T, at: number): boolean {
+    if (this.best && candidate.footprint >= this.best.footprint - FOOTPRINT_EPS) return false;
+    this.best = candidate;
+    this.improvedAt = at;
+    return true;
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // The search
 
 interface Best extends MarginPlacement {
@@ -292,10 +313,9 @@ export function* solveSteps(
   let attempts = 0;
   let validated = 0;
   /** The smallest layout found by any chain: what the result is and `onImproved` reports. */
-  let best: Best | null = null;
-  /** The ordinary chain's own best: what its anneals start from. Equal to `best` unless a motif chain has done better. */
+  const keeper = new BestKeeper<Best>();
+  /** The ordinary chain's own best: what its anneals start from. The keeper's best unless a motif chain has done better. */
   let baseBest: Best | null = null;
-  let lastImprovedAt = 0;
   let lastFailure: string | undefined;
   const failures: string[] = [];
 
@@ -305,13 +325,13 @@ export function* solveSteps(
   };
 
   const progress = (phase: string): void =>
-    onProgress({ elapsedMs: elapsed(), attempts, validated, bestFootprint: best?.footprint ?? null, phase, lastFailure });
+    onProgress({ elapsedMs: elapsed(), attempts, validated, bestFootprint: keeper.best?.footprint ?? null, phase, lastFailure });
   const result = (stoppedBy: SolveResult['stoppedBy']): SolveResult => {
     progress('done');
     return {
-      layout: best?.layout ?? null,
-      report: best?.report ?? null,
-      footprint: best?.footprint ?? null,
+      layout: keeper.best?.layout ?? null,
+      report: keeper.best?.report ?? null,
+      footprint: keeper.best?.footprint ?? null,
       attempts,
       validated,
       stoppedBy,
@@ -366,10 +386,7 @@ export function* solveSteps(
 
   /** Makes a layout that passed the full validator the overall best if it is smaller, and reports it. */
   const adopt = (candidate: Best): void => {
-    lastImprovedAt = elapsed();
-    if (best && candidate.footprint >= best.footprint - FOOTPRINT_EPS) return;
-    best = candidate;
-    onImproved(candidate.layout, candidate.report, candidate.footprint);
+    if (keeper.offer(candidate, elapsed())) onImproved(candidate.layout, candidate.report, candidate.footprint);
   };
 
   // --- fallback ladder
@@ -401,7 +418,7 @@ export function* solveSteps(
     lastFailure = tagged[0];
     progress(`ladder: margin ${margin} rejected`);
   }
-  if (!best || !baseBest) return result(shouldStop() ? 'user' : 'exhausted');
+  if (!keeper.best || !baseBest) return result(shouldStop() ? 'user' : 'exhausted');
 
   // --- improvement loop
   const rng = new Rng(opts.seed);
@@ -411,7 +428,7 @@ export function* solveSteps(
     if (shouldStop()) return 'user';
     const t = elapsed();
     if (t >= opts.timeBudgetMs) return 'budget';
-    if (t >= opts.minRunMs && t - lastImprovedAt >= opts.earlyStopFraction * t) return 'early';
+    if (t >= opts.minRunMs && t - keeper.improvedAt >= opts.earlyStopFraction * t) return 'early';
     return null;
   };
 
@@ -507,8 +524,8 @@ export function* solveSteps(
     net: Netlist;
     constructive: (margin: number) => Placement;
     /**
-     * The smallest layout of this variant that passed the static checks: it starts the next anneal. The full validator
-     * has only judged it if it was below the overall best when it was found.
+     * The smallest layout of this variant that starts the next anneal: one the full validator passed, or one that was
+     * not below the overall best (the validator has no use for those). Never a layout the validator turned down.
      */
     best: (MarginPlacement & { footprint: number }) | null;
   }
@@ -591,15 +608,19 @@ export function* solveSteps(
       progress(`motif ${name}: margin ${margin}, no smaller (${built.footprint.toFixed(0)} against ${variant.best.footprint.toFixed(0)})`);
       return;
     }
-    // smaller than this variant's best: it is the variant's new start; the full validator only runs for a new overall best
-    variant.best = { ...placed, footprint: built.footprint };
-    if (best && built.footprint >= best.footprint - FOOTPRINT_EPS) {
+    const overall = (keeper.best as Best).footprint;
+    if (built.footprint >= overall - FOOTPRINT_EPS) {
+      // not below the overall best, so the full validator has no use for it; it is the next start of this variant
+      variant.best = { ...placed, footprint: built.footprint };
       lastFailure = undefined;
-      progress(`motif ${name}: margin ${margin}, footprint ${built.footprint.toFixed(0)}, not below ${best.footprint.toFixed(0)}`);
+      progress(`motif ${name}: margin ${margin}, footprint ${built.footprint.toFixed(0)}, not below ${overall.toFixed(0)}`);
       return;
     }
+    // a candidate for the overall best: the full validator decides. Only a layout that passes it starts the variant's
+    // next anneal (a rejected one would also keep every later candidate of its size out of the validator).
     const accepted = accept(built, placed);
     if ('best' in accepted) {
+      variant.best = { ...placed, footprint: built.footprint };
       adopt(accepted.best);
       lastFailure = undefined;
       progress(`motif ${name}: margin ${margin}, footprint ${built.footprint.toFixed(0)}`);
