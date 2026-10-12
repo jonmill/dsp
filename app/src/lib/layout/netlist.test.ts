@@ -1096,6 +1096,34 @@ describe('buildNetlist: the proliferator net (Task 28)', () => {
     expect(() => buildNetlist(plan, data, allEffects, { maxMachinesPerNet: 2 })).toThrow(/proliferator.*Mk\.III.*2 stations/i);
   });
 
+  it('the one-slot rule is for the slot with the proliferator role: a target that is the sprayed proliferator exports it from two stations', () => {
+    // 30 machines make Mk.III, the target and the item the plan sprays with; at 2 taps a net there are 15 export nets, and with the
+    // feed's port that is more than one station's 12 ports. The slot of Mk.III is an export (role 'export'), so each station that
+    // takes some of the export nets holds a copy of it; the feed is still one net, from one of them.
+    const plan = synthPlan({
+      stages: [{ machines: 30, outputs: [{ itemId: MK3, perSecond: 15 }] }],
+      flows: [{ itemId: MK3, from: 0, to: 'export', perSecond: 15 }],
+      exports: [{ itemId: MK3, perSecond: 15 }],
+    });
+    plan.proliferatorPerSecond = 0.1;
+    plan.request.proliferator = { tier: 3, mode: 'extra' };
+    plan.stages[0].proliferated = true;
+    expect(plan.stationSlots).toEqual([{ itemId: MK3, role: 'export' }]);
+    const nl = buildNetlist(plan, data, allEffects, { maxMachinesPerNet: 2 });
+    const feeds = nl.nets.filter((n) => n.proliferator);
+    expect(feeds).toHaveLength(1);
+    expect(netsOf(nl, MK3).filter((n) => !n.proliferator)).toHaveLength(15);
+    // the export slot is on both stations, each within its 12 ports, and the one feed starts at one of them
+    expect(nl.stations).toHaveLength(2);
+    expect(nl.stations.map((s) => s.slots.map((x) => x.itemId))).toEqual([[MK3], [MK3]]);
+    expect(nl.stations.map((s) => s.portsNeeded).reduce((n, p) => n + p, 0)).toBe(16);
+    for (const st of nl.stations) expect(st.portsNeeded).toBeLessThanOrEqual(12);
+    const feed = feeds[0];
+    if (feed.source.kind !== 'station') throw new Error('the proliferator net is not station-sourced');
+    expect(nl.stations[feed.source.stationIdx].slots.map((s) => s.itemId)).toContain(MK3);
+    expectSound(nl, plan, allEffects);
+  });
+
   it('a plan that makes the proliferator it sprays with (it is the target) still gets its net', async () => {
     const plan = await planOf(
       request({

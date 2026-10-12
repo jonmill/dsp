@@ -806,10 +806,12 @@ export function buildNetlist(
       current.portsNeeded += group.length;
     }
   }
-  // the proliferator's slot is on one station, the one its feed starts at (a feed is one net: it has one station to start at)
+  // The slot with the 'proliferator' role is on one station, the one its feed starts at (a feed is one net: it has one station
+  // to start at). A slot of another role for that item (the plan's target is the sprayed proliferator: an export) may be on
+  // several stations, one per group of 12 ports of its export nets; the feed still starts at one of them.
   const feed = nets.find((n) => n.proliferator);
   const holders = feed ? stations.filter((st) => st.slots.some((x) => x.itemId === feed.itemId)).length : 1;
-  if (feed && holders !== 1) {
+  if (feed && roleOf.get(feed.itemId) === 'proliferator' && holders !== 1) {
     throw new Error(`netlist: the proliferator ${itemName(data, feed.itemId)} has a slot on ${holders} stations, not exactly one`);
   }
   const unbalanced = pooledImbalances({ nets, stations });
