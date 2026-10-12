@@ -34,6 +34,36 @@ export interface SimOptions {
   measureTicks?: number;
   /** Power the block's network can supply, in watts. Omitted: unlimited (serve ratio 1). */
   powerSupplyW?: number;
+  /**
+   * Asked every `ABORT_CHECK_TICKS` ticks, in the warm-up and the measurement; when it says yes the run ends with a
+   * `SimulationAborted`. For a caller that has run out of time (the solver's budget): a long simulation need not be
+   * waited for.
+   */
+  shouldAbort?: () => boolean;
+  /**
+   * The adaptive warm-up gives up once it has run this many ticks (counted in whole windows of 3600; a cap of
+   * `MAX_WARMUP_TICKS` or more is no cap) if the target has not reached its rate by then: the run ends with a
+   * `WarmupNotSettled` and nothing is measured. A run
+   * that does settle before the cap warms up for exactly as long as it would without it and measures the same, so a
+   * layout it passes is one that the run without the cap passes too. Ignored when `warmupTicks` is given.
+   */
+  warmupCapTicks?: number;
+}
+
+/** `SimOptions.shouldAbort` said yes. */
+export class SimulationAborted extends Error {
+  constructor() {
+    super('the simulation was aborted');
+    this.name = 'SimulationAborted';
+  }
+}
+
+/** The adaptive warm-up reached `SimOptions.warmupCapTicks` with the target short of its rate. */
+export class WarmupNotSettled extends Error {
+  constructor(readonly ticks: number) {
+    super(`the target had not reached its rate after ${ticks} warm-up ticks`);
+    this.name = 'WarmupNotSettled';
+  }
 }
 
 export interface MachineStat {
@@ -88,8 +118,13 @@ export interface SimResult {
 
 /** The adaptive warm-up runs in windows of this many ticks (1 game minute), at least two of them. */
 const WARMUP_WINDOW_TICKS = 3600;
-/** The adaptive warm-up gives up on a steady state after this many ticks (20 game minutes). */
+/**
+ * The adaptive warm-up never runs longer than this many ticks (20 game minutes), whether or not the target reached its
+ * rate by then; the measurement that follows judges a block that is still short.
+ */
 export const MAX_WARMUP_TICKS = 72000;
+/** `SimOptions.shouldAbort` is asked this often (10 game seconds). */
+export const ABORT_CHECK_TICKS = 600;
 /** Two consecutive warm-up windows that each make this share of the provisioned rate end the adaptive warm-up. */
 const WARMUP_REACHED = 0.999;
 const DEFAULT_MEASURE_TICKS = 18000;
@@ -217,29 +252,45 @@ export function runSimulation(
   const exportItems = plan.exports.map((e) => e.itemId);
   const targetItem = plan.request.targetItemId;
 
+  const shouldAbort = opts.shouldAbort;
+  /** `n` ticks, asking `shouldAbort` now and then. */
+  const runTicks = (n: number): void => {
+    for (let t = 0; t < n; t++) {
+      if (shouldAbort && t % ABORT_CHECK_TICKS === 0 && shouldAbort()) throw new SimulationAborted();
+      world.tick();
+    }
+  };
+
   let warmupTicksUsed = 0;
   if (opts.warmupTicks !== undefined) {
-    for (; warmupTicksUsed < opts.warmupTicks; warmupTicksUsed++) world.tick();
+    runTicks(opts.warmupTicks);
+    warmupTicksUsed = opts.warmupTicks;
   } else {
     // Adaptive: windows of the target's rate until two in a row reach the provisioned rate, at most MAX_WARMUP_TICKS.
     // Two windows that merely agree do not end it: a deep chain fills in steps, with plateaus between them.
     const wanted = provisionedRate(plan);
     const reached = (rate: number): boolean => wanted > 0 && rate >= WARMUP_REACHED * wanted;
+    const cap = Math.min(MAX_WARMUP_TICKS, opts.warmupCapTicks ?? MAX_WARMUP_TICKS);
     let previous = 0;
-    while (warmupTicksUsed < MAX_WARMUP_TICKS) {
+    let settled = false;
+    while (warmupTicksUsed < cap) {
       const before = received(targetItem);
-      for (let t = 0; t < WARMUP_WINDOW_TICKS; t++) world.tick();
+      runTicks(WARMUP_WINDOW_TICKS);
       warmupTicksUsed += WARMUP_WINDOW_TICKS;
       const windowRate = (received(targetItem) - before) / (WARMUP_WINDOW_TICKS / tps);
-      if (reached(previous) && reached(windowRate)) break;
+      if (reached(previous) && reached(windowRate)) {
+        settled = true;
+        break;
+      }
       previous = windowRate;
     }
+    if (!settled && opts.warmupCapTicks !== undefined && opts.warmupCapTicks < MAX_WARMUP_TICKS) throw new WarmupNotSettled(warmupTicksUsed);
   }
   for (const m of machines.list) m.machine.resetStats();
   const receivedAtStart = new Map<number, number>();
   for (const id of [targetItem, ...exportItems]) receivedAtStart.set(id, received(id));
   measuring = true;
-  for (let t = 0; t < measureTicks; t++) world.tick();
+  runTicks(measureTicks);
 
   const rate = (itemId: number): number => (received(itemId) - (receivedAtStart.get(itemId) ?? 0)) / measureSeconds;
 

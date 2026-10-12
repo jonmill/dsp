@@ -382,6 +382,39 @@ describe('RATE_MACHINE_INPUT', () => {
       kit.sorters[3].plannedRate = 0.4;
       expect(codesOf(machineInput(kit))).toEqual(['RATE_MACHINE_INPUT']);
     });
+
+    describe('one ingredient fed from two belts (a sorter supplies at most what it can move)', () => {
+      /** A gear assembler needing 2/s of iron ingots, with one Mk.I sorter from each of two ingot belts, planned at `a` and `b`. */
+      const twoBelts = (a: number, b: number) => {
+        const { kit, asm, belt } = gearCell();
+        const second = kit.belt(3, IRON_INGOT, line([0, 10], [12, 10]));
+        const first = kit.sorter(onNode(belt, 6), onSlot(asm, 7), 1, { plannedRate: a });
+        const other = kit.sorter(onNode(second, 6), onSlot(asm, 1), 1, { plannedRate: b });
+        return { kit, first, other };
+      };
+
+      test('the planned rates of the two belts add up', () => {
+        expect(machineInput(twoBelts(1, 1).kit)).toEqual([]);
+        // 0.9 + 1.0 = 1.9 of the 2/s needed
+        expect(codesOf(machineInput(twoBelts(0.9, 1).kit))).toEqual(['RATE_MACHINE_INPUT']);
+      });
+
+      test('a sorter planned above what it can move supplies only what it can move: the surplus does not cover the other belt\'s gap', () => {
+        // Mk.I at span 1 moves 1.5/s. Planned 1.9 + 0.4 = 2.3 reads as enough, but 1.5 + 0.4 = 1.9 is not.
+        const { kit, first } = twoBelts(1.9, 0.4);
+        const violations = run(kit);
+        expect(codesOf(violations)).toEqual(['RATE_SORTER', 'RATE_MACHINE_INPUT']);
+        expect(violations[0].entities).toEqual([{ kind: 'sorter', id: first.id }]);
+        const input = violations.filter((v) => v.code === 'RATE_MACHINE_INPUT');
+        expect(input[0].message).toMatch(/1\.9\/s of Iron Ingot from 2 sorter/);
+        expect(input[0].message).not.toMatch(/2\.3\/s/);
+      });
+
+      test('a sorter planned at or below its capacity counts at its planned rate', () => {
+        // 1.5 (exactly its capacity) + 0.5 = 2.0
+        expect(run(twoBelts(1.5, 0.5).kit)).toEqual([]);
+      });
+    });
   });
 
   describe('which stage a machine belongs to', () => {

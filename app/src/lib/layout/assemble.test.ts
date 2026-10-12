@@ -252,7 +252,9 @@ describe('the Processor netlist end to end', () => {
     const plan = await processorPlan();
     const s = solve(plan, 2);
     const t0 = performance.now();
-    const report = validateLayout(s.layout, plan, data, effects, { warmupTicks: 1800, measureTicks: 3600 });
+    // 3600 warm-up ticks (1800 before Task 27): the weighted heuristic routes some belts of the chain differently, and the
+    // chain fills a few seconds later (59 items of 60 in the window after 1800 ticks, 1.000 from 2400); the steady state is the same
+    const report = validateLayout(s.layout, plan, data, effects, { warmupTicks: 3600, measureTicks: 3600 });
     const ms = performance.now() - t0;
     process.stdout.write(
       `processor: ${s.net.machines.length} machines, ${s.poles.length} poles, ${s.layout.sorters.length} sorters, ` +

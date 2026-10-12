@@ -2,10 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ProductionPlan } from '../calc';
 import type { Layout, PlacedBuilding } from '../geometry';
 import { LayoutKit, compositeLayout } from '../validate/testkit';
-import { MAX_WARMUP_TICKS, validateLayout } from '../validate';
+import { MAX_WARMUP_TICKS, SimulationAborted, validateLayout, WarmupNotSettled } from '../validate';
 import type { ValidateOptions, ValidationReport } from '../validate';
 import type { SimResult } from '../validate/sim/run';
-import { annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, solve, solveSteps, validateWithRetry } from './solver';
+import { annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
 import { VERIFIED_MOTIFS } from './motifs';
 import { ASSEMBLER, data, effects, matrixPlan, occupancyOf, planFor, SMELTER } from './testkit';
@@ -149,6 +149,76 @@ describe('BestKeeper (the smallest layout found, and when it last got smaller: t
   });
 });
 
+describe('MarginPicker (the improvement margin follows the record of what got built)', () => {
+  it('gives every margin the same share until it has a record', () => {
+    expect(new MarginPicker([1, 2]).shares()).toEqual([0.5, 0.5]);
+    const three = new MarginPicker([1, 2, 3]).shares();
+    for (const share of three) expect(share).toBeCloseTo(1 / 3, 9);
+  });
+
+  it('moves the share to the margin that gets built, and back when the record changes', () => {
+    const picker = new MarginPicker([1, 2]);
+    for (let i = 0; i < 6; i++) picker.record(1, false);
+    for (let i = 0; i < 6; i++) picker.record(2, true);
+    const [one, two] = picker.shares();
+    expect(one).toBeLessThan(0.2);
+    expect(two).toBeGreaterThan(0.8);
+    expect(one + two).toBeCloseTo(1, 9);
+    for (let i = 0; i < 40; i++) picker.record(1, true);
+    expect(picker.shares()[0]).toBeGreaterThan(0.4);
+  });
+
+  it('never takes a margin below its minimum share, however badly it did', () => {
+    const picker = new MarginPicker([1, 2]);
+    for (let i = 0; i < 500; i++) {
+      picker.record(1, false);
+      picker.record(2, true);
+    }
+    expect(picker.shares()[0]).toBeCloseTo(0.15, 9);
+    const picks = Array.from({ length: 1000 }, (_, i) => picker.pick((i + 0.5) / 1000));
+    expect(picks.filter((m) => m === 1)).toHaveLength(150);
+  });
+
+  it('picks by the draw: the first margin below its share, the next above', () => {
+    const picker = new MarginPicker([1, 2]);
+    expect(picker.pick(0)).toBe(1);
+    expect(picker.pick(0.49)).toBe(1);
+    expect(picker.pick(0.5)).toBe(2);
+    expect(picker.pick(0.999)).toBe(2);
+  });
+
+  it('ignores a margin it does not know', () => {
+    const picker = new MarginPicker([1, 2]);
+    picker.record(5, true);
+    expect(picker.shares()).toEqual([0.5, 0.5]);
+  });
+});
+
+describe('warmupCapFor (how long the improvement loop waits for a candidate to reach its rate)', () => {
+  const reportWith = (warmupTicksUsed: number | undefined): ValidationReport =>
+    ({ pass: true, violations: [], checkedAt: '', stage: 'simulation', sim: warmupTicksUsed === undefined ? undefined : ({ warmupTicksUsed } as SimResult) }) as ValidationReport;
+
+  it('is twice the warm-up of the best layout, within four windows and the adaptive cap', () => {
+    expect(warmupCapFor(reportWith(25_200))).toBe(50_400);
+    expect(warmupCapFor(reportWith(10_800))).toBe(21_600);
+  });
+
+  it('leaves a quick layout four windows to fill', () => {
+    expect(warmupCapFor(reportWith(3_600))).toBe(14_400);
+    expect(warmupCapFor(reportWith(7_200))).toBe(14_400);
+  });
+
+  it('is the adaptive cap itself, which is no cap, for a layout that ran to the cap', () => {
+    expect(warmupCapFor(reportWith(MAX_WARMUP_TICKS))).toBe(MAX_WARMUP_TICKS);
+    expect(warmupCapFor(reportWith(50_000))).toBe(MAX_WARMUP_TICKS);
+  });
+
+  it('is none when the best layout was not simulated', () => {
+    expect(warmupCapFor(reportWith(undefined))).toBeUndefined();
+    expect(warmupCapFor(null)).toBeUndefined();
+  });
+});
+
 describe('validateWithRetry (a longer measure window for a near miss)', () => {
   const layout: Layout = { ...compositeLayout().kit.layout(), meta: { ...compositeLayout().kit.layout().meta, planTargetRate: 2 } };
   const plan = {} as ProductionPlan;
@@ -236,6 +306,52 @@ describe('validateWithRetry (a longer measure window for a near miss)', () => {
       expect(retry(v)).toBe(first);
       expect(v.calls).toHaveLength(1);
     }
+  });
+});
+
+describe('ladderRungs (what the fallback ladder tries, in this order)', () => {
+  it('is margins 3, 4 and 6 with the fast router, and then the same three with the exact router', () => {
+    expect(ladderRungs()).toEqual([
+      { margin: 3, exact: false },
+      { margin: 4, exact: false },
+      { margin: 6, exact: false },
+      { margin: 3, exact: true },
+      { margin: 4, exact: true },
+      { margin: 6, exact: true },
+    ]);
+  });
+});
+
+describe('validateGated (validateWithRetry, saying whether the longer window decided)', () => {
+  const layout: Layout = { ...compositeLayout().kit.layout(), meta: { ...compositeLayout().kit.layout().meta, planTargetRate: 2 } };
+  const plan = {} as ProductionPlan;
+  const sim = (rate: number, seconds = 300): SimResult => ({ measuredTargetRate: rate, measureSeconds: seconds, warmupTicksUsed: 7200, deadlocked: false }) as SimResult;
+  const report = (violations: ValidationReport['violations'], s: SimResult): ValidationReport => ({ pass: violations.length === 0, violations, sim: s, checkedAt: '', stage: 'simulation' });
+  const low = { code: 'SIM_OUTPUT_LOW' as const, entities: [], message: 'low' };
+  const answers = (...reports: ValidationReport[]) => {
+    let n = 0;
+    return (() => reports[Math.min(n++, reports.length - 1)]) as unknown as typeof validateLayout;
+  };
+
+  it('says no for a layout that passes the plain window', () => {
+    const first = report([], sim(2));
+    expect(validateGated(layout, plan, data, effects, { simulate: true }, answers(first))).toEqual({ report: first, longerWindow: false });
+  });
+
+  it('says yes for a layout that passes only over the doubled window', () => {
+    const second = report([], sim(2, 600));
+    const gated = validateGated(layout, plan, data, effects, { simulate: true }, answers(report([low], sim(1.97)), second));
+    expect(gated.report).toBe(second);
+    expect(gated.longerWindow).toBe(true);
+  });
+
+  it('says yes when the doubled window decided against the layout too, and no for a shortfall that is not a near miss', () => {
+    const second = report([low], sim(1.96, 600));
+    const gated = validateGated(layout, plan, data, effects, { simulate: true }, answers(report([low], sim(1.97)), second));
+    expect(gated.report).toBe(second);
+    expect(gated.longerWindow).toBe(true);
+    const far = report([low], sim(1.5));
+    expect(validateGated(layout, plan, data, effects, { simulate: true }, answers(far))).toEqual({ report: far, longerWindow: false });
   });
 });
 
@@ -333,9 +449,10 @@ describe('solve', () => {
     expect(result.layout).toBeNull();
     expect(result.report).toBeNull();
     expect(result.stoppedBy).toBe('exhausted');
-    expect(result.attempts).toBe(3);
+    expect(result.attempts).toBe(6); // the fast rungs, then the exact router's
     expect(improved).not.toHaveBeenCalled();
     for (const margin of [3, 4, 6]) expect(result.failures.some((f) => f.startsWith(`margin ${margin}: `) && /power/.test(f))).toBe(true);
+    for (const margin of [3, 4, 6]) expect(result.failures.some((f) => f.startsWith(`margin ${margin} (exact routes): `) && /power/.test(f))).toBe(true);
   }, 120_000);
 
   /** A validator that answers `verdicts[n]` to the n-th full validation (the real one when that is undefined). */
@@ -404,6 +521,214 @@ describe('solve', () => {
     expect(result.failures[0]).toMatch(/^margin [12]: internal error: simulator blew up$/);
     expect(v.calls()).toBeGreaterThan(2);
   }, 120_000);
+
+  describe('long simulations of candidates (Task 27)', () => {
+    /** `scripted`, and the options of every full validation. */
+    function watched(verdicts: (ValidationReport | Error | undefined)[]) {
+      const seen: ValidateOptions[] = [];
+      const inner = scripted(verdicts);
+      const fn = ((layout, plan, d, fx, o) => {
+        seen.push(o ?? {});
+        return inner.fn(layout, plan, d, fx, o);
+      }) as typeof validateLayout;
+      return { fn, seen };
+    }
+    const adaptive = { ...DEFAULT_SOLVE_OPTIONS, seed: 7, minRunMs: 1e9 };
+
+    it('validates the ladder without a cap and with an abort for the user, and the improvement candidates with a cap of twice the best warm-up and an abort for the budget', async () => {
+      const v = watched([]);
+      const fake = fakeClock(1_000);
+      const improved: ValidationReport[] = [];
+      let stop = false;
+      const result = solve(
+        await ingotPlan(), data, effects, { ...adaptive, timeBudgetMs: 10_000, now: fake.now },
+        (p) => fake.onProgress(p), (_l, r) => improved.push(r), () => stop, v.fn,
+      );
+      expect(v.seen.length).toBeGreaterThanOrEqual(2);
+      expect(v.seen[0].warmupCapTicks).toBeUndefined();
+      expect(v.seen[0].shouldAbort).toBeTypeOf('function');
+      // the ladder's abort is the user's stop, not the budget
+      stop = true;
+      expect(v.seen[0].shouldAbort!()).toBe(true);
+      stop = false;
+      expect(v.seen[0].shouldAbort!()).toBe(false);
+      // the cap of an improvement candidate is twice the warm-up of the best layout when it was validated
+      const best = improved[0];
+      expect(best.sim!.warmupTicksUsed).toBeGreaterThan(0);
+      expect(v.seen[1].warmupCapTicks).toBe(warmupCapFor(best));
+      expect(v.seen[1].shouldAbort).toBeTypeOf('function');
+      // the improvement loop's abort is the budget: the fake clock is past it by now
+      expect(v.seen[1].shouldAbort!()).toBe(fake.clock.t >= 10_000);
+      expect(result.layout).not.toBeNull();
+    }, 120_000);
+
+    it('turns a candidate that does not settle within its cap down like any failed simulation: no internal error, and the loop goes on', async () => {
+      const v = watched([undefined, ...Array.from({ length: 200 }, () => new WarmupNotSettled(14_400))]);
+      const fake = fakeClock(1_000);
+      const phases: string[] = [];
+      const result = solve(
+        await ingotPlan(), data, effects, { ...adaptive, timeBudgetMs: 12_000, now: fake.now },
+        (p) => fake.onProgress(p, (q) => phases.push(q.phase)), () => {}, () => false, v.fn,
+      );
+      expect(result.stoppedBy).toBe('budget');
+      expect(result.failures).toEqual([]);
+      expect(v.seen.length).toBeGreaterThan(2);
+      expect(phases.some((p) => /^improve: margin \d rejected by the simulation$/.test(p))).toBe(true);
+    }, 120_000);
+
+    it('drops a candidate whose simulation was aborted without calling it a failure, and ends on the budget', async () => {
+      const v = watched([undefined, ...Array.from({ length: 200 }, () => new SimulationAborted())]);
+      const fake = fakeClock(1_000);
+      const phases: string[] = [];
+      const result = solve(
+        await ingotPlan(), data, effects, { ...adaptive, timeBudgetMs: 12_000, now: fake.now },
+        (p) => fake.onProgress(p, (q) => phases.push(q.phase)), () => {}, () => false, v.fn,
+      );
+      expect(result.stoppedBy).toBe('budget');
+      expect(result.failures).toEqual([]);
+      expect(phases.some((p) => /^improve: margin \d stopped$/.test(p))).toBe(true);
+      expect(phases.some((p) => p.includes('rejected'))).toBe(false);
+    }, 120_000);
+
+    it('checks the budget inside a long validation: the abort turns yes while the clock runs past it, and the candidate is dropped', async () => {
+      const fake = fakeClock(1_000);
+      const polled: boolean[] = [];
+      let calls = 0;
+      const validate = ((layout, p, d, fx, o) => {
+        if (++calls === 1) return validateLayout(layout, p, d, fx, o); // the ladder's
+        // a simulation that takes ten seconds of the (fake) clock and asks for an abort every second of it
+        for (let second = 0; second < 10; second++) {
+          fake.clock.t += 1_000;
+          const abort = (o as ValidateOptions).shouldAbort!();
+          polled.push(abort);
+          if (abort) throw new SimulationAborted();
+        }
+        throw new Error('the abort never came');
+      }) as typeof validateLayout;
+      const phases: string[] = [];
+      const result = solve(
+        await ingotPlan(), data, effects, { ...adaptive, timeBudgetMs: 6_000, now: fake.now },
+        (p) => fake.onProgress(p, (q) => phases.push(q.phase)), () => {}, () => false, validate,
+      );
+      expect(result.stoppedBy).toBe('budget');
+      expect(result.failures).toEqual([]);
+      expect(polled.length).toBeGreaterThan(0);
+      expect(polled[polled.length - 1]).toBe(true);
+      expect(polled.slice(0, -1).every((a) => !a)).toBe(true);
+      // the budget was passed during the validation, not at the next check between candidates: it ran at most 10 s past it
+      expect(fake.clock.t).toBeLessThan(6_000 + 11_000);
+      expect(phases.some((p) => /^improve: margin \d stopped$/.test(p))).toBe(true);
+    }, 120_000);
+
+    it('ends with the user when the ladder\'s simulation is aborted', async () => {
+      const v = watched([new SimulationAborted()]);
+      const fake = fakeClock(1_000);
+      const improved = vi.fn();
+      const result = solve(
+        await ingotPlan(), data, effects, { ...adaptive, timeBudgetMs: 12_000, now: fake.now },
+        (p) => fake.onProgress(p), improved, () => false, v.fn,
+      );
+      expect(result.stoppedBy).toBe('user');
+      expect(result.layout).toBeNull();
+      expect(result.failures).toEqual([]);
+      expect(result.attempts).toBe(1);
+      expect(improved).not.toHaveBeenCalled();
+    }, 120_000);
+
+    it('what the improvement loop accepts under a cap passes plain validateLayout too', async () => {
+      const plan = await ingotPlan();
+      const r = run(plan, { ...adaptive, timeBudgetMs: 12_000, simWarmupTicks: undefined, simMeasureTicks: undefined }, 1_000);
+      expect(r.improved.length).toBeGreaterThanOrEqual(1);
+      for (const imp of r.improved) {
+        const plain = validateLayout(imp.layout, plan, data, effects);
+        expect(messages(plain)).toEqual([]);
+        expect(plain.pass).toBe(true);
+        expect(plain.sim!.warmupTicksUsed).toBe(imp.report.sim!.warmupTicksUsed);
+      }
+    }, 180_000);
+  });
+
+  describe('the fallback ladder (Task 27)', () => {
+    const nearMiss = (rate = 2.95): ValidationReport => ({
+      pass: false,
+      violations: [{ code: 'SIM_OUTPUT_LOW', entities: [], message: 'low' }],
+      sim: { measuredTargetRate: rate, measureSeconds: 300, warmupTicksUsed: 7200, deadlocked: false } as SimResult,
+      checkedAt: '',
+      stage: 'simulation',
+    });
+    const longerWindowPass: ValidationReport = {
+      pass: true,
+      violations: [],
+      sim: { measuredTargetRate: 3, measureSeconds: 600, warmupTicksUsed: 7200, deadlocked: false } as SimResult,
+      checkedAt: '',
+      stage: 'simulation',
+    };
+    const go = async (verdicts: (ValidationReport | Error | undefined)[]) => {
+      const v = scripted(verdicts);
+      const fake = fakeClock(60_000);
+      const phases: string[] = [];
+      const result = solve(
+        await ingotPlan(), data, effects,
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, minRunMs: 1e9, now: fake.now },
+        (p) => fake.onProgress(p, (q) => phases.push(q.phase)), () => {}, () => false, v.fn,
+      );
+      return { result, phases, calls: v.calls };
+    };
+
+    it('goes on to the exact router rungs when the three fast ones fail, and takes the first that passes', async () => {
+      const { result, phases } = await go([rejection, rejection, rejection]);
+      expect(result.layout).not.toBeNull();
+      expect(result.report!.pass).toBe(true);
+      expect(result.attempts).toBe(4);
+      expect(result.failures).toEqual(['margin 3: SIM_STALLED: made up', 'margin 4: SIM_STALLED: made up', 'margin 6: SIM_STALLED: made up']);
+      expect(phases).toContain('ladder: margin 3 (exact routes)');
+    }, 120_000);
+
+    it('ends exhausted only after the exact rungs failed as well, naming every rung', async () => {
+      const { result } = await go(Array.from({ length: 6 }, () => rejection));
+      expect(result.stoppedBy).toBe('exhausted');
+      expect(result.layout).toBeNull();
+      expect(result.attempts).toBe(6);
+      expect(result.failures).toEqual([
+        'margin 3: SIM_STALLED: made up',
+        'margin 4: SIM_STALLED: made up',
+        'margin 6: SIM_STALLED: made up',
+        'margin 3 (exact routes): SIM_STALLED: made up',
+        'margin 4 (exact routes): SIM_STALLED: made up',
+        'margin 6 (exact routes): SIM_STALLED: made up',
+      ]);
+    }, 120_000);
+
+    it('prefers a layout that passes the plain window to one that passes only over the doubled window, though it is not smaller', async () => {
+      // rung 1: near miss, the doubled window passes; rung 2: the real validator, a plain pass
+      const { result, calls } = await go([nearMiss(), longerWindowPass, undefined]);
+      expect(result.attempts).toBe(2);
+      expect(calls()).toBe(3);
+      expect(result.report!.sim!.measureSeconds).toBe(SIM.simMeasureTicks / 60); // the real validator's window, not the scripted 600 s
+      expect(result.failures).toEqual([]);
+    }, 120_000);
+
+    it('falls back to the first layout that passed only over the doubled window when no rung passes the plain one', async () => {
+      const { result, phases } = await go([nearMiss(), longerWindowPass, nearMiss(), longerWindowPass, nearMiss(), longerWindowPass]);
+      expect(result.attempts).toBe(3); // the three fast rungs; the exact ones are not needed for a layout
+      expect(result.layout).not.toBeNull();
+      expect(result.report).toBe(longerWindowPass);
+      expect(phases).toContain('ladder: margin 3, over the longer window');
+      expect(result.failures).toEqual([]);
+    }, 120_000);
+
+    it('emits that layout once, at the end of the ladder', async () => {
+      const improved: number[] = [];
+      const v = scripted([nearMiss(), longerWindowPass, nearMiss(), longerWindowPass, nearMiss(), longerWindowPass]);
+      const fake = fakeClock(60_000);
+      solve(
+        await ingotPlan(), data, effects,
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, minRunMs: 1e9, now: fake.now },
+        (p) => fake.onProgress(p), (_l, _r, f) => improved.push(f), () => false, v.fn,
+      );
+      expect(improved).toHaveLength(1);
+    }, 120_000);
+  });
 
   it('a plain Processor/s plan on default facilities (a slow chain) is accepted only if plain validateLayout accepts it', async () => {
     // Mk.I assemblers, Re-composing Assemblers and Negentropy Smelters: the chain fills over 10 game minutes. The
@@ -485,7 +810,11 @@ describe('solve with dense motifs', () => {
   /** The matrix chain fills over a few game minutes: a warm-up of two. */
   const ADAPTIVE = { simWarmupTicks: 7_200, simMeasureTicks: 3_600 };
 
-  /** 1 Magnetic Coil/s on base-tier machines: four machines, and a direct-insertion cluster that holds all of them. */
+  /**
+   * 1 Magnetic Coil/s on base-tier machines: four machines. The direct-insertion motif can group all four (three
+   * internal sorters) and the sandwich motif can put them on shared belts; which of them gives the smallest layout
+   * depends on the run (the e2e test (f) names the one that wins on its seed).
+   */
   const coilPlan = (): Promise<ProductionPlan> =>
     planFor({
       targetItemId: 1202,

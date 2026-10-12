@@ -14,8 +14,9 @@
 //
 // Which sorters feed which ingredient. A sorter dropping into a building carries its `filterItemId`; an unfiltered
 // one (filter 0) carries the item of the belt it picks from. An unfiltered sorter that picks from a building is
-// attributed to no ingredient. Each ingredient needs the planned rates of its sorters to add up to at least 99.9 %
-// of the required rate.
+// attributed to no ingredient. Each ingredient needs the supplies of its sorters to add up to at least 99.9 % of the
+// required rate; a sorter supplies `min(plannedRate, what it can move)`, so one planned above its capacity (RATE_SORTER)
+// does not make up for a short supply from another belt.
 import type { ProductionPlan, Stage } from '../calc';
 import type { GameDataIndex, TechEffects } from '../data';
 import type { BeltPath, Layout, PlacedBuilding, Sorter } from '../geometry';
@@ -153,7 +154,9 @@ export function checkCapacity(
           `but moves at most ${fmt(rate)} ${stack > 0 ? `from a belt at stack ${stack}` : 'from a building'}`,
       });
     }
-    if (s.drop.kind === 'building') addFeed(feeds, s.drop.buildingId, s, pickBelt);
+    // a sorter delivers what it is planned for, but never more than it can move: the surplus of one cannot make up
+    // for a short supply on another belt (RATE_SORTER names the over-planned one)
+    if (s.drop.kind === 'building') addFeed(feeds, s.drop.buildingId, s, pickBelt, Math.min(s.plannedRate, rate));
   }
 
   // RATE_MACHINE_INPUT
@@ -221,12 +224,13 @@ export function checkCapacity(
   return [...beltViolations, ...sorterViolations, ...machineViolations];
 }
 
-/** Records that sorter `s` delivers its planned rate into building `buildingId`, if it carries a known item. */
+/** Records that sorter `s` delivers `rate` (its planned rate, capped at what it can move) into building `buildingId`, if it carries a known item. */
 function addFeed(
   feeds: Map<number, Map<number, Feed>>,
   buildingId: number,
   s: Sorter,
   pickBelt: BeltPath | undefined,
+  rate: number,
 ): void {
   const itemId = s.filterItemId !== 0 ? s.filterItemId : pickBelt?.itemId;
   if (!itemId) return;
@@ -234,6 +238,6 @@ function addFeed(
   if (!byItem) feeds.set(buildingId, (byItem = new Map()));
   let feed = byItem.get(itemId);
   if (!feed) byItem.set(itemId, (feed = { rate: 0, sorters: [] }));
-  feed.rate += s.plannedRate;
+  feed.rate += rate;
   feed.sorters.push(s.id);
 }

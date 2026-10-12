@@ -27,6 +27,10 @@ export interface ValidateOptions {
   /** Ticks before the measurement, used exactly. Omitted: the simulation warms up adaptively (see `SimOptions`). */
   warmupTicks?: number;
   measureTicks?: number;
+  /** See `SimOptions.shouldAbort`: a yes ends the simulation with a `SimulationAborted`, which this function does not catch. */
+  shouldAbort?: () => boolean;
+  /** See `SimOptions.warmupCapTicks`: an adaptive warm-up that is still short of the rate at the cap ends with a `WarmupNotSettled`. */
+  warmupCapTicks?: number;
 }
 
 /** The target output must reach this share of the plan rate (the Global Constraints: 99 %). */
@@ -140,7 +144,12 @@ export function validateLayout(
 
   if (opts.simulate === false) return { pass: true, violations: [], checkedAt, stage: 'capacity' };
 
-  const sim = runSimulation(layout, plan, data, effects, { warmupTicks: opts.warmupTicks, measureTicks: opts.measureTicks });
+  const sim = runSimulation(layout, plan, data, effects, {
+    warmupTicks: opts.warmupTicks,
+    measureTicks: opts.measureTicks,
+    shouldAbort: opts.shouldAbort,
+    warmupCapTicks: opts.warmupCapTicks,
+  });
   const violations = checkSimulation(sim, layout, plan, data);
   return { pass: violations.length === 0, violations, sim, checkedAt, stage: 'simulation' };
 }

@@ -29,6 +29,16 @@
 // station ports) best, then the nearer tap point, then the lower index. Slots next to one already chosen for the same
 // tap, in the same row, get a bonus, so a tap with several sorters takes a straight stretch of one side.
 //
+// Lanes (MX §9 M2). The taps of nets that share a machine's face compete for the same ground: the sorter that comes
+// first takes the nearest lane (span 1), a tap whose span-1 point lies on that ground goes one lane further out (span 2,
+// then 3) on a slot facing the same way, reaching over the nearer lanes, and needs more sorters for it. A farther lane
+// is slower. The taps are first assigned in the order of the netlist; when that leaves a tap on a farther lane or fails
+// for want of slots, they are assigned again in order of their demand, the share of a span-1 sorter's rate they need,
+// the most demanding first (the highest-rate input on the nearest lane, M2), and the assignment with fewer sorters
+// wins (then the lower total span; a tie keeps the netlist order). Either way the taps come back in net order. A span-2
+// or 3 sorter that reaches over another net's belt is legal for the validator (sorters do not collide with belts) and
+// unverified in game: Task 30's checklist.
+//
 // Motifs. The slots that the internal sorters of `Netlist.motifs` use are taken before the first tap is assigned.
 //
 // Ports. A net that starts or ends at a station takes one of its 12 ports. A station's nets are matched to its ports
@@ -142,6 +152,8 @@ class Assigner {
     private readonly occ: Occupancy,
     private readonly data: GameDataIndex,
     private readonly effects: TechEffects,
+    /** Assign the most demanding taps first instead of in netlist order. */
+    private readonly byDemand = false,
   ) {
     this.reach = data.data.constants.sorterMaxReachMeters;
     // the slots the internal sorters of motifs use are theirs: a slot takes one sorter
@@ -158,7 +170,7 @@ class Assigner {
 
   run(): TapAssignment {
     this.assignPorts();
-    for (const n of this.net.nets) this.assignNet(n);
+    this.assignAllTaps();
     return { taps: this.taps, stationPorts: this.ports };
   }
 
@@ -355,9 +367,38 @@ class Assigner {
   // -------------------------------------------------------------------------------------------
   // Taps
 
-  private assignNet(n: BeltNet): void {
-    const stack = netStack(n.source.kind === 'station', this.effects);
-    for (const tap of n.taps) this.assignTap(n, tap, stack);
+  /**
+   * Assigns every tap of every net, in netlist order or (`byDemand`) the most demanding first, and puts the sorters in
+   * net order, then the order of the net's taps, then sorter index.
+   */
+  private assignAllTaps(): void {
+    interface Job {
+      net: BeltNet;
+      tap: NetTap;
+      stack: number;
+      /** The share of one span-1 sorter's rate the tap needs. */
+      demand: number;
+      order: number;
+    }
+    const jobs: Job[] = [];
+    const tier = this.net.sorterTierItemId;
+    for (const n of this.net.nets) {
+      const stack = netStack(n.source.kind === 'station', this.effects);
+      for (const tap of n.taps) {
+        const cap = sorterRate(tier, 1, tap.dir === 'in' ? stack : 0, this.effects, this.data);
+        jobs.push({ net: n, tap, stack, demand: tap.rate / cap, order: jobs.length });
+      }
+    }
+    const sequence = this.byDemand
+      ? [...jobs].sort((a, b) => (Math.abs(a.demand - b.demand) > SCORE_EPS ? b.demand - a.demand : a.order - b.order))
+      : jobs;
+    const placed = new Map<AssignedTap, number>();
+    for (const job of sequence) {
+      const before = this.taps.length;
+      this.assignTap(job.net, job.tap, job.stack);
+      for (let i = before; i < this.taps.length; i++) placed.set(this.taps[i], job.order);
+    }
+    this.taps.sort((a, b) => (placed.get(a) as number) - (placed.get(b) as number) || a.sorterIndex - b.sorterIndex);
   }
 
   /** Does a sorter of `span` on `slot` work for net `netId`? Returns where it taps, or undefined. */
@@ -484,6 +525,9 @@ class Assigner {
   }
 }
 
+/** Sorters, then total span: what the lanes of two assignments of one netlist are compared by (less is better). */
+const cost = (r: TapAssignment): [number, number] => [r.taps.length, r.taps.reduce((sum, t) => sum + t.span, 0)];
+
 /**
  * Picks the sorter slots and station ports of a placed netlist (see the file comment). `occ` must hold the buildings
  * of `placement`. Returns `{ failed }` with a message when a machine runs out of usable slots or a station out of
@@ -495,11 +539,23 @@ export function assignTaps(
   occ: Occupancy,
   data: GameDataIndex,
   effects: TechEffects,
+  /** `repass: false` assigns in netlist order only, with no second pass in order of demand (see the file comment). */
+  options: { repass?: boolean } = {},
 ): TapAssignment | { failed: string } {
-  try {
-    return new Assigner(net, placement, occ, data, effects).run();
-  } catch (err) {
-    if (err instanceof Failure) return { failed: err.message };
-    throw err;
-  }
+  const attempt = (byDemand: boolean): TapAssignment | { failed: string } => {
+    try {
+      return new Assigner(net, placement, occ, data, effects, byDemand).run();
+    } catch (err) {
+      if (err instanceof Failure) return { failed: err.message };
+      throw err;
+    }
+  };
+  const inOrder = attempt(false);
+  // nothing on a farther lane (or in the way): the lanes are as good as they get
+  if (options.repass === false || (!('failed' in inOrder) && inOrder.taps.every((t) => t.span === 1))) return inOrder;
+  const byDemand = attempt(true);
+  if ('failed' in byDemand) return inOrder;
+  if ('failed' in inOrder) return byDemand;
+  const [a, b] = [cost(inOrder), cost(byDemand)];
+  return b[0] < a[0] || (b[0] === a[0] && b[1] < a[1]) ? byDemand : inOrder;
 }

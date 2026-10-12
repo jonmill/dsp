@@ -10,11 +10,13 @@
 //
 // One allowance, and only for the items in `NEEDS_LONGER_WINDOW`: the solver's own (`validateWithRetry`), where a layout
 // whose only violation is SIM_OUTPUT_LOW, less than 2 % short, is measured once more over twice the window and that
-// verdict stands. Hydrogen Fuel Rod needs it: its four final-stage machines work in step, so its 60 s windows alternate
-// between 0.933 and 1.067 of the rate and a 300 s window reads 0.987 or 1.000 depending on where it starts (the average
-// is 1.000). Every other item has to pass the plain validation, and an item in the list that passes it fails the test,
-// so the list stays honest. The threshold (99 % of the rate) is the validator's, unchanged.
-// Slow: about 4 minutes, logging the runtime of every item. Run with `npm run test:e2e`; `npm test` leaves it out.
+// verdict stands. Hydrogen Fuel Rod used to need it: its four final-stage machines work in step, so its 60 s windows
+// alternate between 0.933 and 1.067 of the rate and a 300 s window reads 0.987 or 1.000 depending on where it starts (the
+// average is 1.000). Since Task 27 the ladder keeps a layout that passes only over the doubled window for the end and takes
+// the first rung that passes the plain window instead, and Hydrogen Fuel Rod has one, so the list is empty. An item in the
+// list that passes the plain validation fails the test, so the list stays honest. The threshold (99 % of the rate) is the
+// validator's, unchanged.
+// Slow: about 2 minutes, logging the runtime of every item. Run with `npm run test:e2e`; `npm test` leaves it out.
 import { afterAll, describe, expect, it } from 'vitest';
 import type { PlanRequest, ProductionPlan } from '../src/lib/calc';
 import { compatibleFacilities, planProduction, plannableProducers } from '../src/lib/calc';
@@ -86,7 +88,7 @@ const EXPECTED_SKIPPED: Record<string, string> = {
 };
 
 /** Layouts that pass `validateLayout` only over twice the measure window (see the file comment). */
-const NEEDS_LONGER_WINDOW: readonly string[] = ['Hydrogen Fuel Rod'];
+const NEEDS_LONGER_WINDOW: readonly string[] = [];
 
 const log = (line: string): void => void process.stdout.write(`${line}\n`);
 
@@ -173,8 +175,8 @@ describe('fallback ladder sweep [slow]', () => {
           // see the file comment
           expect(report.pass, `${name} passes the plain validation now: take it out of NEEDS_LONGER_WINDOW`).toBe(false);
           report = validateWithRetry(result.layout!, plan, data, effects, { simulate: true });
-          retried = '; the plain window failed, the 2x window passed';
-          retriedItems.push(name);
+          retried = `; the plain window failed, the 2x window ${report.pass ? 'passed' : 'failed too'}`;
+          if (report.pass) retriedItems.push(name);
         }
         const total = (performance.now() - t0) / 1000;
         seconds += total;
@@ -193,7 +195,7 @@ describe('fallback ladder sweep [slow]', () => {
   afterAll(() => {
     log(
       `ladder sweep: ${passed} of ${items.length} plannable items passed, ${seconds.toFixed(0)} s in all; ` +
-        `plain validation passed over the 2x window only for: ${retriedItems.join(', ') || 'none'}`,
+        `plain validation failed but the 2x window passed for: ${retriedItems.join(', ') || 'none'}`,
     );
   });
 });

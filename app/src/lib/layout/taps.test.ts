@@ -1,12 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { buildingDef, buildingOBBs, LEVEL, pointInOBBs, portInfos, slotInfos, sorterEndsValid, sorterTapEnds, sorterTapPoint, TILE } from '../geometry';
 import type { PlacedBuilding, Yaw } from '../geometry';
-import { sorterRate } from '../validate/capacity';
-import { fixtureData, patchBuilding } from '../validate/testkit';
+import { checkCapacity, sorterRate } from '../validate/capacity';
+import { fixtureData, patchBuilding, planOf, planStage } from '../validate/testkit';
 import { netStack } from './netlist';
 import type { Netlist } from './netlist';
 import { constructivePlacement, placementBuildingIdOf, stationBuildingId } from './placement';
 import type { Placement } from './placement';
+import { defaultRouteParams, routeNets } from './router';
 import { assignTaps } from './taps';
 import type { AssignedTap, TapAssignment } from './taps';
 import {
@@ -14,6 +15,7 @@ import {
   BlockingOccupancy,
   data,
   effects,
+  layoutOf,
   occupancyOf,
   PLS,
   processorNetlist,
@@ -513,5 +515,156 @@ describe('assignTaps with the internal sorters of motifs', () => {
     const res = assignTaps({ ...net, motifs: { groups: [], sorters: all } }, placement, occupancyOf(placement.buildings), data, effects);
     expect(res).toHaveProperty('failed');
     expect((res as { failed: string }).failed).toMatch(/no usable sorter slot/);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 27: multi-lane taps (MX §9 M2: several belts side by side along one face of a machine; a sorter of span 2 or 3
+// reaches a farther lane over the nearer ones)
+
+describe('assignTaps multi-lane taps (MX §9 M2)', () => {
+  const MAGNET = 1102;
+  const COPPER = 1104;
+
+  /** One assembler at the origin; only its east face (slots 3, 4, 5, facing east) has tap points a belt can use. */
+  function eastFaceOnly(): { buildings: PlacedBuilding[]; placement: Placement; occ: BlockingOccupancy; east: ReturnType<typeof slotInfos> } {
+    const { buildings, placement } = lone(ASSEMBLER);
+    const infos = slotInfos(buildings[0], buildingDef(data, ASSEMBLER));
+    const east = infos.filter((s) => s.index >= 3 && s.index <= 5);
+    for (const s of east) expect(s.dir).toEqual([1, 0]);
+    const blocked = infos.flatMap((s) => (s.index >= 3 && s.index <= 5 ? [] : [1, 2, 3].map((span) => sorterTapPoint(s, span as 1 | 2 | 3))));
+    return { buildings, placement, occ: new BlockingOccupancy(buildings, blocked), east };
+  }
+
+  /** Nets of one input each (items `items[i]` at `rates[i]`) tapping machine 1, in this order. */
+  const inputNets = (rates: number[], items = [MAGNET, COPPER, 1103]): Netlist =>
+    synthNetlist(
+      [{ building: ASSEMBLER, count: 1 }],
+      [],
+      rates.map((rate, i) => ({ itemId: items[i], rate, taps: [{ machineId: 1, itemId: items[i], dir: 'in' as const, rate, sorters: 1 }] })),
+      2011,
+    );
+
+  const tapsOf = (res: TapAssignment, netId: number): AssignedTap[] => res.taps.filter((t) => t.netId === netId);
+  const sum = (taps: AssignedTap[]): number => taps.reduce((s, t) => s + t.rate, 0);
+
+  /** The layout the taps make once routed, judged by the rate checks the solver relies on. */
+  function capacityOf(net: Netlist, placement: Placement, res: TapAssignment, occ: BlockingOccupancy, inputs: number[], items: number[]) {
+    const routed = routeNets(net, res, occ, defaultRouteParams(occ), () => false);
+    expect(routed.ok, 'the nets route').toBe(true);
+    if (!routed.ok) return [];
+    const layout = layoutOf(net, placement, res, routed.routes);
+    const plan = planOf([planStage(100, { inputs: inputs.map((perSecond, i) => ({ itemId: items[i], perSecond })) })]);
+    return checkCapacity(layout, plan, data, effects);
+  }
+
+  it('when the span-1 tap point of one net lies on the ground of another, that net takes span 2 on a slot facing the same way', () => {
+    const { placement, occ } = eastFaceOnly();
+    // Mk.I sorters from a belt: 1.5/s at span 1, 0.75/s at span 2. Net 1 fills a span-1 lane; net 2 needs 0.5/s.
+    const net = inputNets([1.0, 0.5]);
+    const res = ok(assignTaps(net, placement, occ, data, effects));
+    const first = tapsOf(res, 1);
+    const second = tapsOf(res, 2);
+    expect(first.map((t) => t.span)).toEqual([1]);
+    expect(second).toHaveLength(1);
+    expect(second[0].span).toBe(2);
+    // the same facing: the lane one further out along the east direction
+    expect(second[0].point.x).toBe(first[0].point.x + 1);
+    expect(second[0].axis).toBe(first[0].axis);
+    // distinct slots, and the ground of the two nets is apart
+    expect(second[0].slot).not.toBe(first[0].slot);
+    expect(needed(first[0]).filter((c) => needed(second[0]).includes(c))).toEqual([]);
+    // the sorter rate covers the tap rate
+    expect(sum(second)).toBeCloseTo(0.5, 9);
+    expect(second[0].rate).toBeLessThanOrEqual(sorterRate(2011, 2, 1, effects, data) * (1 + 1e-9));
+  });
+
+  it('adds sorters when one span-2 sorter cannot carry the rate of the net on the farther lane, and the layout passes checkCapacity', () => {
+    const { placement, occ } = eastFaceOnly();
+    // net 1 (1.5/s, one span-1 sorter) covers the ground of the whole face; net 2 needs 1.4/s on the next lane: two span-2 sorters (0.75/s each)
+    const net = inputNets([1.5, 1.4]);
+    const res = ok(assignTaps(net, placement, occ, data, effects));
+    expect(tapsOf(res, 1)).toHaveLength(1);
+    const far = tapsOf(res, 2);
+    expect(far.map((t) => t.span)).toEqual([2, 2]);
+    expect(new Set(far.map((t) => t.slot)).size).toBe(2);
+    expect(sum(far)).toBeCloseTo(1.4, 9);
+    for (const t of far) expect(t.rate).toBeLessThanOrEqual(0.75 * (1 + 1e-9));
+    expect(capacityOf(net, placement, res, occ, [1.5, 1.4], [MAGNET, COPPER])).toEqual([]);
+  });
+
+  it('puts the net with the most demanding tap on the nearest lane, whatever its place in the netlist', () => {
+    const { placement, occ } = eastFaceOnly();
+    // net 1 is a trickle listed first; net 2 needs 3/s, two span-1 sorters. In netlist order the trickle would take a
+    // slot at span 1, net 2 would be left with span 2 on the others, and the face would run out of slots.
+    const net = inputNets([0.2, 3.0]);
+    const res = ok(assignTaps(net, placement, occ, data, effects));
+    const heavy = tapsOf(res, 2);
+    expect(heavy.map((t) => t.span)).toEqual([1, 1]);
+    expect(sum(heavy)).toBeCloseTo(3.0, 9);
+    const light = tapsOf(res, 1);
+    expect(light.map((t) => t.span)).toEqual([2]);
+    expect(light[0].point.x).toBe(heavy[0].point.x + 1);
+    expect(capacityOf(net, placement, res, occ, [0.2, 3.0], [MAGNET, COPPER])).toEqual([]);
+  });
+
+  it('keeps the netlist order when the demand order does not need fewer sorters or less span', () => {
+    const { placement, occ } = eastFaceOnly();
+    // 0.3, 0.4 and 0.2/s: three sorters on spans 1, 2 and 3 in either order; the netlist order stands
+    const res = ok(assignTaps(inputNets([0.3, 0.4, 0.2]), placement, occ, data, effects));
+    expect(res.taps.map((t) => [t.netId, t.span])).toEqual([[1, 1], [2, 2], [3, 3]]);
+  });
+
+  it('returns the taps in net order, then the order of the net\'s taps, whatever order they were assigned in', () => {
+    const { placement, occ } = eastFaceOnly();
+    const res = ok(assignTaps(inputNets([0.2, 3.0]), placement, occ, data, effects));
+    expect(res.taps.map((t) => t.netId)).toEqual([1, 2, 2]);
+    expect(res.taps.filter((t) => t.netId === 2).map((t) => t.sorterIndex)).toEqual([0, 1]);
+  });
+
+  it('three nets on one face take three lanes, spans 1, 2 and 3, all facing east, and every sorter is one the validator accepts', () => {
+    const { buildings, placement, occ } = eastFaceOnly();
+    const net = inputNets([0.4, 0.3, 0.2]);
+    const res = ok(assignTaps(net, placement, occ, data, effects));
+    expect(res.taps).toHaveLength(3);
+    // highest demand nearest
+    expect(res.taps.map((t) => t.span)).toEqual([1, 2, 3]);
+    expect(new Set(res.taps.map((t) => t.axis))).toEqual(new Set(['y']));
+    expect(res.taps.map((t) => t.point.x)).toEqual([2, 3, 4]);
+    const REACH = data.data.constants.sorterMaxReachMeters;
+    const infos = slotInfos(buildings[0], buildingDef(data, ASSEMBLER));
+    for (const t of res.taps) {
+      const slot = infos[t.slot];
+      expect(sorterEndsValid({ ...sorterTapEnds(slot, t.point, t.dir), facings: [slot.dir], toBelt: true }, REACH)).toBe(true);
+      expect(t.rate).toBeLessThanOrEqual(sorterRate(2011, t.span, 1, effects, data) * (1 + 1e-9));
+    }
+    expect(capacityOf(net, placement, res, occ, [0.4, 0.3, 0.2], [MAGNET, COPPER, 1103])).toEqual([]);
+  });
+
+  it('a span-2 or span-3 sorter reaches over the lattice points of the nearer lanes, none of which lies inside a building', () => {
+    const { buildings, placement, occ } = eastFaceOnly();
+    const res = ok(assignTaps(inputNets([0.4, 0.3, 0.2]), placement, occ, data, effects));
+    const allObbs = placement.buildings.flatMap((b) => buildingOBBs(b, buildingDef(data, b.itemId)));
+    const infos = slotInfos(buildings[0], buildingDef(data, ASSEMBLER));
+    for (const t of res.taps) {
+      const slot = infos[t.slot];
+      for (let k = 0; k < t.span - 1; k++) {
+        const x = slot.firstOutside.x + k * slot.dir[0];
+        const y = slot.firstOutside.y + k * slot.dir[1];
+        expect(pointInOBBs(x, y, null, allObbs, 0), `span ${t.span} passes over (${x}, ${y})`).toBe(false);
+      }
+    }
+  });
+
+  it('a farther lane that is not free is not offered: with the span-2 and span-3 lanes blocked the second net fails the usual way', () => {
+    const { placement, buildings, east } = eastFaceOnly();
+    const lanes = east.flatMap((s) => [2, 3].map((span) => sorterTapPoint(s, span as 1 | 2 | 3)));
+    const blocked = new BlockingOccupancy(buildings, [
+      ...lanes,
+      ...slotInfos(buildings[0], buildingDef(data, ASSEMBLER)).flatMap((s) => (s.index >= 3 && s.index <= 5 ? [] : [1, 2, 3].map((span) => sorterTapPoint(s, span as 1 | 2 | 3)))),
+    ]);
+    const res = assignTaps(inputNets([1.0, 0.5]), placement, blocked, data, effects);
+    expect(res).toHaveProperty('failed');
+    expect((res as { failed: string }).failed).toMatch(/net 2/);
   });
 });

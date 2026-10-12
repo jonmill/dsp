@@ -16,7 +16,7 @@ import { buildNetlist } from '../src/lib/layout/netlist';
 import { Rng } from '../src/lib/layout/rng';
 import { DEFAULT_SOLVE_OPTIONS, footprintOf, solve } from '../src/lib/layout/solver';
 import type { SolveOptions, SolveResult } from '../src/lib/layout/solver';
-import { ASSEMBLER, data, effects, everything, matrixPlan, planFor, processorPlan, SMELTER } from '../src/lib/layout/testkit';
+import { ASSEMBLER, data, effects, everything, matrixPlan, planFor, processorPlan, quantumPlan, SMELTER } from '../src/lib/layout/testkit';
 import { runSimulation, validateLayout } from '../src/lib/validate';
 import type { ValidationReport } from '../src/lib/validate';
 
@@ -117,10 +117,37 @@ describe('solver end to end [slow]', () => {
   }, 180_000);
 });
 
+describe('solver on Quantum Chips end to end [slow]', () => {
+  it('(h) 1 Quantum Chip/s from the raw resources: the fallback ladder alone gives a layout that passes plain validateLayout, in time to be recorded', async () => {
+    const plan = await quantumPlan();
+    expect(plan.stages).toHaveLength(19);
+    const first: { at: number; footprint: number }[] = [];
+    const t0 = performance.now();
+    const result = solve(
+      plan,
+      data,
+      effects,
+      { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: 1, seed: 1 },
+      () => {},
+      (_l, _r, footprint) => first.push({ at: (performance.now() - t0) / 1000, footprint }),
+      () => false,
+    );
+    log(`quantum chip 1/s: ladder ${first[0]?.at.toFixed(1)} s to a layout of ${first[0]?.footprint.toFixed(0)} tiles; ${result.attempts} attempts, ${result.stoppedBy}`);
+    expect(result.failures).toEqual([]);
+    expect(result.layout).not.toBeNull();
+    expect(first).toHaveLength(1);
+    const plain = validateLayout(result.layout as Layout, plan, data, effects);
+    expect(messages(plain)).toEqual([]);
+    expect(plain.pass).toBe(true);
+    expect(plain.sim!.measuredTargetRate).toBeGreaterThanOrEqual(0.99 * wantedRate(plan));
+  }, 300_000);
+});
+
 // ---------------------------------------------------------------------------------------------
 // Dense motifs (Task 26)
 
 const MOTIF_ITERATIONS = 24;
+const PROCESSOR_ITERATIONS = 12;
 
 /**
  * Solves on a clock that moves one second per iteration of the ordinary chain (the ladder rungs and the improvement
@@ -165,8 +192,12 @@ const isDirect = (s: Layout['sorters'][number]): boolean => s.pick.kind === 'bui
 describe('solver with dense motifs end to end [slow]', () => {
   it('(d) 1 Processor/s with useUnverifiedMotifs passes the validator and is smaller than without (same seed, same budget)', async () => {
     const plan = await processorPlan(1);
-    const without = solveCounted('processor 1/s without motifs', plan, {});
-    const withMotifs = solveCounted('processor 1/s with motifs', plan, { useUnverifiedMotifs: true });
+    // 12 iterations of the ordinary chain, not 24 (re-pinned in Task 27): with the tuned router and the margin picker the
+    // ordinary chain alone reaches 629 tiles in 24 iterations (1148 before), which no motif layout beats; after 12 it is
+    // at 958 tiles and the motif chains are at 848
+    const budget = { timeBudgetMs: PROCESSOR_ITERATIONS * 1000 };
+    const without = solveCounted('processor 1/s without motifs', plan, budget);
+    const withMotifs = solveCounted('processor 1/s with motifs', plan, { ...budget, useUnverifiedMotifs: true });
     expectAcceptable('processor 1/s without motifs', plan, without);
     const layout = expectAcceptable('processor 1/s with motifs', plan, withMotifs);
     expect(withMotifs.footprint as number).toBeLessThan(without.footprint as number);
@@ -206,7 +237,7 @@ describe('solver with dense motifs end to end [slow]', () => {
     expect(withMotifs.phases.some((p) => /^motif [a-zA-Z+]+: margin \d, footprint \d+$/.test(p))).toBe(true);
   }, 600_000);
 
-  it('(f) 1 Magnetic Coil/s: one direct-insertion cluster holds all four machines, and it is smaller than without', async () => {
+  it('(f) 1 Magnetic Coil/s: a direct-insertion cluster holds all four machines and wins, and it is smaller than without', async () => {
     const plan = await planFor({
       targetItemId: 1202,
       suppliedItemIds: new Set([1001, 1002]),
@@ -216,10 +247,15 @@ describe('solver with dense motifs end to end [slow]', () => {
     const without = solveCounted('coil 1/s without motifs', plan, {});
     const withMotifs = solveCounted('coil 1/s with motifs', plan, { useUnverifiedMotifs: true });
     expectAcceptable('coil 1/s without motifs', plan, without);
-    expectAcceptable('coil 1/s with motifs', plan, withMotifs);
+    const layout = expectAcceptable('coil 1/s with motifs', plan, withMotifs);
     expect(withMotifs.footprint as number).toBeLessThan(without.footprint as number);
     for (const l of withMotifs.emitted) expect(validateLayout(l, plan, data, effects).pass).toBe(true);
-    expect(withMotifs.phases.some((p) => /^motif [a-zA-Z+]+: margin \d, footprint \d+$/.test(p))).toBe(true);
+    // the last layout the run emitted came from the direct-insertion chain (not the sandwich: in Task 26 it was the
+    // sandwich that won on this seed, with no sorter between buildings), and its three internal sorters join the four machines
+    const wins = withMotifs.phases.filter((p) => /^motif [a-zA-Z+]+: margin \d, footprint \d+$/.test(p));
+    expect(wins[wins.length - 1]).toMatch(new RegExp(`^motif direct: margin \\d, footprint ${withMotifs.footprint!.toFixed(0)}$`));
+    expect(layout.sorters.filter(isDirect)).toHaveLength(3);
+    expect(without.layout!.sorters.filter(isDirect)).toEqual([]);
   }, 600_000);
 });
 

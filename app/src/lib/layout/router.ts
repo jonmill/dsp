@@ -46,13 +46,26 @@
 // present factor, the present factor grows, and so on until no cell is shared and every net has a route, or
 // maxIterations is reached (or a round changes nothing). A net whose new route fails keeps its old one. Scaling the
 // history with the present factor keeps a cell that stays shared from being cheaper to hold than a detour across two
-// cells others hold, which left the last conflicts of large layouts unresolved. When the same nets are in conflict for
-// `STUCK_ROUNDS` rounds in a row, every other round routes them in the opposite order (the net routed first takes the
-// cell the others need, round after round; Planetary Logistics Station at margin 3 stalled on 3 cells for 30 rounds
-// once its split consumers were routed last). The result is the round with the
-// fewest nets without a route and, among those, the fewest shared cells. The forced nodes of a stop (the node before
-// and after a tap, the step out of a port) count as the net's cells like any other, so the other nets are steered
-// off them.
+// cells others hold, which left the last conflicts of large layouts unresolved. When the same nets are in conflict in
+// `STUCK_ROUNDS + 1` rounds in a row (the first, and `STUCK_ROUNDS` that repeat it), every other round after that routes
+// them in the opposite order (the net routed first takes the cell the others need, round after round; Planetary
+// Logistics Station at margin 3 stalled on 3 cells for 30 rounds once its split consumers were routed last). The result
+// is the round with the fewest nets without a route and, among those, the fewest shared cells. The forced nodes of a
+// stop (the node before and after a tap, the step out of a port) count as the net's cells like any other, so the other
+// nets are steered off them.
+//
+// A net that cannot be routed (Task 27). Its legs are laid one after the other, and a leg can take the cells that a later
+// stop has to be entered through (a net never uses a cell twice), or wall in the node a sink port is entered through.
+// When the leg to a stop finds no route, the net is searched again with the stops of that stop's group in another order
+// (`reorderings`: the failed run first, the group reversed; for a port, the group of the run before it), at most
+// `maxReorders` times, and the order that works is the one the net keeps. A net whose searches fail `maxNetFailures` times
+// in a row is left alone for the rest of the call (a failing search explores the whole window, which is what made hot
+// nets that could not be rerouted cost round after round). `stallRounds` and `hopeless` let a caller that can afford to
+// lose the candidate (the solver's improvement loop) end a negotiation that is not converging; they are off by default.
+//
+// Speed (Task 27). The A* heuristic is weighted (`heuristicWeight`, 1.25): routes about as long as the exact ones in a
+// fifth of the expansions, which at 40 negotiation rounds on 500 nets is the difference between 7 and 30 seconds. With
+// a weight above 1 the first goal found is not always the cheapest, so a route is no longer a shortest one.
 import type { GridPoint } from '../geometry';
 import { MinHeap } from './heap';
 import type { Netlist } from './netlist';
@@ -66,6 +79,30 @@ export interface RouteParams {
   historyFactor: number;
   allowElevation: boolean;
   maxLevel: number;
+  /** Searches of one net that find no route, in a row, after which it is not tried again in this call (default 5). */
+  maxNetFailures?: number;
+  /** A failed net is searched again with other orders of its stops at most this often (default 2). */
+  maxReorders?: number;
+  /**
+   * After this many rounds in a row with the same nets in conflict, every other round routes them in the opposite
+   * order (default `STUCK_ROUNDS`; `Infinity`: never).
+   */
+  stuckRounds?: number;
+  /**
+   * Rounds in a row without a better result after which the negotiation gives up. Omitted: it goes on until it has
+   * converged or `maxIterations` rounds are done (a stuck negotiation can still resolve after 30 rounds).
+   */
+  stallRounds?: number;
+  /**
+   * The negotiation gives up after round `afterRounds` if it still has more than `perNet` conflicts (shared cells plus
+   * nets without a route) for every net: a placement whose routes are that far from clear after a few rounds does not
+   * converge later. Omitted: never.
+   */
+  hopeless?: { afterRounds: number; perNet: number };
+  /** Extra cost of a node per level above the ground (default `ELEVATION_COST`). */
+  elevationCost?: number;
+  /** The A* heuristic's weight; above 1 trades route length for speed (default `HEURISTIC_WEIGHT`). */
+  heuristicWeight?: number;
   /** The search window in tiles; every tap point and port point has to lie inside it (placement bounds + 6). */
   bounds: { minX: number; minY: number; maxX: number; maxY: number };
 }
@@ -74,9 +111,24 @@ export interface RoutedNet {
   /** In flow order: the first node is the belt start. Empty for a net that could not be routed. */
   nodes: GridPoint[];
 }
+/** What a `routeNets` call did, for tuning and tests. */
+export interface RouteStats {
+  /** Negotiation rounds run (the first one routes every net). */
+  rounds: number;
+  /** Searches for a whole net, whether or not they found a route. */
+  netSearches: number;
+  /** Of those, the ones that found no route. */
+  netFailures: number;
+  /** Of the searches, the ones that tried the stops of a failed net in another order. */
+  reorders: number;
+  /** A* expansions in all. */
+  expansions: number;
+  /** After each round: the shared cells plus the nets without a route. */
+  conflictsPerRound: number[];
+}
 export type RouteResult =
-  | { ok: true; routes: RoutedNet[] }
-  | { ok: false; conflicts: number; routes: RoutedNet[]; unroutable: number[] };
+  | { ok: true; routes: RoutedNet[]; stats: RouteStats }
+  | { ok: false; conflicts: number; routes: RoutedNet[]; unroutable: number[]; stats: RouteStats };
 
 /** Tiles of free search space around the placement. */
 export const ROUTE_WINDOW_MARGIN = 6;
@@ -116,15 +168,37 @@ const PHASE_LIFTED_DOWN = 4;
 /** A belt may end in these phases. */
 const END_PHASES = (1 << 1) | (1 << 2);
 const ANY_PHASE = (1 << PHASES) - 1;
+/**
+ * What a node costs per level above the ground. Measured in Task 27. Quantum Chip placements annealed at margin 2 (8 of
+ * them, routed the way the improvement loop does): at 0.25, 5 route and 20 % more nodes are lifted; at 0.5, 5 route; at 1
+ * and 2 none do, the negotiation is too far from converging after 6 rounds. Quantum Chip placements of the ladder (margins
+ * 3, 4, 6): 1, 2 and 4 lift about 16, 23 and 27 % fewer nodes, lay 3, 8 and 14 % more nodes in all, and take 2.3-2.5, 4.2-4.7
+ * and 6-8.5 times as long. Most lifts are crossings that have no route on the ground, so a higher price buys few
+ * fewer of them. Kept at 0.5.
+ */
 const ELEVATION_COST = 0.5;
+/**
+ * A* with the distance to the goal weighted by this much. 1.25 finds routes about as long as 1 does (Quantum Chip at
+ * margin 2: 14.3k nodes either way; Planetary Logistics Station at margin 3: 35.5k against 35.3k) with 7-9 % more
+ * elevated nodes, in a fifth of the expansions (the Station's routing: 27 s to 7 s). At 1.5 the elevated nodes grow by
+ * three quarters (Quantum Chip: 3.2k to 5.7k) for a further saving that the layout does not need.
+ */
+const HEURISTIC_WEIGHT = 1.25;
 /** Added to the heuristic's weight in the heap key, so states nearer a goal win ties between equal f. */
 const TIE_BREAK = 1e-6;
 /** Searches check `shouldStop` every this many expansions. */
 const STOP_CHECK_MASK = 4095;
-/** Rounds with the same nets in conflict after which every other such round routes them in the opposite order. */
+/**
+ * Rounds that repeat the same nets in conflict (after the first one that has them) after which every other round routes
+ * them in the opposite order: with 3, the fifth round is the first reversed.
+ */
 const STUCK_ROUNDS = 3;
 /** The present factor stops growing here: past it every shared cell is as good as forbidden. */
 const MAX_PRESENT_FACTOR = 1e4;
+/** Consecutive failed searches after which a net is not tried again in one `routeNets` call. */
+const MAX_NET_FAILURES = 5;
+/** A failed net is searched again with other orders of its stops at most this often (per search of the net). */
+const MAX_REORDERS = 2;
 /** A leg whose best path crosses itself is searched again with the repeated cells closed, at most this often. */
 const SELF_CROSS_RETRIES = 3;
 
@@ -163,6 +237,13 @@ interface PortStop {
 }
 type Stop = RunStop | PortStop;
 type TapDir = AssignedTap['dir'];
+
+/** The stops of a net in visiting order, and which of them may swap places with which (see `reorderings`). */
+interface StopPlan {
+  stops: Stop[];
+  /** Per stop: the group of runs it may be reordered within (producers, mixed runs, consumers); -1: fixed in place. */
+  group: number[];
+}
 
 /** No consumer before a producer in `kinds`, in the order they are passed. */
 const producersFirst = (kinds: (TapDir | null)[]): boolean => {
@@ -293,7 +374,7 @@ function stopsOf(
   taps: AssignedTap[],
   ports: AssignedStationPort[],
   isSplit: (t: AssignedTap) => boolean = () => false,
-): Stop[] | undefined {
+): StopPlan | undefined {
   const source = ports.find((p) => p.end === 'source');
   const sink = ports.find((p) => p.end === 'sink');
   if ((hasSource && !source) || (hasSink && !sink)) return undefined;
@@ -320,16 +401,22 @@ function stopsOf(
   ];
 
   const stops: Stop[] = [];
+  const groupOf: number[] = [];
+  const push = (stop: Stop, group: number): void => {
+    stops.push(stop);
+    groupOf.push(group);
+  };
   let from: Cell | undefined;
   if (source) {
-    stops.push({ kind: 'start', x: source.point.x, y: source.point.y, facing: headingOf(source.dir[0], source.dir[1]) });
+    push({ kind: 'start', x: source.point.x, y: source.point.y, facing: headingOf(source.dir[0], source.dir[1]) }, -1);
     from = source.point;
   }
-  for (const { runs: group, byId } of groups) {
+  for (const [g, { runs: group, byId }] of groups.entries()) {
+    const gid = byId ? -1 : g;
     let pool = group;
     if (pool.length === 0) continue;
     if (!from && byId) {
-      stops.push(pool[0]);
+      push(pool[0], gid);
       from = pool[0].center;
       pool = pool.slice(1);
     } else if (!from) {
@@ -351,16 +438,49 @@ function stopsOf(
       });
       const head = pool[first];
       pool = pool.filter((_, i) => i !== first);
-      stops.push(head);
+      push(head, gid);
       from = head.center;
     }
     const ordered = byId ? pool : nearestFirst(pool, from);
-    stops.push(...ordered);
+    for (const stop of ordered) push(stop, gid);
     if (ordered.length > 0) from = ordered[ordered.length - 1].center;
   }
-  if (sink) stops.push({ kind: 'end', x: sink.point.x, y: sink.point.y, facing: headingOf(sink.dir[0], sink.dir[1]) });
-  return stops.length > 0 ? stops : undefined;
+  if (sink) push({ kind: 'end', x: sink.point.x, y: sink.point.y, facing: headingOf(sink.dir[0], sink.dir[1]) }, -1);
+  return stops.length > 0 ? { stops, group: groupOf } : undefined;
 }
+
+/**
+ * Other orders for the stops of a net whose leg to stop `k` failed, most promising first. The stop that failed is
+ * usually a run whose cells (or the nodes beside them) an earlier leg took: its group is reordered with it moved to the
+ * front, so that the cells of that run are taken before the legs that used to run over them, and with the group
+ * reversed. A stop that has to stay where it is (a sink port, whose approach an earlier leg walled in; split consumers)
+ * leaves the last run before it to move instead: the group of that run is reordered the same way. Producers still come
+ * before consumers in all of them: only stops of one group change places; the ports and the split consumers, whose order
+ * is the machine id order of the rate axis, stay where they are.
+ */
+function reorderings(plan: StopPlan, k: number): StopPlan[] {
+  let j = k;
+  while (j >= 0 && plan.group[j] < 0) j--;
+  if (j < 0) return [];
+  const g = plan.group[j];
+  const from = plan.group.indexOf(g);
+  const to = plan.group.lastIndexOf(g) + 1;
+  const make = (order: Stop[]): StopPlan => ({ stops: [...plan.stops.slice(0, from), ...order, ...plan.stops.slice(to)], group: plan.group });
+  const members = plan.stops.slice(from, to);
+  const seen = new Set<string>([members.map((m) => stopKey(m)).join('|')]);
+  const out: StopPlan[] = [];
+  const add = (order: Stop[]): void => {
+    const key = order.map((m) => stopKey(m)).join('|');
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(make(order));
+  };
+  if (j > from) add([plan.stops[j], ...members.filter((_, i) => i !== j - from)]);
+  if (members.length > 1) add([...members].reverse());
+  return out;
+}
+
+const stopKey = (s: Stop): string => (s.kind === 'run' ? `${s.axis}${s.cells[0].x},${s.cells[0].y}` : `${s.kind}${s.x},${s.y}`);
 
 // ---------------------------------------------------------------------------------------------
 // The router
@@ -430,6 +550,8 @@ class Router {
   private readonly heap = new MinHeap(4096);
 
   private presentFactor: number;
+  private readonly elevationCost: number;
+  private readonly hWeight: number;
   /** The node before a sink port's first node (cell index), or -1: only the last leg may use it. */
   private approach = -1;
 
@@ -440,6 +562,11 @@ class Router {
   private bestGoal: Goal | undefined;
   private bestPhase = 0;
   private expansions = 0;
+  private rounds = 0;
+  private netSearches = 0;
+  private netFailures = 0;
+  private reorders = 0;
+  private readonly conflictsPerRound: number[] = [];
 
   constructor(
     private readonly net: Netlist,
@@ -464,6 +591,8 @@ class Router {
     this.own = new Int32Array(this.cells);
     this.legBlock = new Int32Array(this.cells);
     this.presentFactor = p.presentFactorStart;
+    this.elevationCost = p.elevationCost ?? ELEVATION_COST;
+    this.hWeight = (p.heuristicWeight ?? HEURISTIC_WEIGHT) + TIE_BREAK;
   }
 
   // -------------------------------------------------------------------------------------------
@@ -506,7 +635,7 @@ class Router {
     return this.own[cell] !== this.ownStamp && this.reserved[this.flatOf(x, y)] === 0 && !this.blocked(x, y, 0, cell);
   }
   private cost(cell: number, z: number): number {
-    return 1 + ELEVATION_COST * z + this.presentFactor * this.use[cell] + this.history[cell];
+    return 1 + this.elevationCost * z + this.presentFactor * this.use[cell] + this.history[cell];
   }
   private nodeCost(n: GridPoint): number {
     return this.cost(this.cellOf(n.x, n.y, n.z), n.z);
@@ -565,7 +694,7 @@ class Router {
     G[s] = g;
     seen[s] = this.stamp;
     (this.parent as Int32Array)[s] = from;
-    this.heap.push(g + this.heuristic(nx, ny) * (1 + TIE_BREAK), s);
+    this.heap.push(g + this.heuristic(nx, ny) * this.hWeight, s);
   }
 
   /**
@@ -594,7 +723,7 @@ class Router {
       parent[s] = -1;
       seen[s] = stamp;
       startOf.set(s, st);
-      heap.push(st.g0 + this.heuristic(st.x, st.y), s);
+      heap.push(st.g0 + this.heuristic(st.x, st.y) * this.hWeight, s);
     }
     const area = this.W * this.H;
 
@@ -742,8 +871,8 @@ class Router {
     return { nodes, start: { x: end.x, y: end.y, z: 0, dir: found.goal.dir, phase, g0: 0, prefix: nodes } };
   }
 
-  /** Routes a net through `stops`; undefined when it cannot be done. Throws `Aborted`. */
-  private routeNet(stops: Stop[]): GridPoint[] | undefined {
+  /** Routes a net through `stops`; the failing stop's index when it cannot be done. Throws `Aborted`. */
+  private routeNet(stops: Stop[]): GridPoint[] | number {
     const end = stops[stops.length - 1];
     const ax = end.kind === 'end' ? end.x + DX[end.facing] : 0;
     const ay = end.kind === 'end' ? end.y + DY[end.facing] : 0;
@@ -751,7 +880,7 @@ class Router {
     this.ownStamp++;
     this.newLeg(stops.length <= 1);
     const firsts = this.startsOf(stops[0], stops[1]?.kind === 'end');
-    if (firsts.length === 0) return undefined;
+    if (firsts.length === 0) return 0;
     if (stops.length === 1) {
       // a lone run: the cheaper direction
       const only = firsts.reduce((a, b) => (b.g0 < a.g0 ? b : a));
@@ -770,19 +899,19 @@ class Router {
       const found = this.leg([start], goals);
       if (found && (!chosen || found.cost < chosen.found.cost)) chosen = { found, start };
     }
-    if (!chosen) return undefined;
+    if (!chosen) return 1;
     this.ownStamp++;
     this.markOwn(chosen.start.prefix, 0);
     let { nodes, start } = this.extend(chosen.found, chosen.start.prefix);
 
     for (let k = 2; k < stops.length; k++) {
       const stop = stops[k];
-      if (stop.kind === 'start') return undefined;
+      if (stop.kind === 'start') return k;
       this.newLeg(k === stops.length - 1);
       const goals = this.goalsOf(stop, start, stops[k + 1]?.kind === 'end');
-      if (goals.length === 0) return undefined;
+      if (goals.length === 0) return k;
       const found = this.leg([start], goals);
-      if (!found) return undefined;
+      if (!found) return k;
       ({ nodes, start } = this.extend(found, nodes));
     }
     return nodes;
@@ -801,7 +930,7 @@ class Router {
       }
     }
     // reserve tap and port points
-    const stopsOfNet: (Stop[] | undefined)[] = nets.map((n) => {
+    const planOfNet: (StopPlan | undefined)[] = nets.map((n) => {
       const taps = this.taps.taps.filter((t) => t.netId === n.id);
       const ports = this.taps.stationPorts.filter((p) => p.netId === n.id);
       for (const t of taps) if (this.inWindow(t.point.x, t.point.y)) this.reserved[this.flatOf(t.point.x, t.point.y)] = n.id;
@@ -815,7 +944,37 @@ class Router {
       .sort((a, b) => nets[b].taps.length - nets[a].taps.length || nets[a].id - nets[b].id);
     const routes: GridPoint[][] = nets.map(() => []);
     /** A net with no stops has nothing to route: it stays without a route. */
-    const routable = (i: number): boolean => stopsOfNet[i] !== undefined;
+    const routable = (i: number): boolean => planOfNet[i] !== undefined;
+    /** Searches of a net that found no route, in a row. A net at `maxNetFailures` is not tried again. */
+    const failStreak: number[] = nets.map(() => 0);
+    const maxFailures = Math.max(1, this.p.maxNetFailures ?? MAX_NET_FAILURES);
+    const maxReorders = this.p.maxReorders ?? MAX_REORDERS;
+    const tried = (i: number): boolean => failStreak[i] < maxFailures;
+    /**
+     * Routes net `i`. When a leg fails, the net is routed again with the stops of that leg's group in other orders (see
+     * `reorderings`), at most `maxReorders` times; the order that works is the one the net keeps for the next round.
+     */
+    const search = (i: number): GridPoint[] | undefined => {
+      let plan = planOfNet[i] as StopPlan;
+      this.netSearches++;
+      let outcome = this.routeNet(plan.stops);
+      let alternatives: StopPlan[] | undefined;
+      for (let attempt = 0; typeof outcome === 'number' && attempt < maxReorders; attempt++) {
+        alternatives ??= reorderings(plan, outcome);
+        const next = alternatives.shift();
+        if (!next) break;
+        this.netSearches++;
+        this.reorders++;
+        const again = this.routeNet(next.stops);
+        if (typeof again !== 'number') planOfNet[i] = plan = next;
+        outcome = again;
+      }
+      if (typeof outcome === 'number') {
+        this.netFailures++;
+        return undefined;
+      }
+      return outcome;
+    };
     type Best = { routes: GridPoint[][]; shared: number; unroutable: number[] };
     let best: Best | undefined;
 
@@ -860,7 +1019,11 @@ class Router {
       let todo = order;
       let lastHot = '';
       let stuck = 0;
+      let bestRound = Infinity;
+      let sinceBest = 0;
+      const stallRounds = this.p.stallRounds === undefined ? Infinity : Math.max(1, this.p.stallRounds);
       for (let iter = 0; iter < Math.max(1, this.p.maxIterations); iter++) {
+        this.rounds++;
         let gained = false;
         for (const i of todo) {
           if (this.shouldStop()) throw new Aborted();
@@ -869,18 +1032,25 @@ class Router {
           routes[i] = [];
           let nodes: GridPoint[] | undefined;
           try {
-            nodes = routable(i) ? this.routeNet(stopsOfNet[i] as Stop[]) : undefined;
+            if (routable(i)) nodes = search(i);
           } catch (err) {
             routes[i] = before;
             addUse(before, 1);
             throw err;
           }
+          failStreak[i] = nodes || !routable(i) ? 0 : failStreak[i] + 1;
           // a net that cannot be routed this time keeps the route it had
           routes[i] = nodes ?? before;
           addUse(routes[i], 1);
           if (nodes && before.length === 0) gained = true;
         }
         const snap = record();
+        const score = snap.shared + unroutableIds().length;
+        this.conflictsPerRound.push(score);
+        sinceBest = score < bestRound ? 0 : sinceBest + 1;
+        bestRound = Math.min(bestRound, score);
+        if (sinceBest >= stallRounds) break;
+        if (this.p.hopeless && this.rounds >= this.p.hopeless.afterRounds && score > this.p.hopeless.perNet * nets.length && score > 0) break;
         const missing = nets.filter((_, i) => routes[i].length === 0 && routable(i)).length;
         if (snap.shared === 0 && missing === 0) break;
         // with nothing shared and no net newly routed, another round would only repeat this one
@@ -893,13 +1063,13 @@ class Router {
             Math.max(this.p.presentFactorStart, MAX_PRESENT_FACTOR),
           );
         }
-        todo = order.filter((i) => snap.hot.has(i) || (routes[i].length === 0 && routable(i)));
+        todo = order.filter((i) => tried(i) && (snap.hot.has(i) || (routes[i].length === 0 && routable(i))));
         // The same nets in conflict round after round: whichever of them is routed first takes the cell the others
         // need, every time. Routing them in the opposite order every other round lets the other one have it.
         const hotKey = todo.join(',');
         stuck = hotKey === lastHot ? stuck + 1 : 0;
         lastHot = hotKey;
-        if (stuck >= STUCK_ROUNDS && stuck % 2 === 1) todo.reverse();
+        if (stuck >= (this.p.stuckRounds ?? STUCK_ROUNDS) && stuck % 2 === 1) todo.reverse();
         if (todo.length === 0) break;
       }
     } catch (err) {
@@ -913,9 +1083,10 @@ class Router {
 
   private result(best: { routes: GridPoint[][]; shared: number; unroutable: number[] }, stopped: boolean): RouteResult {
     const out: RoutedNet[] = this.net.nets.map((n, i) => ({ netId: n.id, nodes: best.routes[i] }));
-    if (best.shared === 0 && best.unroutable.length === 0 && !stopped) return { ok: true, routes: out };
+    const stats: RouteStats = { rounds: this.rounds, netSearches: this.netSearches, netFailures: this.netFailures, reorders: this.reorders, expansions: this.expansions, conflictsPerRound: this.conflictsPerRound };
+    if (best.shared === 0 && best.unroutable.length === 0 && !stopped) return { ok: true, routes: out, stats };
     const conflicts = best.shared + best.unroutable.length;
-    return { ok: false, conflicts: Math.max(conflicts, stopped ? 1 : 0), routes: out, unroutable: best.unroutable };
+    return { ok: false, conflicts: Math.max(conflicts, stopped ? 1 : 0), routes: out, unroutable: best.unroutable, stats };
   }
 }
 

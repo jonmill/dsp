@@ -12,7 +12,8 @@
     "lint": "eslint .",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "schema": "tsx scripts/export-schema.ts",
-    "emit:test-bp": "tsx scripts/emit-test-blueprint.ts"
+    "emit:test-bp": "tsx scripts/emit-test-blueprint.ts",
+    "bench": "tsx scripts/bench.ts"
   },
   "dependencies": {
     "glpk.js": "^5.0.0",

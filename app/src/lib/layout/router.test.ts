@@ -90,8 +90,8 @@ function beltViolations(routes: RoutedNet[], buildings: PlacedBuilding[] = []) {
 }
 
 describe('routeNets: one net in an empty area', () => {
-  it('finds a shortest path of 4-adjacent nodes between two ports', () => {
-    const res = route([{ id: 1, source: { x: 2, y: 5, dir: E }, sink: { x: 17, y: 15, dir: W } }]);
+  it('finds a shortest path of 4-adjacent nodes between two ports when the heuristic is not weighted', () => {
+    const res = route([{ id: 1, source: { x: 2, y: 5, dir: E }, sink: { x: 17, y: 15, dir: W } }], { heuristicWeight: 1 });
     expect(res.ok).toBe(true);
     const nodes = routeOf(res, 1);
     // 15 east and 10 north: 25 steps, 26 nodes
@@ -100,6 +100,16 @@ describe('routeNets: one net in an empty area', () => {
     expect(nodes.every((p) => p.z === 0)).toBe(true);
     expect(nodes[0]).toEqual({ x: 2, y: 5, z: 0 });
     expect(nodes[nodes.length - 1]).toEqual({ x: 17, y: 15, z: 0 });
+  });
+
+  it('with the default weighted heuristic the path is at most a quarter longer than the shortest, in a fifth of the expansions', () => {
+    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, sink: { x: 17, y: 15, dir: W } }];
+    const weighted = route(spec);
+    const exact = route(spec, { heuristicWeight: 1 });
+    expect(weighted.ok).toBe(true);
+    expect(routeOf(weighted, 1).length).toBeLessThanOrEqual(routeOf(exact, 1).length * 1.25);
+    expect(routeOf(weighted, 1).every((p) => p.z === 0)).toBe(true);
+    expect(weighted.stats.expansions).toBeLessThanOrEqual(exact.stats.expansions);
   });
 
   it('steps straight out of the source port and straight into the sink port', () => {
@@ -677,29 +687,29 @@ describe('split consumers (a machine that takes one item on two nets)', () => {
 });
 
 describe('a negotiation that stalls', () => {
-  // Four nets of 3-6 taps in a 16 x 16 window, found by a random search: with every round routing the nets in
-  // conflict in the same order the same single cell stays shared for all 40 rounds; routing them in the opposite
-  // order every other round resolves it.
+  // Four nets of 3-5 taps in a 16 x 16 window, found by a random search (re-found for Task 27's weighted heuristic): with
+  // every round routing the nets in conflict in the same order the shared cells never clear in 40 rounds; routing them in
+  // the opposite order every other round resolves it.
   const TAPS: [net: number, machine: number, x: number, y: number, dir: 'in' | 'out'][] = [
-    [1, 101, 12, 13, 'out'],
-    [1, 102, 4, 14, 'in'],
-    [1, 103, 3, 12, 'in'],
-    [2, 201, 13, 9, 'out'],
-    [2, 202, 13, 14, 'in'],
-    [2, 203, 10, 11, 'in'],
-    [2, 204, 11, 15, 'in'],
-    [3, 301, 11, 7, 'out'],
-    [3, 302, 14, 5, 'out'],
-    [3, 303, 5, 1, 'in'],
-    [3, 304, 7, 5, 'in'],
-    [3, 305, 4, 7, 'in'],
-    [3, 306, 11, 10, 'in'],
-    [4, 401, 6, 3, 'out'],
-    [4, 402, 9, 4, 'in'],
-    [4, 403, 5, 2, 'in'],
+    [1, 100, 11, 11, 'out'],
+    [1, 101, 11, 7, 'in'],
+    [1, 102, 12, 2, 'in'],
+    [1, 103, 5, 11, 'in'],
+    [2, 200, 13, 5, 'out'],
+    [2, 201, 13, 10, 'in'],
+    [2, 202, 14, 9, 'in'],
+    [2, 203, 2, 14, 'in'],
+    [2, 204, 13, 3, 'in'],
+    [3, 300, 2, 5, 'out'],
+    [3, 301, 2, 13, 'in'],
+    [3, 302, 13, 13, 'in'],
+    [4, 400, 2, 3, 'out'],
+    [4, 401, 5, 12, 'in'],
+    [4, 402, 6, 10, 'in'],
+    [4, 403, 6, 7, 'in'],
   ];
 
-  it('is resolved by routing the nets in conflict in the opposite order every other round', () => {
+  const go = (over: Partial<RouteParams>) => {
     const nets: Partial<BeltNet>[] = [1, 2, 3, 4].map((id) => ({
       source: { kind: 'taps' },
       sink: { kind: 'deadEnd' },
@@ -717,7 +727,220 @@ describe('a negotiation that stalls', () => {
       sorterIndex: 0,
       rate: 1,
     }));
-    const res = routeNets(net, { taps, stationPorts: [] }, occupancyOf([]), params({ allowElevation: false, maxLevel: 0, bounds: { minX: 0, minY: 0, maxX: 16, maxY: 16 } }), never);
+    return routeNets(net, { taps, stationPorts: [] }, occupancyOf([]), params({ allowElevation: false, maxLevel: 0, bounds: { minX: 0, minY: 0, maxX: 16, maxY: 16 }, ...over }), never);
+  };
+
+  it('is resolved by routing the nets in conflict in the opposite order every other round', () => {
+    const res = go({});
     expect(res.ok).toBe(true);
+    // the reversal starts in the fifth round: the same nets were in conflict in the four before it
+    expect(res.stats.rounds).toBeGreaterThan(4);
+  });
+
+  it('is not resolved in 40 rounds when the order is never reversed', () => {
+    const res = go({ stuckRounds: Infinity });
+    expect(res.ok).toBe(false);
+    expect(res.stats.rounds).toBe(40);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Task 27: reordering fallback, failure cap, stall stop, leg windows
+
+/** One net of taps only (machine id, x, y, axis, direction) in a `size` x `size` window, routed on the ground. */
+function tapsOnly(taps: [machine: number, x: number, y: number, axis: 'x' | 'y', dir: 'in' | 'out'][], over: Partial<RouteParams> = {}, obstacles: PlacedBuilding[] = [], size = 14) {
+  const net = synthNetlist(
+    [{ building: ASSEMBLER, count: 1 }],
+    [],
+    [{ taps: taps.map((t) => ({ machineId: t[0], itemId: 1001, dir: t[4], rate: 1, sorters: 1 })) }],
+  );
+  const assigned: AssignedTap[] = taps.map(([machineId, x, y, axis, dir]) => ({
+    netId: 1,
+    machineId,
+    slot: 0,
+    span: 1,
+    point: { x, y },
+    axis,
+    dir,
+    sorterIndex: 0,
+    rate: 1,
+  }));
+  return routeNets(
+    net,
+    { taps: assigned, stationPorts: [] },
+    occupancyOf(obstacles),
+    params({ allowElevation: false, maxLevel: 0, maxIterations: 10, bounds: { minX: 0, minY: 0, maxX: size, maxY: size }, ...over }),
+    never,
+  );
+}
+
+describe('a net whose earlier leg takes the entry of a later run', () => {
+  // Found by a random search over small nets: routed in the order of nearest neighbours, the leg to the second consumer
+  // run crosses the cells the last run has to be entered through, and the last run cannot be reached any more.
+  const TAPS: [number, number, number, 'x' | 'y', 'in' | 'out'][] = [
+    [100, 9, 7, 'x', 'out'],
+    [101, 8, 6, 'y', 'in'],
+    [102, 7, 7, 'y', 'in'],
+    [103, 3, 6, 'x', 'in'],
+  ];
+
+  it('is unroutable in the first order of its stops', () => {
+    const res = tapsOnly(TAPS, { maxReorders: 0 });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.unroutable).toEqual([1]);
+    expect(res.stats.reorders).toBe(0);
+  });
+
+  it('is routed by trying the stops of the failed leg in another order, with every tap served and no BELT violation', () => {
+    const res = tapsOnly(TAPS);
+    expect(res.ok).toBe(true);
+    expect(res.stats.reorders).toBeGreaterThanOrEqual(1);
+    const nodes = routeOf(res, 1);
+    for (const [, x, y, axis] of TAPS) {
+      const i = at(nodes, x, y);
+      expect(i, `tap ${x},${y}`).toBeGreaterThan(0);
+      // the belt runs straight along the axis through the tap, with a node before and after it
+      const before = nodes[i - 1];
+      const after = nodes[i + 1];
+      expect(after, `a node after tap ${x},${y}`).toBeDefined();
+      expect(axis === 'x' ? before.y === y && after.y === y : before.x === x && after.x === x).toBe(true);
+    }
+    // the producer comes first on the belt
+    const producer = at(nodes, 9, 7);
+    for (const [, x, y] of TAPS.slice(1)) expect(at(nodes, x, y)).toBeGreaterThan(producer);
+    expect(beltViolations(res.routes)).toEqual([]);
+  });
+
+  it('is deterministic', () => {
+    expect(tapsOnly(TAPS)).toEqual(tapsOnly(TAPS));
+  });
+
+  it('also when the stop that fails is a sink port whose approach the first leg walled in: the producers before it change places', () => {
+    // two producers, then a sink port whose approach node (19, 6) lies on the way to the second producer: with the
+    // weighted heuristic the first leg comes down the column beside the port and shuts it in
+    const taps: Spec['taps'] = [
+      { x: 2, y: 17, axis: 'x', dir: 'out' },
+      { x: 19, y: 4, axis: 'y', dir: 'out' },
+    ];
+    const spec: Spec[] = [{ id: 1, taps, sink: { x: 18, y: 6, dir: E } }];
+    const bounds = { minX: 0, minY: 0, maxX: 30, maxY: 30 };
+    const without = route(spec, { bounds, maxReorders: 0 });
+    expect(without.ok).toBe(false);
+    const res = route(spec, { bounds });
+    expect(res.ok).toBe(true);
+    expect(res.stats.reorders).toBeGreaterThanOrEqual(1);
+    const nodes = routeOf(res, 1);
+    expect(nodes[nodes.length - 1]).toEqual({ x: 18, y: 6, z: 0 });
+    expect(nodes[nodes.length - 2]).toEqual({ x: 19, y: 6, z: 0 });
+    expect(beltViolations(res.routes)).toEqual([]);
+  });
+});
+
+describe('nets that keep failing', () => {
+  // Two nets that cross and cannot both stay on the ground (so the negotiation goes on round after round) and a third
+  // whose only tap has a building on both sides along its axis: it never gets a route, whatever the others do.
+  const plug: PlacedBuilding[] = [
+    { id: 300, itemId: ASSEMBLER, x: 6, y: 8, z: 0, yaw: 0 },
+    { id: 301, itemId: ASSEMBLER, x: 10, y: 8, z: 0, yaw: 0 },
+  ];
+  const specs: Spec[] = [
+    { id: 1, source: { x: 0, y: 12, dir: E }, sink: { x: 16, y: 12, dir: W } },
+    { id: 2, source: { x: 8, y: 2, dir: N }, sink: { x: 8, y: 16, dir: S } },
+    { id: 3, taps: [{ x: 8, y: 8, axis: 'x', dir: 'in' }] },
+  ];
+  const go = (over: Partial<RouteParams>) =>
+    route(specs, { allowElevation: false, maxLevel: 0, maxIterations: 20, bounds: { minX: 0, minY: 0, maxX: 16, maxY: 16 }, ...over }, plug);
+
+  it('are tried a limited number of times in a row, not in every round', () => {
+    const capped = go({ maxNetFailures: 3 });
+    const uncapped = go({ maxNetFailures: 1000 });
+    expect(capped.ok).toBe(false);
+    if (!capped.ok) expect(capped.unroutable).toContain(3);
+    // without the cap the enclosed net is searched again in every round the crossing nets keep the negotiation going
+    expect(uncapped.stats.rounds).toBeGreaterThanOrEqual(8);
+    expect(uncapped.stats.netFailures).toBe(uncapped.stats.rounds);
+    expect(capped.stats.netFailures).toBe(3);
+    expect(capped.stats.netSearches).toBeLessThan(uncapped.stats.netSearches);
+    // the others are still routed as well as before
+    expect(capped.routes.find((r) => r.netId === 1)?.nodes.length).toBeGreaterThan(2);
+    expect(capped.routes.find((r) => r.netId === 2)?.nodes.length).toBeGreaterThan(2);
+  });
+
+  it('count a failure only when every order of the stops failed', () => {
+    const res = go({ maxNetFailures: 1000, maxIterations: 4 });
+    // net 3 has one stop, so it has no other order: one failed search per round
+    expect(res.stats.reorders).toBe(0);
+    expect(res.stats.netFailures).toBe(res.stats.rounds);
+  });
+});
+
+describe('elevationCost', () => {
+  // net 2 crosses net 1 in the middle of its short run from (10, 8) to (10, 12): it can hop over the belt or go round it
+  const specs: Spec[] = [
+    { id: 1, source: { x: 2, y: 10, dir: E }, sink: { x: 18, y: 10, dir: W } },
+    { id: 2, source: { x: 10, y: 8, dir: N }, sink: { x: 10, y: 12, dir: S } },
+  ];
+  const lifted = (res: { routes: RoutedNet[] }): number => res.routes.flatMap((r) => r.nodes).filter((p) => p.z > 0).length;
+
+  it('prices a lift: with cheap lifts a belt hops the one it crosses, with dear ones it goes round on the ground', () => {
+    const cheap = route(specs, { elevationCost: 0.5 });
+    const dear = route(specs, { elevationCost: 50 });
+    expect(cheap.ok).toBe(true);
+    expect(dear.ok).toBe(true);
+    expect(lifted(cheap)).toBeGreaterThan(0);
+    expect(lifted(dear)).toBe(0);
+    const length = (res: { routes: RoutedNet[] }): number => res.routes.reduce((n, r) => n + r.nodes.length, 0);
+    expect(length(dear)).toBeGreaterThan(length(cheap));
+  });
+
+  it('defaults to 0.5 a level', () => {
+    expect(route(specs).routes).toEqual(route(specs, { elevationCost: 0.5 }).routes);
+  });
+});
+
+describe('a negotiation that does not get better', () => {
+  const cross: Spec[] = [
+    { id: 1, source: { x: 0, y: 10, dir: E }, sink: { x: 20, y: 10, dir: W } },
+    { id: 2, source: { x: 10, y: 0, dir: N }, sink: { x: 10, y: 20, dir: S } },
+  ];
+
+  it('goes on to maxIterations rounds by default and gives up after stallRounds rounds in a row with no better result', () => {
+    const plain = route(cross, { allowElevation: false, maxIterations: 30 });
+    expect(plain.ok).toBe(false);
+    expect(plain.stats.rounds).toBe(30);
+    const stalled = route(cross, { allowElevation: false, maxIterations: 30, stallRounds: 4 });
+    expect(stalled.ok).toBe(false);
+    expect(stalled.stats.rounds).toBeLessThan(10);
+    // what comes back is the best round, the same as the long run's
+    expect(stalled.stats.conflictsPerRound.length).toBe(stalled.stats.rounds);
+    if (!plain.ok && !stalled.ok) expect(stalled.conflicts).toBe(plain.conflicts);
+  });
+
+  it('does not give up while the rounds keep improving', () => {
+    // four nets: 6, 6, 3, 4, 3, 0 conflicts in the six rounds it takes; the stall count starts again at the better round
+    const specs: Spec[] = [
+      ...cross,
+      { id: 3, source: { x: 0, y: 6, dir: E }, sink: { x: 20, y: 14, dir: W } },
+      { id: 4, source: { x: 6, y: 0, dir: N }, sink: { x: 14, y: 20, dir: S } },
+    ];
+    const res = route(specs, { stallRounds: 3 });
+    expect(res.ok).toBe(true);
+    expect(res.stats.conflictsPerRound).toEqual([6, 6, 3, 4, 3, 0]);
+    expect(route(specs, { stallRounds: 2 }).ok).toBe(false);
+  });
+
+  it('gives up once the rounds that are due have passed and more than the allowed conflicts per net are left', () => {
+    // four nets with 6, 6, 3, 4, 3, 0 conflicts in its six rounds: 1.5 per net in the second
+    const specs: Spec[] = [
+      ...cross,
+      { id: 3, source: { x: 0, y: 6, dir: E }, sink: { x: 20, y: 14, dir: W } },
+      { id: 4, source: { x: 6, y: 0, dir: N }, sink: { x: 14, y: 20, dir: S } },
+    ];
+    const strict = route(specs, { hopeless: { afterRounds: 2, perNet: 1 } });
+    expect(strict.ok).toBe(false);
+    expect(strict.stats.rounds).toBe(2);
+    // not before its round, and not when the conflicts are within the allowance
+    expect(route(specs, { hopeless: { afterRounds: 4, perNet: 1 } }).stats.conflictsPerRound).toEqual([6, 6, 3, 4, 3, 0]);
+    expect(route(specs, { hopeless: { afterRounds: 2, perNet: 2 } }).ok).toBe(true);
   });
 });

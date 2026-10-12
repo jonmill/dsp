@@ -99,8 +99,8 @@ const BASE_TIER_BY_TYPE: Record<string, number> = {
   RESEARCH: 2901,
 };
 
-/** 1 Quantum Chip/s on base-tier machines: 19 stages, 231 machines, 56 nets. */
-export async function quantumNetlist(): Promise<Netlist> {
+/** 1 Quantum Chip/s on base-tier machines from the raw resources and Hydrogen: 19 stages, 231 machines, 56 nets. */
+export async function quantumPlan(): Promise<ProductionPlan> {
   const request: PlanRequest = {
     targetItemId: 1305,
     quantity: { kind: 'rate', perSecond: 1 },
@@ -116,7 +116,12 @@ export async function quantumNetlist(): Promise<Netlist> {
   };
   const result = await planProduction(request, data, effects);
   if (!result.ok) throw new Error(`plan failed: ${result.error.kind}: ${result.error.message}`);
-  return buildNetlist(result.plan, data, effects);
+  return result.plan;
+}
+
+/** The netlist of `quantumPlan`. */
+export async function quantumNetlist(): Promise<Netlist> {
+  return buildNetlist(await quantumPlan(), data, effects);
 }
 
 /** A hand-made netlist of `count` machines of `building` (ids 1..count) and the given nets. */

@@ -1272,7 +1272,7 @@ export function routeNets(net: Netlist, taps: TapAssignment, occ: Occupancy, p: 
 
 **Files:**
 - Create: `app/src/lib/layout/solver.ts`, `app/src/lib/layout/worker.ts`, `app/src/lib/layout/client.ts`, `app/src/lib/layout/index.ts`
-- Test: `solver.test.ts`, `app/test/solver-e2e.test.ts`
+- Test: `solver.test.ts`, `app/test/solver.e2e.test.ts`
 
 **Interfaces:**
 - Produces:
@@ -1312,7 +1312,7 @@ export function footprintOf(layout: Layout, data: GameDataIndex): number;   // b
   - The budget stop triggers.
   - The user stop returns the best found.
   - Determinism for a fixed seed.
-- [ ] **Step 2:** `test/solver-e2e.test.ts`, marked with a 180 s timeout, using `simWarmupTicks: 1800, simMeasureTicks: 3600` to keep it fast. For fixture plans (a) 3 iron ingots/s, (b) 1 Circuit Board/s from iron and copper ore, (c) 1 Processor/s from ores (Mk.III assemblers, Mk.II belts), with a 20 s budget:
+- [ ] **Step 2:** `test/solver.e2e.test.ts`, marked with a 180 s timeout, using `simWarmupTicks: 1800, simMeasureTicks: 3600` to keep it fast. For fixture plans (a) 3 iron ingots/s, (b) 1 Circuit Board/s from iron and copper ore, (c) 1 Processor/s from ores (Mk.III assemblers, Mk.II belts), with a 20 s budget:
   - `layout != null`;
   - `report.pass`;
   - `report.sim.measuredTargetRate ≥ 0.99·plan rate`;

@@ -3,7 +3,7 @@ import { GameDataIndex } from '../../data';
 import type { Layout } from '../../geometry';
 import { checkSimulation } from '../report';
 import { codesOf, fixtureData, fixtureEffects, ITEM, LayoutKit, line, only, onNode, onSlot, planOf, refineryLayout, smelterRowLayout, stationConfig, stationPairLayout } from '../testkit';
-import { MAX_WARMUP_TICKS, runSimulation } from './run';
+import { ABORT_CHECK_TICKS, MAX_WARMUP_TICKS, runSimulation, SimulationAborted, WarmupNotSettled } from './run';
 import type { SimResult } from './run';
 
 const TPS = 60;
@@ -577,5 +577,69 @@ describe('runSimulation: spray coaters', () => {
     const sim = runSimulation(layout, row.plan, fixtureData, fixtureEffects, FAST);
     expect(sim.warnings.join('\n')).toMatch(/coater 1.*proliferator belt/);
     expect(sim.measuredTargetRate).toBeGreaterThan(2.9);
+  });
+});
+
+describe('runSimulation: aborting and capping the warm-up (Task 27)', () => {
+  it('asks shouldAbort every ABORT_CHECK_TICKS ticks, in the warm-up and in the measurement, and a run that is not aborted reads the same', () => {
+    const row = smelterRowLayout(3);
+    let asked = 0;
+    const watched = simulate(row, { ...FAST, shouldAbort: () => (asked++, false) });
+    expect(asked).toBe(Math.ceil(FAST.warmupTicks / ABORT_CHECK_TICKS) + Math.ceil(FAST.measureTicks / ABORT_CHECK_TICKS));
+    expect(watched).toEqual(simulate(smelterRowLayout(3), FAST));
+  });
+
+  it('stops with a SimulationAborted at the first yes, in the warm-up', () => {
+    const row = smelterRowLayout(3);
+    let asked = 0;
+    expect(() => simulate(row, { shouldAbort: () => ++asked > 2 })).toThrow(SimulationAborted);
+    expect(asked).toBe(3); // the third question, at tick 1200, ended it: the adaptive warm-up had not even finished a window
+  });
+
+  it('stops with a SimulationAborted in the measurement too', () => {
+    const row = smelterRowLayout(3);
+    const warmupAsks = Math.ceil(FAST.warmupTicks / ABORT_CHECK_TICKS);
+    let asked = 0;
+    expect(() => simulate(row, { ...FAST, shouldAbort: () => ++asked > warmupAsks + 2 })).toThrow(SimulationAborted);
+  });
+
+  it('a warm-up cap that the block settles within changes nothing: the same warm-up and the same measurement', () => {
+    const plain = simulate(smelterRowLayout(3));
+    expect(plain.warmupTicksUsed).toBeGreaterThanOrEqual(7200);
+    const capped = simulate(smelterRowLayout(3), { warmupCapTicks: plain.warmupTicksUsed });
+    expect(capped).toEqual(plain);
+    expect(simulate(smelterRowLayout(3), { warmupCapTicks: 4 * plain.warmupTicksUsed })).toEqual(plain);
+    // one window less and it is given up on
+    expect(() => simulate(smelterRowLayout(3), { warmupCapTicks: plain.warmupTicksUsed - 3600 })).toThrow(WarmupNotSettled);
+  });
+
+  it('a warm-up cap that comes first ends the run with a WarmupNotSettled that names the ticks, and nothing is measured', () => {
+    const row = smelterRowLayout(3);
+    let asked = 0;
+    let thrown: unknown;
+    try {
+      simulate(row, { warmupCapTicks: 3600, shouldAbort: () => (asked++, false) });
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(WarmupNotSettled);
+    expect((thrown as WarmupNotSettled).ticks).toBe(3600);
+    expect((thrown as WarmupNotSettled).message).toMatch(/3600 warm-up ticks/);
+    expect(asked).toBe(3600 / ABORT_CHECK_TICKS); // the warm-up only
+  });
+
+  it('a block that never settles is given up on at the cap instead of running to MAX_WARMUP_TICKS', () => {
+    const dead = smelterRowLayout(3, { deadEnd: true });
+    expect(() => simulate(dead, { warmupCapTicks: 10800 })).toThrow(WarmupNotSettled);
+    // without the cap it runs to the limit and the measurement judges it
+    const sim = simulate(smelterRowLayout(3, { deadEnd: true }), { measureTicks: 600 });
+    expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
+  });
+
+  it('ignores the cap when the warm-up is given, and a cap at or above MAX_WARMUP_TICKS is no cap', () => {
+    const row = smelterRowLayout(3, { deadEnd: true });
+    expect(simulate(row, { warmupTicks: 1200, measureTicks: 600, warmupCapTicks: 600 }).warmupTicksUsed).toBe(1200);
+    const sim = simulate(smelterRowLayout(3, { deadEnd: true }), { measureTicks: 600, warmupCapTicks: MAX_WARMUP_TICKS });
+    expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
   });
 });
