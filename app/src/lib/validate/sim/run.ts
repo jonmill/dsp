@@ -52,9 +52,10 @@ export interface SimOptions {
   /**
    * Whether a result needs no more waiting (for `validateLayout`: that it passes). Asked after each measurement of an
    * adaptive warm-up. When it says no and a belt or a machine's product buffer was still filling over the window (it
-   * gained a share of its capacity and was not full when the window began), the run warms up on for 36000 ticks and
-   * measures again, up to `MAX_FILL_WARMUP_TICKS` in all: a start-up that is still going on has not been judged.
-   * Omitted: the first measurement stands. Ignored when `warmupTicks` is given.
+   * gained 1 % of its capacity per 36000 ticks and was not full when the window began), the run warms up on, 36000 ticks at a
+   * time while one still fills, and measures again when it has run a quarter more ticks than it had (or nothing fills any
+   * more), up to `MAX_FILL_WARMUP_TICKS` in all: a start-up that is still going on has not been judged. Omitted: the first
+   * measurement stands. Ignored when `warmupTicks` is given.
    */
   acceptable?: (result: SimResult) => boolean;
 }
@@ -142,21 +143,25 @@ const WARMUP_WINDOW_TICKS = 3600;
  */
 export const MAX_WARMUP_TICKS = 72000;
 /**
- * The longest a run with `SimOptions.acceptable` warms up (200 game minutes). A producer with slack fills the belt of its
- * product at its surplus, and a stage that shares a scarce input with it runs short meanwhile: a proliferated plan sized
- * to 98 % of its Refined Oil starves the Plastic stage for 80 game minutes while the Sulfuric Acid belt (232 cargo, 0.06
- * cargo/s of surplus) fills, and then reads 103 %. The first 20 game minutes of that read 95 % of a layout that is right.
+ * The longest a run with `SimOptions.acceptable` warms up (1250 game minutes, 21 hours). A producer with slack fills the belt
+ * of its product at its surplus, and a stage that shares a scarce input with it runs short meanwhile. A proliferated
+ * High-Explosive Shell Set sized to 98 % of its Refined Oil starves the Plastic stage for 80 game minutes while the Sulfuric Acid
+ * belt (232 cargo, 0.06 cargo/s of surplus) fills, and then reads 103 % (the first 20 game minutes read 95 % of a layout that is
+ * right). A proliferated Quantum Chip, whose machines upstream on a shared belt run flat out and starve the ones behind, so
+ * that the nets of the first fill at 4 cargo a minute, reads 96 % at 5 game hours, 100 % at 14 and 102 % at 21.
  */
-export const MAX_FILL_WARMUP_TICKS = 720000;
-/** Ticks a run with `SimOptions.acceptable` warms up on for when a belt still fills (10 game minutes). */
+export const MAX_FILL_WARMUP_TICKS = 4_500_000;
+/** Ticks a run with `SimOptions.acceptable` warms up on for at a time while a stock still fills (10 game minutes). */
 const FILL_STEP_TICKS = 36000;
 /**
  * A stock (a belt, or the product buffer of a machine) still fills if it gained this share of its capacity per
- * `FILL_STEP_TICKS` over the measurement window...
+ * `FILL_STEP_TICKS` over a stretch of ticks...
  */
-const FILL_GAIN = 0.08;
-/** ...and held less than this share of its capacity when it began (the window that fills it up is still a start-up). */
+const FILL_GAIN = 0.01;
+/** ...and held less than this share of its capacity when the stretch began (the stretch that fills it up is still a start-up). */
 const FILL_FULL = 0.97;
+/** A run that waits for a stock to fill measures again each time it has run this share more ticks than at the last measurement. */
+const FILL_MEASURE_GROWTH = 0.25;
 /** `SimOptions.shouldAbort` is asked this often (10 game seconds). */
 export const ABORT_CHECK_TICKS = 600;
 /** Two consecutive warm-up windows that each make this share of the provisioned rate end the adaptive warm-up. */
@@ -313,13 +318,17 @@ export function runSimulation(
     ...[...world.belts.values()].map((b) => ({ level: () => b.cargoCount(), capacity: b.capacity() })),
     ...machines.list.map((m) => ({ level: () => m.machine.outputLevel(), capacity: m.machine.outputCapacity() })),
   ];
+  const levels = (): number[] => stocks.map((s) => s.level());
+  /** Whether any stock gained `FILL_GAIN` of its capacity per `FILL_STEP_TICKS` in the `ticks` since it held `before`, not being full then. */
+  const filledSince = (before: readonly number[], ticks: number): boolean =>
+    stocks.some((stock, i) => before[i] < FILL_FULL * stock.capacity && stock.level() - before[i] >= FILL_GAIN * stock.capacity * (ticks / FILL_STEP_TICKS));
   /** Measure `measureTicks` more ticks: the counters start from zero, the block from the state it is in. */
   const measure = (): { result: SimResult; filling: boolean } => {
     for (const m of machines.list) m.machine.resetStats();
     const coatersAtStart = coaters.map((c) => ({ sprayed: c.sprayedItems, taken: c.proliferatorTaken }));
     const receivedAtStart = new Map<number, number>();
     for (const id of [targetItem, ...exportItems]) receivedAtStart.set(id, received(id));
-    const fillAtStart = stocks.map((s) => s.level());
+    const fillAtStart = levels();
     sumTick = 0;
     sumIdleTick = 0;
     streak = 0;
@@ -327,11 +336,7 @@ export function runSimulation(
     measuring = true;
     runTicks(measureTicks);
     measuring = false;
-    const filling = stocks.some(
-      (stock, i) =>
-        fillAtStart[i] < FILL_FULL * stock.capacity &&
-        stock.level() - fillAtStart[i] >= FILL_GAIN * stock.capacity * (measureTicks / FILL_STEP_TICKS),
-    );
+    const filling = filledSince(fillAtStart, measureTicks);
 
     const rate = (itemId: number): number => (received(itemId) - (receivedAtStart.get(itemId) ?? 0)) / measureSeconds;
     const machineStats: MachineStat[] = machines.list.map((m) => ({
@@ -384,12 +389,21 @@ export function runSimulation(
   let measured = measure();
   const acceptable = opts.acceptable;
   if (acceptable && opts.warmupTicks === undefined) {
-    // A start-up still going on (a belt filling) has not been judged: warm up on and measure again, until the result
-    // is acceptable, nothing fills any more or the limit is reached. The ticks of a window that is judged short were
-    // warm-up as far as the next one is concerned.
+    // A start-up still going on (a stock filling) has not been judged: warm up on while something fills, measure again, and so
+    // on until the result is acceptable, nothing fills any more or the limit is reached. The ticks of a window that is judged
+    // short were warm-up as far as the next one is concerned.
     while (measured.filling && !acceptable(measured.result) && warmupTicksUsed + measureTicks + FILL_STEP_TICKS <= MAX_FILL_WARMUP_TICKS) {
-      runTicks(FILL_STEP_TICKS);
-      warmupTicksUsed += measureTicks + FILL_STEP_TICKS;
+      warmupTicksUsed += measureTicks;
+      // until nothing fills any more, but measured again when a quarter more has been run than before: a block that is right
+      // by then is not waited for to the end, and the windows measured are few
+      const until = warmupTicksUsed + Math.max(FILL_STEP_TICKS, FILL_MEASURE_GROWTH * warmupTicksUsed);
+      let going = true;
+      while (going && warmupTicksUsed < until && warmupTicksUsed + FILL_STEP_TICKS + measureTicks <= MAX_FILL_WARMUP_TICKS) {
+        const before = levels();
+        runTicks(FILL_STEP_TICKS);
+        warmupTicksUsed += FILL_STEP_TICKS;
+        going = filledSince(before, FILL_STEP_TICKS);
+      }
       measured = measure();
     }
   }

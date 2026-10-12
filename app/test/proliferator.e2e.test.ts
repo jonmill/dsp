@@ -12,7 +12,7 @@ import type { Layout } from '../src/lib/geometry';
 import { buildNetlist } from '../src/lib/layout/netlist';
 import { DEFAULT_SOLVE_OPTIONS, footprintOf, solve } from '../src/lib/layout/solver';
 import type { SolveOptions, SolveProgress, SolveResult } from '../src/lib/layout/solver';
-import { data, effects, processorPlan } from '../src/lib/layout/testkit';
+import { data, effects, planFor, processorPlan, quantumPlan } from '../src/lib/layout/testkit';
 import { checkGeometry, runSimulation, validateLayout } from '../src/lib/validate';
 import type { ValidationReport } from '../src/lib/validate';
 
@@ -113,6 +113,46 @@ describe('the proliferator network end to end [slow]', () => {
     expect(replay.measuredTargetRate).toBeGreaterThanOrEqual(0.98 * again.sim!.measuredTargetRate);
     expect(replay.measuredTargetRate).toBeLessThanOrEqual(1.02 * again.sim!.measuredTargetRate);
   }, 300_000);
+
+  // Fix round 1: these three had no coating window on the ladder's rungs (Quantum Chip: Copper Ingot 3 producers / 8 consumers, High-purity
+  // Silicon 7 / 6, Circuit Board 2 / 6; High-Explosive Shell Set: producers at nodes 1 and 12 of a net, consumers from 28, with lifts
+  // between), and High-Explosive Shell Set read 0.89 of its rate for the 80 game minutes its Sulfuric Acid belt took to fill.
+  const LARGE: [string, () => Promise<ProductionPlan>][] = [
+    ['Quantum Chip', () => quantumPlan({ tier: 3, mode: 'extra' })],
+    [
+      'High-Explosive Shell Set',
+      () =>
+        planFor({
+          targetItemId: data.data.items.find((i) => i.name === 'High-Explosive Shell Set')!.id,
+          suppliedItemIds: new Set([1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031]),
+          proliferator: { tier: 3, mode: 'extra' },
+        }),
+    ],
+    [
+      'Planetary Logistics Station',
+      () =>
+        planFor({
+          targetItemId: data.data.items.find((i) => i.name === 'Planetary Logistics Station')!.id,
+          suppliedItemIds: new Set([1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031]),
+          proliferator: { tier: 3, mode: 'extra' },
+        }),
+    ],
+  ];
+  it.each(LARGE)('%s 1/s with Mk.III extra products: the ladder alone (timeBudgetMs 1) gives a layout that passes a plain validateLayout', async (name, makePlan) => {
+    const plan = await makePlan();
+    const { result, seconds } = solveLogged(`${name} Mk.III`, plan, { timeBudgetMs: 1 });
+    expect(result.layout, `${name}: no layout; ${result.failures.join(' || ')}`).not.toBeNull();
+    const layout = result.layout as Layout;
+    const t0 = performance.now();
+    const report = validateLayout(layout, plan, data, effects);
+    log(
+      `${name} Mk.III: ${plan.stages.reduce((n, s) => n + s.machines, 0)} machines, ${layout.coaters!.length} coaters; ladder ${seconds.toFixed(1)} s, plain validation ` +
+        `${((performance.now() - t0) / 1000).toFixed(1)} s: ${report.sim!.measuredTargetRate.toFixed(3)}/s of ${wantedRate(plan)}/s after a warm-up of ${report.sim!.warmupTicksUsed} ticks`,
+    );
+    expect(messages(report)).toEqual([]);
+    expect(report.pass).toBe(true);
+    expect(report.sim!.coaters.proliferatorPerSecond).toBeGreaterThan(0);
+  }, 900_000);
 
   it('the same line without a proliferator: no coaters, no feed belt, and fewer constraints on the footprint (the numbers the report compares)', async () => {
     const plain = await processorPlan(1);

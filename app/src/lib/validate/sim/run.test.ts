@@ -225,19 +225,20 @@ describe('runSimulation: a start-up that is still going on', () => {
     expect(passes(sim, row)).toBe(true);
   });
 
-  it('stops asking once the result is acceptable, and leaves a result that is acceptable at the first window alone', () => {
+  it('is asked after the 20-minute warm-up: a yes leaves the first measurement alone, a no waits and asks again, and a later yes ends it', () => {
     const row = decoyRow(200);
     let asked = 0;
-    const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, {
-      acceptable: () => ++asked >= 3,
-    });
-    expect(asked).toBe(3);
-    // 72000 of warm-up, then each rejected window of 18000 and a step of 36000 more
-    expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS + 2 * (18000 + 36000));
+    const yes = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: () => (asked++, true) });
+    expect(asked).toBe(1);
+    expect(yes.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
+    // a no, and a yes the second time: it stops where it asked, a quarter more than the 90000 ticks run by then
+    asked = 0;
+    const later = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: () => ++asked >= 2 });
+    expect(asked).toBe(2);
+    expect(later.warmupTicksUsed).toBeGreaterThan(MAX_WARMUP_TICKS + 18000);
+    expect(later.warmupTicksUsed).toBeLessThan(MAX_WARMUP_TICKS + 18000 + 1.25 * 90000);
     const settled = smelterRowLayout(3);
-    const first = simulate(settled, {});
-    const again = simulate(settled, { acceptable: () => false });
-    expect(again).toEqual(first); // nothing fills, so there is nothing to wait for
+    expect(simulate(settled, { acceptable: () => false })).toEqual(simulate(settled, {})); // nothing fills, so there is nothing to wait for
   });
 
   it('stops waiting when nothing fills any more, whatever the verdict, and never passes MAX_FILL_WARMUP_TICKS', () => {

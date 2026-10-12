@@ -102,8 +102,11 @@ const BASE_TIER_BY_TYPE: Record<string, number> = {
   RESEARCH: 2901,
 };
 
-/** 1 Quantum Chip/s on base-tier machines from the raw resources and Hydrogen: 19 stages, 231 machines, 56 nets. */
-export async function quantumPlan(): Promise<ProductionPlan> {
+/**
+ * 1 Quantum Chip/s on base-tier machines from the raw resources and Hydrogen: 19 stages, 231 machines, 56 nets (108 machines with
+ * Mk.III proliferator, extra products).
+ */
+export async function quantumPlan(proliferator: ProliferatorSetting = { tier: 0, mode: 'extra' }): Promise<ProductionPlan> {
   const request: PlanRequest = {
     targetItemId: 1305,
     quantity: { kind: 'rate', perSecond: 1 },
@@ -114,7 +117,7 @@ export async function quantumPlan(): Promise<ProductionPlan> {
       parsed.recipes.filter((r) => r.type in BASE_TIER_BY_TYPE).map((r) => [r.id, BASE_TIER_BY_TYPE[r.type]] as const),
     ),
     recipeOverrides: { 1114: 16 },
-    proliferator: { tier: 0, mode: 'extra' },
+    proliferator,
     stationKind: 'planetary',
   };
   const result = await planProduction(request, data, effects);
