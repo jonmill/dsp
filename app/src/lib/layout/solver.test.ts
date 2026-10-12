@@ -5,7 +5,7 @@ import { LayoutKit, compositeLayout } from '../validate/testkit';
 import { MAX_WARMUP_TICKS, SimulationAborted, validateLayout, WarmupNotSettled } from '../validate';
 import type { ValidateOptions, ValidationReport } from '../validate';
 import type { SimResult } from '../validate/sim/run';
-import { annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
+import { annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, Reheat, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
 import { VERIFIED_MOTIFS } from './motifs';
 import { ASSEMBLER, data, effects, matrixPlan, occupancyOf, planFor, SMELTER } from './testkit';
@@ -191,6 +191,33 @@ describe('MarginPicker (the improvement margin follows the record of what got bu
     const picker = new MarginPicker([1, 2]);
     picker.record(5, true);
     expect(picker.shares()).toEqual([0.5, 0.5]);
+  });
+});
+
+describe('Reheat (the anneal starts hotter the longer the best layout has stood)', () => {
+  it('starts at the base temperature', () => {
+    expect(new Reheat().heat()).toBe(1);
+  });
+
+  it('rises by a quarter of the base temperature for every iteration that found nothing better, to 8 times', () => {
+    const reheat = new Reheat();
+    const seen: number[] = [];
+    for (let i = 0; i < 32; i++) {
+      reheat.iteration();
+      seen.push(reheat.heat());
+    }
+    expect(seen.slice(0, 4)).toEqual([1.25, 1.5, 1.75, 2]);
+    expect(seen[27]).toBe(8); // 28 stale iterations
+    expect(seen[31]).toBe(8);
+    for (let i = 1; i < seen.length; i++) expect(seen[i]).toBeGreaterThanOrEqual(seen[i - 1]);
+  });
+
+  it('goes back to the base temperature when the best layout gets smaller', () => {
+    const reheat = new Reheat();
+    for (let i = 0; i < 10; i++) reheat.iteration();
+    expect(reheat.heat()).toBe(3.5);
+    reheat.improved();
+    expect(reheat.heat()).toBe(1);
   });
 });
 

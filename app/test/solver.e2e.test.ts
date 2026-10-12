@@ -192,9 +192,9 @@ const isDirect = (s: Layout['sorters'][number]): boolean => s.pick.kind === 'bui
 describe('solver with dense motifs end to end [slow]', () => {
   it('(d) 1 Processor/s with useUnverifiedMotifs passes the validator and is smaller than without (same seed, same budget)', async () => {
     const plan = await processorPlan(1);
-    // 12 iterations of the ordinary chain, not 24 (re-pinned in Task 27): with the tuned router and the margin picker the
-    // ordinary chain alone reaches 629 tiles in 24 iterations (1148 before), which no motif layout beats; after 12 it is
-    // at 958 tiles and the motif chains are at 848
+    // 12 iterations of the ordinary chain, not 24 (re-pinned in Task 27): with the tuned router, the margin picker and the
+    // reheated anneals the ordinary chain alone reaches 740 tiles in 24 iterations (1148 before), which no motif layout
+    // beats (the run with motifs ends at the same 740); after 12 it is at 986 tiles and the motif chains are at 792
     const budget = { timeBudgetMs: PROCESSOR_ITERATIONS * 1000 };
     const without = solveCounted('processor 1/s without motifs', plan, budget);
     const withMotifs = solveCounted('processor 1/s with motifs', plan, { ...budget, useUnverifiedMotifs: true });
