@@ -5,6 +5,7 @@ import {
   buildingName,
   facilityLabel,
   formatCount,
+  formatDuration,
   formatPercent,
   formatPower,
   formatRate,
@@ -142,5 +143,20 @@ describe('techLabel', () => {
   it('adds the level of leveled techs', () => {
     expect(techLabel({ name: 'Mecha Core', level: 6 })).toBe('Mecha Core 6');
     expect(techLabel({ name: 'Processor', level: 0 })).toBe('Processor');
+  });
+});
+
+describe('formatDuration', () => {
+  it('shows minutes and zero-padded seconds', () => {
+    expect(formatDuration(0)).toBe('0:00');
+    expect(formatDuration(7_400)).toBe('0:07');
+    expect(formatDuration(65_000)).toBe('1:05');
+    expect(formatDuration(600_000)).toBe('10:00');
+    expect(formatDuration(75 * 60_000 + 30_999)).toBe('75:30');
+  });
+
+  it('shows a dash for what is not a duration', () => {
+    expect(formatDuration(Number.NaN)).toBe('-');
+    expect(formatDuration(-1)).toBe('-');
   });
 });

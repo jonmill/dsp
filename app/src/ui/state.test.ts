@@ -2,9 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { loadFixtureGameData } from '../../test/fixtures/fixtureGameData';
 import { planProduction } from '../lib/calc';
 import type { PlanResult, ProductionPlan } from '../lib/calc';
+import { decodeBlueprint } from '../lib/blueprint';
 import { allTechs, techClosure } from '../lib/data';
-import { createAppState, PROFILES_KEY, UNLOCK_ALL_PROFILE } from './state.svelte';
-import type { AppState } from './state.svelte';
+import type { SolveResult } from '../lib/layout/solver';
+import { compositeLayout } from '../lib/validate/testkit';
+import type { Violation } from '../lib/validate';
+import { blueprintFileName, createAppState, PROFILES_KEY, UNLOCK_ALL_PROFILE } from './state.svelte';
+import type { AppDeps, AppState } from './state.svelte';
 
 // Pass-through spy: most tests run the real planner, the stale-result tests substitute one call.
 vi.mock('../lib/calc', async (importOriginal) => {
@@ -58,8 +62,8 @@ function memoryStorage(initial: Record<string, string> = {}, failWith?: Error) {
 /** Every state a test created, so afterEach can finish their pending recomputes. */
 const created: AppState[] = [];
 
-function createApp(): AppState {
-  const app = createAppState(data);
+function createApp(deps?: AppDeps): AppState {
+  const app = createAppState(data, deps);
   created.push(app);
   return app;
 }
@@ -682,5 +686,300 @@ describe('tech profiles and localStorage', () => {
     const app = createApp();
     expect(app.saveProfile('mine')).toBe(true);
     expect(app.techProfileName).toBe('mine');
+  });
+});
+
+// -- the layout solve ---------------------------------------------------------------------
+
+type StartSolve = NonNullable<AppDeps['startSolve']>;
+
+/** A solver whose runs the test finishes by hand. */
+function fakeSolver() {
+  const runs: {
+    plan: Parameters<StartSolve>[0];
+    opts: Parameters<StartSolve>[3];
+    callbacks: NonNullable<Parameters<StartSolve>[4]>;
+    stop: ReturnType<typeof vi.fn>;
+    finish(result: SolveResult): void;
+    fail(error: Error): void;
+  }[] = [];
+  const startSolve: StartSolve = (plan, _index, _effects, opts, callbacks = {}) => {
+    let finish!: (result: SolveResult) => void;
+    let fail!: (error: Error) => void;
+    const done = new Promise<SolveResult>((resolve, reject) => {
+      finish = resolve;
+      fail = reject;
+    });
+    const stop = vi.fn();
+    runs.push({ plan, opts, callbacks, stop, finish, fail });
+    return { stop, done };
+  };
+  return { runs, startSolve };
+}
+
+const solved = compositeLayout().kit.layout();
+const passing = { pass: true, violations: [], checkedAt: '2026-01-01T00:00:00Z', stage: 'simulation' as const };
+
+function resultOf(over: Partial<SolveResult> = {}): SolveResult {
+  return {
+    layout: solved,
+    report: passing,
+    footprint: 120,
+    attempts: 5,
+    validated: 3,
+    stoppedBy: 'budget',
+    failures: [],
+    ...over,
+  };
+}
+
+/** An app with the Iron Ingot planned and a fake solver behind it. */
+async function solvingApp() {
+  const solver = fakeSolver();
+  const app = createApp({ startSolve: solver.startSolve });
+  app.setTarget(IRON_INGOT);
+  await app.whenSettled();
+  return { app, ...solver };
+}
+
+describe('solve', () => {
+  it('can only start on an ok, settled plan', async () => {
+    const solver = fakeSolver();
+    const app = createApp({ startSolve: solver.startSolve });
+    expect(app.canSolve).toBe(false);
+    app.startSolve();
+    expect(solver.runs).toHaveLength(0);
+    expect(app.solve.status).toBe('idle');
+
+    app.setTarget(IRON_INGOT);
+    expect(app.canSolve).toBe(false); // the plan is still being computed
+    await app.whenSettled();
+    expect(app.canSolve).toBe(true);
+    app.toggleSupplied(IRON_ORE); // iron ore is no longer supplied and nothing makes it: no plan
+    await app.whenSettled();
+    expect(app.canSolve).toBe(false);
+  });
+
+  it('hands the worker the plan, the effects and the budget in milliseconds, and runs until it answers', async () => {
+    const { app, runs } = await solvingApp();
+    app.setSolverBudgetMinutes(0.5);
+    app.startSolve();
+    expect(app.solve.status).toBe('running');
+    expect(runs).toHaveLength(1);
+    expect(runs[0].plan).toBe(okPlan(app.plan));
+    expect(runs[0].opts.timeBudgetMs).toBe(30_000);
+    expect(runs[0].opts.simulate).toBe(true);
+    expect(app.solve.budgetMs).toBe(30_000);
+    expect(app.solve.layout).toBeNull();
+    expect(app.blueprint).toBeNull();
+
+    runs[0].callbacks.onProgress?.({ elapsedMs: 1000, attempts: 2, validated: 1, bestFootprint: null, phase: 'ladder' });
+    expect(app.solve.progress?.attempts).toBe(2);
+    runs[0].callbacks.onImproved?.(solved, passing, 150);
+    expect(app.solve.layout).toBe(solved);
+    expect(app.solve.footprint).toBe(150);
+    expect(app.solve.status).toBe('running');
+
+    runs[0].finish(resultOf({ footprint: 120 }));
+    await app.whenSolved();
+    expect(app.solve.status).toBe('done');
+    expect(app.solve.footprint).toBe(120);
+    expect(app.solve.report).toBe(passing);
+    expect(app.solve.result?.stoppedBy).toBe('budget');
+  });
+
+  it('uses a new seed for each run', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    app.startSolve();
+    expect(runs[1].opts.seed).not.toBe(runs[0].opts.seed);
+  });
+
+  it('builds the blueprint from the best layout: titled with the target and rate, flagged as approximate', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    runs[0].callbacks.onImproved?.(solved, passing, 150);
+    const bp = app.blueprint!;
+    expect(bp.error).toBeNull();
+    expect(bp.text.startsWith('BLUEPRINT:')).toBe(true);
+    expect(bp.shortDesc).toBe('Iron Ingot 1/s');
+    expect(bp.fileName).toBe('iron-ingot-1.txt');
+    expect(bp.desc).toContain('Iron Ingot 1/s');
+    expect(bp.desc).toContain('Iron Ore');
+    // Review Focus #5: the layout is on approximate geometry, so the UI is told and the string carries the flag.
+    expect(solved.meta.geometrySource).toBe('approximate');
+    expect(bp.approximate).toBe(true);
+    const header = decodeBlueprint(bp.text).header;
+    expect(header.shortDesc).toBe('Iron Ingot 1/s');
+    expect(header.desc).toContain('approximate');
+    // The same layout gives the same object: reading it again does not rebuild the string.
+    expect(app.blueprint).toBe(bp);
+  });
+
+  it('does not flag extracted geometry as approximate', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    const extracted = { ...solved, meta: { ...solved.meta, geometrySource: 'extracted' as const } };
+    runs[0].callbacks.onImproved?.(extracted, passing, 150);
+    expect(app.blueprint?.approximate).toBe(false);
+    expect(decodeBlueprint(app.blueprint!.text).header.desc).not.toContain('approximate');
+  });
+
+  it('reports a layout the blueprint builder rejects instead of throwing', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    const broken = { ...solved, belts: [{ ...solved.belts[0], tierItemId: 9999 as 2001 }] };
+    runs[0].callbacks.onImproved?.(broken, passing, 150);
+    expect(app.blueprint?.text).toBe('');
+    expect(app.blueprint?.error).toMatch(/could not be built/);
+  });
+
+  it('stops a running solve when a new one starts and ignores the old one\'s late answer', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    runs[0].callbacks.onImproved?.(solved, passing, 150);
+    app.startSolve();
+    expect(runs[0].stop).toHaveBeenCalledOnce();
+    expect(runs).toHaveLength(2);
+    expect(app.solve.layout).toBeNull(); // the new run starts empty
+
+    runs[0].callbacks.onImproved?.(solved, passing, 99);
+    runs[0].callbacks.onProgress?.({ elapsedMs: 5, attempts: 99, validated: 99, bestFootprint: 99, phase: 'old' });
+    runs[0].finish(resultOf({ footprint: 99 }));
+    await Promise.resolve();
+    expect(app.solve.layout).toBeNull();
+    expect(app.solve.progress).toBeNull();
+    expect(app.solve.status).toBe('running');
+
+    runs[1].finish(resultOf({ footprint: 77 }));
+    await app.whenSolved();
+    expect(app.solve.footprint).toBe(77);
+  });
+
+  it('stop asks the worker once and keeps running until it answers with its best', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    runs[0].callbacks.onImproved?.(solved, passing, 150);
+    app.stopSolve();
+    app.stopSolve();
+    expect(runs[0].stop).toHaveBeenCalledOnce();
+    expect(app.solve.stopping).toBe(true);
+    expect(app.solve.status).toBe('running');
+    runs[0].finish(resultOf({ stoppedBy: 'user', footprint: 150 }));
+    await app.whenSolved();
+    expect(app.solve.status).toBe('done');
+    expect(app.solve.stopping).toBe(false);
+    expect(app.solve.result?.stoppedBy).toBe('user');
+    expect(app.solve.layout).toBe(solved);
+  });
+
+  it('stop does nothing when no solve is running', async () => {
+    const { app, runs } = await solvingApp();
+    app.stopSolve();
+    expect(app.solve.stopping).toBe(false);
+    expect(runs).toHaveLength(0);
+  });
+
+  it('marks the result stale when the plan changes, without cancelling or clearing it', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    expect(app.solve.stale).toBe(false);
+    runs[0].callbacks.onImproved?.(solved, passing, 150);
+
+    app.setQuantity({ kind: 'rate', perSecond: 2 });
+    await app.whenSettled();
+    expect(app.solve.stale).toBe(true);
+    expect(app.solve.status).toBe('running');
+    expect(runs[0].stop).not.toHaveBeenCalled();
+    expect(app.solve.layout).toBe(solved);
+
+    runs[0].finish(resultOf());
+    await app.whenSolved();
+    expect(app.solve.status).toBe('done');
+    expect(app.solve.stale).toBe(true);
+
+    // A plan that comes out the same is not a change; going back clears the banner.
+    app.setQuantity({ kind: 'rate', perSecond: 1 });
+    await app.whenSettled();
+    expect(app.solve.stale).toBe(false);
+
+    app.setQuantity({ kind: 'rate', perSecond: 3 });
+    await app.whenSettled();
+    expect(app.solve.stale).toBe(true);
+    app.startSolve();
+    expect(app.solve.stale).toBe(false);
+    expect(runs[1].plan).toBe(okPlan(app.plan));
+  });
+
+  it('is stale when the plan stops being feasible', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    runs[0].finish(resultOf());
+    await app.whenSolved();
+    app.toggleSupplied(IRON_ORE);
+    await app.whenSettled();
+    expect(app.plan?.ok).toBe(false);
+    expect(app.solve.stale).toBe(true);
+  });
+
+  it('is not stale before any solve', async () => {
+    const { app } = await solvingApp();
+    expect(app.solve.stale).toBe(false);
+  });
+
+  it('keeps the failures when the ladder finds nothing', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    runs[0].finish(resultOf({ layout: null, report: null, footprint: null, stoppedBy: 'exhausted', failures: ['BELT_OVERLAP: x'] }));
+    await app.whenSolved();
+    expect(app.solve.status).toBe('done');
+    expect(app.solve.layout).toBeNull();
+    expect(app.blueprint).toBeNull();
+    expect(app.solve.result?.failures).toEqual(['BELT_OVERLAP: x']);
+  });
+
+  it('reports a worker that fails, and keeps the best layout it had sent', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    runs[0].callbacks.onImproved?.(solved, passing, 150);
+    runs[0].fail(new Error('the solver worker failed'));
+    await app.whenSolved();
+    expect(app.solve.status).toBe('error');
+    expect(app.solve.error).toBe('the solver worker failed');
+    expect(app.solve.layout).toBe(solved);
+  });
+
+  it('reports a worker that cannot be created', async () => {
+    const app = createApp({
+      startSolve: () => {
+        throw new ReferenceError('Worker is not defined');
+      },
+    });
+    app.setTarget(IRON_INGOT);
+    await app.whenSettled();
+    app.startSolve();
+    expect(app.solve.status).toBe('error');
+    expect(app.solve.error).toContain('Worker is not defined');
+    await app.whenSolved();
+    // A later solve can still run.
+    expect(app.canSolve).toBe(true);
+  });
+
+  it('forgets the picked violation when a new solve starts', async () => {
+    const { app } = await solvingApp();
+    const violation: Violation = { code: 'BELT_OVERLAP', entities: [{ kind: 'belt', id: 1 }], message: 'm' };
+    app.selectViolation(violation);
+    expect(app.selectedViolation).toBe(violation);
+    app.startSolve();
+    expect(app.selectedViolation).toBeNull();
+  });
+});
+
+describe('blueprintFileName', () => {
+  it('is <target-name>-<rate>.txt in lower case with dashes', () => {
+    expect(blueprintFileName('Circuit Board', 1)).toBe('circuit-board-1.txt');
+    expect(blueprintFileName('Re-composing Assembler', 1.5)).toBe('re-composing-assembler-1.5.txt');
+    expect(blueprintFileName('Processor', 0.333333)).toBe('processor-0.333.txt');
+    expect(blueprintFileName('???', 2)).toBe('blueprint-2.txt');
   });
 });

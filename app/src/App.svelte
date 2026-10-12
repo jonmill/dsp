@@ -1,16 +1,20 @@
 <script lang="ts">
   import { GameDataError, loadDefaultGameData } from './lib/data';
+  import BlueprintPanel from './ui/BlueprintPanel.svelte';
   import InputsTree from './ui/InputsTree.svelte';
+  import LayoutPreview from './ui/LayoutPreview.svelte';
   import OptionsPanel from './ui/OptionsPanel.svelte';
   import PlanTable from './ui/PlanTable.svelte';
+  import SolvePanel from './ui/SolvePanel.svelte';
   import { createAppState } from './ui/state.svelte';
   import TargetPicker from './ui/TargetPicker.svelte';
   import TechPicker from './ui/TechPicker.svelte';
+  import ValidationPanel from './ui/ValidationPanel.svelte';
   import './ui/theme.css';
 
   const title = 'DSP Factory Planner';
 
-  const loading = loadDefaultGameData().then(createAppState);
+  const loading = loadDefaultGameData().then((data) => createAppState(data));
 
   function describe(error: unknown): { heading: string; detail: string } {
     if (error instanceof GameDataError) {
@@ -45,9 +49,12 @@
         <InputsTree {app} />
         <OptionsPanel {app} />
       </div>
-      <!-- Results stack here; the solve, preview and blueprint panels join this column later. -->
       <div class="results">
         <PlanTable {app} />
+        <SolvePanel {app} />
+        <LayoutPreview {app} />
+        <ValidationPanel {app} />
+        <BlueprintPanel {app} />
       </div>
     </main>
   </div>

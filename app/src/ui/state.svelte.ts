@@ -11,12 +11,24 @@
  * debounce); `recompute()` runs now, and `whenSettled()` resolves once nothing is pending. The
  * request is replaced, never edited in place (it holds Sets, which runes do not track), so
  * `$state.raw` is enough.
+ *
+ * The layout solve (Task 25) hangs off the plan. `startSolve()` runs the solver worker on the current plan; a new
+ * solve stops a running one, and its late answer is ignored. Changing the plan while a solve runs, or after it,
+ * does not cancel or clear anything: `solve.stale` says the result is for an older plan. `solve.layout` is the best
+ * layout so far (it is replaced as the worker reports better ones); `blueprint` is made from it on demand.
  */
+import { layoutToBlueprintString } from '../lib/blueprint';
 import { compatibleFacilities, isPlannableRecipe, planProduction, plannableProducers } from '../lib/calc';
-import type { PlanRequest, PlanResult, ProliferatorSetting } from '../lib/calc';
+import type { PlanRequest, PlanResult, ProductionPlan, ProliferatorSetting } from '../lib/calc';
 import { allTechs, computeTechEffects, GameDataIndex, techClosure } from '../lib/data';
 import type { Building, GameData, Item, Recipe, TechEffects } from '../lib/data';
-import { geometryBadge } from './format';
+import type { Layout } from '../lib/geometry';
+import { startSolve as startSolveWorker } from '../lib/layout/client';
+import type { SolveHandle } from '../lib/layout/client';
+import { DEFAULT_SOLVE_OPTIONS } from '../lib/layout/solver';
+import type { SolveProgress, SolveResult } from '../lib/layout/solver';
+import type { ValidationReport, Violation } from '../lib/validate';
+import { formatCount, formatPower, geometryBadge, itemName } from './format';
 import { buildTree, treeLeaves } from './tree';
 import type { TreeRow } from './tree';
 
@@ -46,6 +58,53 @@ export interface StationChargeRange {
   default: number;
 }
 
+export type SolveStatus = 'idle' | 'running' | 'done' | 'error';
+
+/** The layout solve as the panels see it. Every field is reactive on its own. */
+export interface SolveState {
+  readonly status: SolveStatus;
+  /** A stop was asked for and the solver has not handed back its best yet. */
+  readonly stopping: boolean;
+  /** The latest progress report; null before the first. */
+  readonly progress: SolveProgress | null;
+  /** The best layout so far (the final one once `status` is 'done'). */
+  readonly layout: Layout | null;
+  readonly report: ValidationReport | null;
+  /** Plan-view area of `layout`, in tiles. */
+  readonly footprint: number | null;
+  /** The solver's final answer, once `status` is 'done'. */
+  readonly result: SolveResult | null;
+  /** Why the solve failed, when `status` is 'error'. */
+  readonly error: string | null;
+  /** The plan the solve was started on. */
+  readonly plan: ProductionPlan | null;
+  /** The improvement budget this run was started with. */
+  readonly budgetMs: number;
+  /** `performance.now()` when this run started. */
+  readonly startedAt: number;
+  /** The plan has changed since this run started, so the layout is for an older plan. */
+  readonly stale: boolean;
+}
+
+/** The blueprint made from the best layout, with the texts it is described by. */
+export interface BlueprintExport {
+  /** The `BLUEPRINT:...` string; empty when building it failed. */
+  text: string;
+  /** Why `text` is empty. */
+  error: string | null;
+  /** `<target-name>-<rate>.txt` */
+  fileName: string;
+  shortDesc: string;
+  desc: string;
+  /** The layout was built on approximate geometry (Review Focus #5): the UI says so next to the blueprint. */
+  approximate: boolean;
+}
+
+/** What `createAppState` takes from outside, so a test can stand in for the worker. */
+export interface AppDeps {
+  startSolve?: typeof startSolveWorker;
+}
+
 export interface AppState {
   readonly data: GameData;
   readonly index: GameDataIndex;
@@ -62,7 +121,7 @@ export interface AppState {
   readonly profiles: Readonly<Record<string, number[]>>;
   /** How rates are displayed; the request always holds items per second. */
   readonly rateUnit: 's' | 'min';
-  /** Kept for the layout solver; nothing reads it yet. */
+  /** How long the layout solver may keep improving a layout it already has, in minutes. */
   readonly solverBudgetMinutes: number;
   /** "Geometry: approximate ..." while GameData geometry is approximate, else null. */
   readonly geometryBadge: string | null;
@@ -71,6 +130,13 @@ export interface AppState {
   /** Unlocked buildings that can run the target's recipe, slowest first. */
   readonly targetFacilityChoices: Building[];
   readonly stationChargeRange: StationChargeRange;
+  readonly solve: SolveState;
+  /** The plan is ok and settled, so a solve can start. */
+  readonly canSolve: boolean;
+  /** The blueprint of `solve.layout`; null while there is no layout. */
+  readonly blueprint: BlueprintExport | null;
+  /** The violation the user picked in the report; the preview draws it in red. */
+  readonly selectedViolation: Violation | null;
 
   setTarget(itemId: number): void;
   clearTarget(): void;
@@ -103,6 +169,14 @@ export interface AppState {
   facilityChoices(recipeId: number): Building[];
   /** Unlocked recipes that make the item. */
   recipeChoices(itemId: number): Recipe[];
+
+  /** Solves the current plan; a solve already running is stopped first. Does nothing unless `canSolve`. */
+  startSolve(): void;
+  /** Asks the running solve to stop; `solve.layout` is then the best found so far. */
+  stopSolve(): void;
+  selectViolation(violation: Violation | null): void;
+  /** Resolves when no solve is running. */
+  whenSolved(): Promise<void>;
 
   /** Plans now, cancelling a pending debounce. Resolves with the result it computed. */
   recompute(): Promise<PlanResult>;
@@ -201,7 +275,67 @@ function withLeavesSupplied(index: GameDataIndex, effects: TechEffects, request:
   return { ...request, suppliedItemIds: new Set([...request.suppliedItemIds, ...missing]) };
 }
 
-export function createAppState(data: GameData): AppState {
+// -- the solve ---------------------------------------------------------------------------------
+
+/** Two plans are the same when this is: the layout depends on all of it (the unlocked techs limit belts and sorters). */
+function planSignature(plan: ProductionPlan): string {
+  return JSON.stringify(plan, (_key, value: unknown) =>
+    value instanceof Set ? [...value].sort((a, b) => Number(a) - Number(b)) : value,
+  );
+}
+
+/** The rate the plan provisions for its target: what the layout is built and judged for. */
+export function plannedRate(plan: ProductionPlan): number {
+  return plan.exports.find((e) => e.itemId === plan.request.targetItemId)?.perSecond ?? plan.actualTargetRate;
+}
+
+/** `<target-name>-<rate>.txt`, lower case with dashes: "circuit-board-1.txt". */
+export function blueprintFileName(targetName: string, perSecond: number): string {
+  const slug = targetName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return `${slug === '' ? 'blueprint' : slug}-${formatCount(perSecond)}.txt`;
+}
+
+const MAX_DESC_IMPORTS = 6;
+
+/**
+ * The blueprint string for `layout`, titled "<target name> <rate>/s", with a description of the plan it was solved
+ * for. The builder itself adds the "geometry: approximate" flag to the description when the layout needs it.
+ */
+export function makeBlueprint(
+  layout: Layout,
+  plan: ProductionPlan,
+  index: GameDataIndex,
+  footprint: number | null,
+  report: ValidationReport | null,
+): BlueprintExport {
+  const target = itemName(index, plan.request.targetItemId);
+  const rate = plannedRate(plan);
+  const shortDesc = `${target} ${formatCount(rate)}/s`;
+  const machines = plan.stages.reduce((n, stage) => n + stage.machines, 0);
+  const stations = `${plan.stationsNeeded} station${plan.stationsNeeded === 1 ? '' : 's'}`;
+  const imports = plan.imports.slice(0, MAX_DESC_IMPORTS).map((i) => `${itemName(index, i.itemId)} ${formatCount(i.perSecond)}/s`);
+  if (plan.imports.length > MAX_DESC_IMPORTS) imports.push('...');
+  const power = report?.sim?.power ?? null;
+  const lines = [
+    `${shortDesc}, ${machines} machines, ${stations}${footprint === null ? '' : `, ${Math.round(footprint)} tiles`}.`,
+    imports.length > 0 ? `Supplied: ${imports.join(', ')}.` : 'Nothing supplied.',
+    power
+      ? `Power (simulated): ${formatPower(power.steadyW)} steady, ${formatPower(power.peakW)} peak.`
+      : `Power (estimate): ${formatPower(plan.power.steadyW)} steady, ${formatPower(plan.power.peakW)} peak.`,
+    'Made with DSP Factory Planner.',
+  ];
+  const desc = lines.join('\n');
+  const fileName = blueprintFileName(target, rate);
+  const approximate = layout.meta.geometrySource === 'approximate';
+  try {
+    return { text: layoutToBlueprintString(layout, index, { shortDesc, desc }), error: null, fileName, shortDesc, desc, approximate };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    return { text: '', error: `The blueprint could not be built: ${reason}`, fileName, shortDesc, desc, approximate };
+  }
+}
+
+export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
   const index = new GameDataIndex(data);
   const knownTechs = allTechs(data);
   const badge = geometryBadge(data);
@@ -240,6 +374,23 @@ export function createAppState(data: GameData): AppState {
   let rateUnit = $state<'s' | 'min'>('s');
   let solverBudgetMinutes = $state(DEFAULT_SOLVER_BUDGET_MINUTES);
   let computing = $state(false);
+  /** `planSignature` of `plan` while it is ok. */
+  let planSig = $state<string | null>(null);
+
+  // -- the solve's state: replaced as a whole, so $state.raw
+  let solveStatus = $state<SolveStatus>('idle');
+  let solveStopping = $state(false);
+  let solveProgress = $state.raw<SolveProgress | null>(null);
+  let bestLayout = $state.raw<Layout | null>(null);
+  let bestReport = $state.raw<ValidationReport | null>(null);
+  let bestFootprint = $state<number | null>(null);
+  let solveResult = $state.raw<SolveResult | null>(null);
+  let solveError = $state<string | null>(null);
+  let solvePlan = $state.raw<ProductionPlan | null>(null);
+  let solveSig = $state<string | null>(null);
+  let solveBudgetMs = $state(0);
+  let solveStartedAt = $state(0);
+  let selectedViolation = $state.raw<Violation | null>(null);
 
   // -- recompute --------------------------------------------------------------------------
 
@@ -274,13 +425,17 @@ export function createAppState(data: GameData): AppState {
     const mine = ++latest;
     if (request.targetItemId === 0) {
       plan = null;
+      planSig = null;
       settleIfIdle();
       return Promise.resolve(NO_TARGET);
     }
     running++;
     computing = true;
     return runPlan(request, effects).then((result) => {
-      if (mine === latest) plan = result;
+      if (mine === latest) {
+        plan = result;
+        planSig = result.ok ? planSignature(result.plan) : null;
+      }
       running--;
       settleIfIdle();
       return result;
@@ -299,6 +454,161 @@ export function createAppState(data: GameData): AppState {
   function whenSettled(): Promise<void> {
     if (timer === undefined && running === 0) return Promise.resolve();
     return new Promise((resolve) => waiters.push(resolve));
+  }
+
+  // -- solve ------------------------------------------------------------------------------
+
+  const startWorker = deps.startSolve ?? startSolveWorker;
+  let handle: SolveHandle | undefined;
+  /** Bumped by every solve; the answers of an earlier one are dropped. */
+  let solveToken = 0;
+  let solveRuns = 0;
+  let solveWaiters: (() => void)[] = [];
+
+  function endSolve(): void {
+    solveStopping = false;
+    handle = undefined;
+    const woken = solveWaiters;
+    solveWaiters = [];
+    for (const wake of woken) wake();
+  }
+
+  function startSolve(): void {
+    const current = plan?.ok ? plan.plan : null;
+    if (!current || computing) return;
+    handle?.stop(); // its answer is ignored from here on (the token), and it ends itself
+    const mine = ++solveToken;
+    const budgetMs = solverBudgetMinutes * 60_000;
+    solveStatus = 'running';
+    solveStopping = false;
+    solveProgress = null;
+    bestLayout = null;
+    bestReport = null;
+    bestFootprint = null;
+    solveResult = null;
+    solveError = null;
+    solvePlan = current;
+    solveSig = planSig;
+    solveBudgetMs = budgetMs;
+    solveStartedAt = performance.now();
+    selectedViolation = null;
+
+    const fail = (reason: string): void => {
+      solveStatus = 'error';
+      solveError = reason;
+      endSolve();
+    };
+    let started: SolveHandle;
+    try {
+      started = startWorker(
+        current,
+        index,
+        effects,
+        { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: budgetMs, seed: DEFAULT_SOLVE_OPTIONS.seed + solveRuns++ },
+        {
+          onProgress: (progress) => {
+            if (mine === solveToken) solveProgress = progress;
+          },
+          onImproved: (layout, report, footprint) => {
+            if (mine !== solveToken) return;
+            bestLayout = layout;
+            bestReport = report;
+            bestFootprint = footprint;
+          },
+        },
+      );
+    } catch (error) {
+      // No Worker in this environment, or the plan could not even be handed over.
+      fail(`The solver could not start: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    handle = started;
+    started.done.then(
+      (result) => {
+        if (mine !== solveToken) return;
+        solveResult = result;
+        if (result.layout) {
+          bestLayout = result.layout;
+          bestReport = result.report;
+          bestFootprint = result.footprint;
+        }
+        solveStatus = 'done';
+        endSolve();
+      },
+      (error: unknown) => {
+        if (mine === solveToken) fail(error instanceof Error ? error.message : String(error));
+      },
+    );
+  }
+
+  function stopSolve(): void {
+    if (solveStatus !== 'running' || solveStopping) return;
+    solveStopping = true;
+    handle?.stop();
+  }
+
+  function whenSolved(): Promise<void> {
+    if (solveStatus !== 'running') return Promise.resolve();
+    return new Promise((resolve) => solveWaiters.push(resolve));
+  }
+
+  const solveView: SolveState = {
+    get status() {
+      return solveStatus;
+    },
+    get stopping() {
+      return solveStopping;
+    },
+    get progress() {
+      return solveProgress;
+    },
+    get layout() {
+      return bestLayout;
+    },
+    get report() {
+      return bestReport;
+    },
+    get footprint() {
+      return bestFootprint;
+    },
+    get result() {
+      return solveResult;
+    },
+    get error() {
+      return solveError;
+    },
+    get plan() {
+      return solvePlan;
+    },
+    get budgetMs() {
+      return solveBudgetMs;
+    },
+    get startedAt() {
+      return solveStartedAt;
+    },
+    get stale() {
+      return solveStatus !== 'idle' && solveSig !== planSig;
+    },
+  };
+
+  // Built when asked for, and again only when the layout, its plan, footprint or report is a different object:
+  // progress reports must not re-encode the string.
+  let blueprintMemo:
+    | { layout: Layout; plan: ProductionPlan; footprint: number | null; report: ValidationReport | null; value: BlueprintExport }
+    | undefined;
+  function blueprintOfBest(): BlueprintExport | null {
+    const layout = bestLayout;
+    const plan = solvePlan;
+    const footprint = bestFootprint;
+    const report = bestReport;
+    if (!layout || !plan) return null;
+    const memo = blueprintMemo;
+    if (memo && memo.layout === layout && memo.plan === plan && memo.footprint === footprint && memo.report === report) {
+      return memo.value;
+    }
+    const value = makeBlueprint(layout, plan, index, footprint, report);
+    blueprintMemo = { layout, plan, footprint, report, value };
+    return value;
   }
 
   // -- mutators ---------------------------------------------------------------------------
@@ -425,6 +735,16 @@ export function createAppState(data: GameData): AppState {
     get stationChargeRange() {
       return stationRange(request.stationKind);
     },
+    solve: solveView,
+    get canSolve() {
+      return plan?.ok === true && !computing;
+    },
+    get blueprint() {
+      return blueprintOfBest();
+    },
+    get selectedViolation() {
+      return selectedViolation;
+    },
 
     setTarget,
     clearTarget() {
@@ -522,6 +842,13 @@ export function createAppState(data: GameData): AppState {
     recipeChoices(itemId) {
       return plannableProducers(itemId, index, effects);
     },
+
+    startSolve,
+    stopSolve,
+    selectViolation(violation) {
+      selectedViolation = violation;
+    },
+    whenSolved,
 
     recompute,
     whenSettled,

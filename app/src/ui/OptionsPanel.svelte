@@ -168,8 +168,8 @@
         <input
           class="num"
           type="number"
-          min="1"
-          step="1"
+          min="0.1"
+          step="any"
           value={app.solverBudgetMinutes}
           onchange={(event) => {
             const minutes = numberOrNull(event.currentTarget.value);
@@ -179,7 +179,10 @@
         />
         <span class="muted">minutes</span>
       </label>
-      <p class="hint">Used when the layout solver arrives; it does not change the plan.</p>
+      <p class="hint">
+        How long the solver may keep shrinking a layout once it has a valid one. It may stop sooner when nothing
+        improves. It does not change the plan.
+      </p>
     </fieldset>
   </div>
 </section>
