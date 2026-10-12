@@ -25,8 +25,14 @@
  * Stacks. A blueprint stores no link between stacked buildings, only their heights. A multiLevel building (a lab) standing
  * on another of the same kind (a Self-evolution Lab on a Matrix Lab), on the same x, y and yaw and one lapJoint higher, gets that building as its `stackParentId`.
  *
- * What is not imported. Only the kinds the planner models: production buildings, labs, stations, power nodes, belts and
- * sorters. Every other record (splitters, depots, spray coaters, unknown item ids...) is skipped and named in one
+ * Spray coaters. A coater record (2313) links to nothing (BF §3.3); it stands on a belt node and is found by position: the
+ * node of the folded belts nearest to it, within `COATER_REACH_TILES` in the plan and `COATER_REACH_LEVELS` in height. The
+ * result is a `Layout.coaters` entry (id: the record index) with that belt, node and the yaw snapped to a quarter turn.
+ * A coater with no belt node under it is skipped with one warning. Which belt feeds its top passage is not recorded in a
+ * blueprint, and not needed: the validator and the simulator look for the belt at the point (`findCoaterTop`).
+ *
+ * What is not imported. Only the kinds the planner models: production buildings, labs, stations, power nodes, belts,
+ * sorters and spray coaters. Every other record (splitters, depots, unknown item ids...) is skipped and named in one
  * warning per item id; a belt or sorter end that linked to one is left open (belt) or the sorter is dropped. Throws only for
  * links that cannot be followed: a record index that is not in the blueprint, or a belt that outputs to itself.
  */
@@ -41,6 +47,7 @@ import type {
   Layout,
   PlacedBuilding,
   Sorter,
+  SprayCoater,
   StationConfig,
   StationPortConfig,
   StationSlotConfig,
@@ -60,6 +67,10 @@ const YAW_SNAP_WARN_DEG = 1;
 const MIN_SEGMENT = 1e-9;
 /** `outputToSlot` of a belt record that feeds a belt record from behind; a side merge writes 2 (BF §3.3). */
 const STRAIGHT_SLOT = 1;
+/** A coater record is on the belt node nearest to it, if that is within this many tiles in the plan... */
+const COATER_REACH_TILES = 0.3;
+/** ...and this many levels in height (a coater on the ground does not belong to a belt a level up). */
+const COATER_REACH_LEVELS = 0.3;
 /** Two feeders whose headings into a merge differ by less than this many degrees arrive alike. */
 const SAME_TURN_DEG = 0.5;
 /** At most this many record numbers are listed in a warning. */
@@ -70,7 +81,7 @@ export interface ImportResult {
   warnings: string[];
 }
 
-type Role = 'building' | 'belt' | 'sorter' | 'skipped';
+type Role = 'building' | 'belt' | 'sorter' | 'coater' | 'skipped';
 
 /** What `blueprintToLayout` models, by GameData building kind. */
 const PLACED_KINDS: ReadonlySet<string> = new Set(['production', 'lab', 'station', 'powerNode']);
@@ -161,13 +172,11 @@ export function blueprintToLayout(bp: Blueprint, data: GameDataIndex): ImportRes
       roles.push('sorter');
     } else if (PLACED_KINDS.has(def.kind)) {
       roles.push('building');
+    } else if (def.kind === 'sprayCoater') {
+      roles.push('coater');
     } else {
       roles.push('skipped');
-      const reason =
-        def.kind === 'sprayCoater'
-          ? 'the Layout model has no spray coaters yet, so a proliferator network is not simulated'
-          : `the planner does not model this building (kind ${def.kind})`;
-      skip(pos, `item ${r.itemId}`, `${def.name} (item ${r.itemId})`, reason);
+      skip(pos, `item ${r.itemId}`, `${def.name} (item ${r.itemId})`, `the planner does not model this building (kind ${def.kind})`);
     }
   });
   for (const s of skipped.values()) {
@@ -335,6 +344,38 @@ export function blueprintToLayout(bp: Blueprint, data: GameDataIndex): ImportRes
   });
 
   // -------------------------------------------------------------------------------------------
+  // Spray coaters
+
+  const coaters: SprayCoater[] = [];
+  const unplaced = new Map<string, number[]>();
+  recs.forEach((r, pos) => {
+    if (roles[pos] !== 'coater') return;
+    const def = defs[pos] as Building;
+    let best: { belt: BeltPath; node: number; distance: number } | undefined;
+    for (const belt of belts) {
+      for (let node = 0; node < belt.nodes.length; node++) {
+        const p = belt.nodes[node];
+        if (Math.abs(p.z - r.localOffset[2]) > COATER_REACH_LEVELS) continue;
+        const distance = Math.hypot(p.x - r.localOffset[0], p.y - r.localOffset[1]);
+        if (distance <= COATER_REACH_TILES && (!best || distance < best.distance)) best = { belt, node, distance };
+      }
+    }
+    if (!best) {
+      const key = `${def.name} (item ${r.itemId})`;
+      unplaced.set(key, [...(unplaced.get(key) ?? []), pos]);
+      return;
+    }
+    const { yaw, off } = snapYaw(r.yaw);
+    if (off > YAW_SNAP_WARN_DEG) {
+      warnings.push(`coater ${pos} (${def.name}): yaw ${r.yaw.toFixed(1)} is not a quarter turn and was snapped to ${yaw}`);
+    }
+    coaters.push({ id: pos, beltId: best.belt.id, node: best.node, yaw });
+  });
+  for (const [label, positions] of unplaced) {
+    warnings.push(`${positions.length} x ${label} skipped: no belt node under it (records ${listRecords(positions)})`);
+  }
+
+  // -------------------------------------------------------------------------------------------
   // Sorters
 
   const sorters: Sorter[] = [];
@@ -407,6 +448,7 @@ export function blueprintToLayout(bp: Blueprint, data: GameDataIndex): ImportRes
       buildings,
       belts,
       sorters,
+      ...(coaters.length > 0 ? { coaters } : {}),
       meta: {
         geometrySource: approximate ? 'approximate' : 'extracted',
         gameVersion: bp.header.gameVersion,

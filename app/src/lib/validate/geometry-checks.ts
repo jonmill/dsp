@@ -1,10 +1,11 @@
 // Geometry and connection rules: the independent gate that decides whether a generated layout can be built in
 // game. Everything here is checked from the Layout and GameData alone; nothing from the layout solver is used.
-// Rule numbers refer to the Task 15 brief. Each violation names its entities, and `mirrors` names the game
-// method the rule follows where there is one.
+// Rule numbers refer to the Task 15 brief (rule 17, the spray coaters, is Task 28's). Each violation names its entities,
+// and `mirrors` names the game method the rule follows where there is one.
 import type { Building, GameDataIndex, TechEffects } from '../data';
 import {
   BELT_HALF_WIDTH_TILES,
+  COATER_GROUND_TOLERANCE_LEVELS,
   LEVEL,
   LayoutIndex,
   MIN_SORTER_LENGTH_M,
@@ -12,6 +13,11 @@ import {
   TILE,
   buildingDef,
   buildingOBBs,
+  coaterBuilding,
+  coaterPlacementProblem,
+  coaterProliferators,
+  coaterTopPoint,
+  findCoaterTop,
   obbOverlap,
   pointInOBBs,
   portInfos,
@@ -21,8 +27,9 @@ import {
   sorterReachProblem,
   sorterSkewProblem,
   sorterTapPoint,
+  sprayCoaterDef,
 } from '../geometry';
-import type { BeltPath, GridPoint, Layout, OBB2, PlacedBuilding, SlotInfo, Sorter } from '../geometry';
+import type { BeltPath, GridPoint, Layout, OBB2, PlacedBuilding, SlotInfo, Sorter, SprayCoater } from '../geometry';
 import type { Violation, ViolationCode, ViolationEntity } from './types';
 
 const MIRROR_CLICK = 'BuildTool_Click.CheckBuildConditions';
@@ -52,6 +59,8 @@ const RULE_ORDER: ViolationCode[] = [
   'POWER_UNCOVERED',
   'POWER_DISCONNECTED',
   'STATION_SLOTS',
+  'COATER_PLACEMENT',
+  'COATER_UNFED',
 ];
 
 /** Positions closer than this are the same position. */
@@ -145,9 +154,11 @@ const sorter = (id: number): ViolationEntity => ({ kind: 'sorter', id });
 const beltNode = (id: number, node: number): ViolationEntity => ({ kind: 'belt', id, node });
 
 interface BuildingEntry {
-  /** Position in `layout.buildings`. */
+  /** Position in `layout.buildings`; a coater follows the buildings (`layout.coaters` order). */
   index: number;
   b: PlacedBuilding;
+  /** Set for a spray coater: the layout entry it stands for. */
+  coater?: SprayCoater;
   bd: Building;
   obbs: OBB2[];
   slots?: (SlotInfo | string)[];
@@ -155,6 +166,7 @@ interface BuildingEntry {
 }
 
 const label = (e: BuildingEntry): string => `building ${e.b.id} (${e.bd.name})`;
+const coaterTopPointOf = (e: BuildingEntry): GridPoint => coaterTopPoint(e.b);
 
 /** One collider box of a building, registered in the building grid. */
 interface Box {
@@ -246,12 +258,36 @@ class GeometryChecker {
       this.entryById.set(b.id, entry);
     });
     for (const belt of layout.belts) this.beltById.set(belt.id, belt);
+    this.addCoaterEntries();
     for (const entry of this.entries) {
       for (const obb of entry.obbs) this.boxes.push({ entry, obb, solo: [obb] });
     }
     this.boxGrid = new SpatialGrid(this.boxes.length, CELL_TILES);
     this.boxes.forEach((box, i) => this.boxGrid.add(i, ...bounds(box.obb)));
     this.analyzeStacks();
+  }
+
+  /**
+   * A spray coater stands on a belt node and is not in `layout.buildings`, but it is a building to the rules that treat
+   * one (overlap, a belt through it, power cover), so each coater that has a node under it gets an entry here, after
+   * the buildings. Throws for a coater id that another building or coater has, and for a data set with no coater.
+   */
+  private addCoaterEntries(): void {
+    const coaters = this.layout.coaters ?? [];
+    if (coaters.length === 0) return;
+    const def = sprayCoaterDef(this.data);
+    if (!def) throw new Error('GameData has no spray coater building, but the layout has coaters');
+    const ids = new Set<number>();
+    for (const c of coaters) {
+      if (this.entryById.has(c.id)) throw new Error(`duplicate building id ${c.id} (a coater and another building)`);
+      if (ids.has(c.id)) throw new Error(`duplicate coater id ${c.id}`);
+      ids.add(c.id);
+      const b = coaterBuilding(c, this.beltById.get(c.beltId), def);
+      if (!b) continue; // nothing to stand on: the placement rule says so
+      const entry: BuildingEntry = { index: this.entries.length, b, coater: c, bd: def, obbs: buildingOBBs(b, def) };
+      this.entries.push(entry);
+      this.entryById.set(c.id, entry);
+    }
   }
 
   run(): Violation[] {
@@ -264,6 +300,7 @@ class GeometryChecker {
     this.sorters();
     this.power();
     this.stationSlots();
+    this.coaters();
     return RULE_ORDER.flatMap((code) => this.byCode.get(code) ?? []);
   }
 
@@ -438,7 +475,9 @@ class GeometryChecker {
         const hits: BuildingEntry[] = [];
         this.boxGrid.query(p.x - margin, p.y - margin, p.x + margin, p.y + margin, (id) => {
           const box = this.boxes[id];
-          if (!hits.includes(box.entry) && pointInOBBs(p.x, p.y, p.z, box.solo, BELT_HALF_WIDTH_TILES)) hits.push(box.entry);
+          if (hits.includes(box.entry) || !pointInOBBs(p.x, p.y, p.z, box.solo, BELT_HALF_WIDTH_TILES)) return;
+          if (box.entry.coater && this.passesThroughCoater(box.entry, belt, node)) return;
+          hits.push(box.entry);
         });
         if (hits.length === 0) return;
         hits.sort((a, b) => a.index - b.index);
@@ -1167,6 +1206,77 @@ class GeometryChecker {
           `min(connectDistance_a, connectDistance_b) = ${num(need)} m (MX §6.1, C3: unverified)`,
         MIRROR_POWER,
       );
+    }
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // 17. Spray coaters: COATER_PLACEMENT, COATER_UNFED
+
+  /** The proliferator items a coater takes, from the coater in GameData. */
+  private proliferators: ReadonlySet<number> | undefined;
+  /** Per coater id: the proliferator belt node at its top passage, or null. */
+  private readonly tops = new Map<number, { belt: BeltPath; node: number } | null>();
+
+  private topOf(entry: BuildingEntry): { belt: BeltPath; node: number } | null {
+    const id = entry.b.id;
+    let top = this.tops.get(id);
+    if (top === undefined) {
+      this.proliferators ??= coaterProliferators(entry.bd);
+      top = findCoaterTop(this.layout, entry.b, this.proliferators);
+      this.tops.set(id, top);
+    }
+    return top;
+  }
+
+  /**
+   * May node `node` of `belt` be inside the body of the coater `entry`? Two sets of nodes may: the ground nodes of the belt
+   * the coater stands on (it passes through the bottom of the coater, up to two nodes either side of the one it stands
+   * on), and the one node of the proliferator belt at the top passage. Any other node in the body is a belt through a
+   * building.
+   */
+  private passesThroughCoater(entry: BuildingEntry, belt: BeltPath, node: number): boolean {
+    const c = entry.coater as SprayCoater;
+    if (belt.id === c.beltId && Math.abs(node - c.node) <= 2 && Math.abs(belt.nodes[node].z - entry.b.z) <= COATER_GROUND_TOLERANCE_LEVELS) {
+      return true;
+    }
+    const top = this.topOf(entry);
+    return top !== null && top.belt === belt && top.node === node;
+  }
+
+  // mirrors: BuildTool_Click.CheckBuildConditions
+  /**
+   * Rule 17. A coater stands on a straight run of ground nodes of its belt, turned along it, with the flow or against it
+   * (`coaterPlacementProblem`), and a belt that carries a proliferator (or whose item is not known: an imported blueprint)
+   * passes one level above the node behind it (upstream when it is turned with the flow), within a tenth of a tile of the
+   * exact top passage (`findCoaterTop`). The coater's body is held to the building rules like any building (overlap, belts
+   * through it, power cover). The sample the pattern comes from has a proliferator belt crossing every coater at a right angle:
+   * a belt that runs along the coater through its body puts a second node inside it, which BELT_IN_BUILDING reports.
+   */
+  private coaters(): void {
+    for (const c of this.layout.coaters ?? []) {
+      const who = `coater ${c.id}`;
+      const belt = this.beltById.get(c.beltId);
+      if (!belt) {
+        this.emit('COATER_PLACEMENT', [building(c.id)], `${who} stands on belt ${c.beltId}, which is not in the layout`, MIRROR_CLICK);
+        continue;
+      }
+      const onNode = belt.nodes[c.node] !== undefined;
+      const problem = coaterPlacementProblem(belt, c.node, c.yaw);
+      if (problem) {
+        this.emit('COATER_PLACEMENT', onNode ? [building(c.id), beltNode(belt.id, c.node)] : [building(c.id)], `${who}: ${problem}`, MIRROR_CLICK);
+      }
+      const entry = this.entryById.get(c.id);
+      if (!onNode || !entry) continue;
+      if (this.topOf(entry) === null) {
+        const top = coaterTopPointOf(entry);
+        this.emit(
+          'COATER_UNFED',
+          [building(c.id)],
+          `${who} at ${at(entry.b)} has no proliferator belt over its top passage: no node of a belt that carries a proliferator ` +
+            `is near ${at(top)} at z ${num(top.z)} (one node behind the coater, one level up)`,
+          MIRROR_CLICK,
+        );
+      }
     }
   }
 

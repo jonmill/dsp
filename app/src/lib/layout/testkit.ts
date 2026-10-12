@@ -2,7 +2,7 @@
 // netlists, and the Layout that a placement, a tap assignment and a set of routes make together (so the validator can
 // judge the router's output).
 import { planProduction } from '../calc';
-import type { PlanRequest, ProductionPlan } from '../calc';
+import type { PlanRequest, ProductionPlan, ProliferatorSetting } from '../calc';
 import { allTechs, computeTechEffects, GameDataIndex } from '../data';
 import type { TechEffects } from '../data';
 import { buildingDef, slotInfos } from '../geometry';
@@ -50,8 +50,11 @@ export async function planFor(over: Partial<PlanRequest> & Pick<PlanRequest, 'ta
   return result.plan;
 }
 
-/** The plan of `processorNetlist`: Processors on Mk.III assemblers, everything unlocked, ore/copper/silicon supplied. */
-export async function processorPlan(perSecond = 1): Promise<ProductionPlan> {
+/**
+ * The plan of `processorNetlist`: Processors on Mk.III assemblers, everything unlocked, ore/copper/silicon supplied;
+ * `proliferator` sprays every stage (none by default).
+ */
+export async function processorPlan(perSecond = 1, proliferator: ProliferatorSetting = { tier: 0, mode: 'extra' }): Promise<ProductionPlan> {
   const request: PlanRequest = {
     targetItemId: 1303,
     quantity: { kind: 'rate', perSecond },
@@ -60,7 +63,7 @@ export async function processorPlan(perSecond = 1): Promise<ProductionPlan> {
     suppliedItemIds: new Set([1001, 1002, 1003]),
     facilityOverrides: { 51: ASSEMBLER_MK3, 50: ASSEMBLER_MK3, 53: ASSEMBLER_MK3, 1: SMELTER, 3: SMELTER, 59: SMELTER },
     recipeOverrides: {},
-    proliferator: { tier: 0, mode: 'extra' },
+    proliferator,
     stationKind: 'planetary',
   };
   const result = await planProduction(request, data, effects);
@@ -69,8 +72,8 @@ export async function processorPlan(perSecond = 1): Promise<ProductionPlan> {
 }
 
 /** Processors on Mk.III assemblers, everything unlocked, ore/copper/silicon supplied: a real plan's netlist. */
-export async function processorNetlist(perSecond = 1): Promise<Netlist> {
-  return buildNetlist(await processorPlan(perSecond), data, effects);
+export async function processorNetlist(perSecond = 1, proliferator?: ProliferatorSetting): Promise<Netlist> {
+  return buildNetlist(await processorPlan(perSecond, proliferator), data, effects);
 }
 
 export const MATRIX_LAB = 2901;

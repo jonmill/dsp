@@ -535,26 +535,91 @@ describe('runSimulation: lab stacks', () => {
 });
 
 describe('runSimulation: spray coaters', () => {
-  /** The smelter row with a coater on the ore belt before the first smelter, and a Mk.III proliferator belt above it. */
-  function sprayedRow(): { layout: Layout; row: ReturnType<typeof smelterRowLayout> } {
+  /**
+   * The smelter row with a coater on the ore belt before the first smelter, and a Mk.III proliferator belt over its top
+   * passage. The ore belt flows east along y = 5, so the coater on its node 6, (6, 5), is turned 90 and its top passage is
+   * the node upstream of it, (5, 5), one level up: the proliferator belt crosses there, from a station of its own.
+   */
+  function sprayedRow(prolifLine: [number, number][] = [[5, 3], [5, 12]]): { layout: Layout; row: ReturnType<typeof smelterRowLayout> } {
     const row = smelterRowLayout(3);
     const prolifSource = row.kit.station(0, 30, 0, ITEM.ils, { station: stationConfig(1) });
     prolifSource.station!.slots[0].itemId = 1143;
-    const prolif = row.kit.belt(1, 1143, line([0, 6], [12, 6], 1), { source: { buildingId: prolifSource.id, port: 0 } });
-    const layout = { ...row.kit.layout(), coaters: [{ id: 1, beltId: row.ore.id, node: 6, yaw: 0 }] } as Layout;
-    expect(prolif.nodes[6]).toEqual({ x: 6, y: 6, z: 1 });
-    return { layout, row };
+    row.kit.belt(1, 1143, line(prolifLine[0], prolifLine[1], 1), { source: { buildingId: prolifSource.id, port: 0 } });
+    const coater = row.kit.coater(row.ore, 6);
+    expect(coater.yaw).toBe(90);
+    return { layout: row.kit.layout(), row };
   }
 
   it('sprays the ore so the smelters make 25 % more ingots', () => {
     const { layout, row } = sprayedRow();
+    expect(layout.belts[2].nodes.find((p) => p.x === 5 && p.y === 5)).toEqual({ x: 5, y: 5, z: 1 });
     const sim = runSimulation(layout, row.plan, fixtureData, fixtureEffects, { warmupTicks: 3600, measureTicks: 7200 });
     expect(sim.warnings).toEqual([]);
     expect(Math.abs(sim.measuredTargetRate - 3.75)).toBeLessThan(0.1);
-    const plain = simulate(row, { warmupTicks: 3600, measureTicks: 7200 });
+    const plain = simulate(smelterRowLayout(3), { warmupTicks: 3600, measureTicks: 7200 });
     expect(plain.measuredTargetRate).toBeLessThan(3.05);
     // Work power is drawn by the Mk.III-sprayed smelters (x2.5), so the average power rises.
     expect(sim.power.steadyW).toBeGreaterThan(plain.power.steadyW * 2);
+  });
+
+  it('reads the proliferator from the belt at the exact top passage, not from one that merely passes near', () => {
+    // one node downstream of the coater, one node upstream but on the ground, and two levels up: none feeds it
+    for (const [name, nodes, z] of [
+      ['downstream', [[7, 3], [7, 12]], 1],
+      ['two nodes upstream', [[4, 3], [4, 12]], 1],
+      ['two levels up', [[5, 3], [5, 12]], 2],
+    ] as const) {
+      const { layout, row } = sprayedRow(nodes as unknown as [number, number][]);
+      for (const p of layout.belts[2].nodes) p.z = z;
+      const sim = runSimulation(layout, row.plan, fixtureData, fixtureEffects, FAST);
+      expect(sim.warnings.join('\n'), name).toMatch(/coater \d+.*no proliferator belt/);
+      expect(sim.coaters.proliferatorPerSecond, name).toBe(0);
+    }
+  });
+
+  it('counts what the coaters sprayed and the proliferator they took from the belt', () => {
+    const { layout, row } = sprayedRow();
+    const sim = runSimulation(layout, row.plan, fixtureData, fixtureEffects, { warmupTicks: 3600, measureTicks: 7200 });
+    expect(sim.coaters.count).toBe(1);
+    // the three smelters eat 3 ore/s; every cargo that passes the coater is sprayed
+    expect(Math.abs(sim.coaters.sprayedItems / sim.measureSeconds - 3)).toBeLessThan(0.15);
+    // Mk.III: 60 sprays an item (and a few more for a stack that was itself sprayed: none here)
+    expect(sim.coaters.proliferatorPerSecond).toBeGreaterThan(0);
+    expect(Math.abs(sim.coaters.proliferatorPerSecond - 3 / 60)).toBeLessThan(0.02);
+  });
+
+  it('counts the coater\'s draw in the power it reports: idle with nothing to spray, work while it sprays', () => {
+    // a belt of ore from one station to another, no machine and no sorter: the coater is the only consumer
+    const rig = (prolifNodes: number) => {
+      const pair = stationPairLayout(1, 14);
+      const prolifSource = pair.kit.station(0, 30, 0, ITEM.ils, { station: stationConfig(1) });
+      prolifSource.station!.slots[0].itemId = 1143;
+      if (prolifNodes > 0) pair.kit.belt(1, 1143, line([6, 3], [6, 8], 1), { source: { buildingId: prolifSource.id, port: 0 } });
+      pair.kit.coater(pair.belt, 7);
+      const plan = { ...planOf([]), actualTargetRate: 0 };
+      return runSimulation(pair.kit.layout(), plan, fixtureData, fixtureEffects, { warmupTicks: 3600, measureTicks: 3600 });
+    };
+    const def = fixtureData.building(2313)!;
+    const work = def.power.workPerTick * 60;
+    const idle = def.power.idlePerTick * 60;
+    // wired: idle power all the time, work power on each tick it sprays a cargo (one tick per cargo that passes)
+    const wired = rig(6);
+    expect(wired.coaters.count).toBe(1);
+    const cargoPerSecond = wired.coaters.sprayedItems / wired.measureSeconds; // stack 1: one item a cargo
+    expect(cargoPerSecond).toBeGreaterThan(5);
+    expect(wired.power.steadyW).toBeCloseTo(idle + (cargoPerSecond / 60) * (work - idle), 0);
+    expect(wired.power.idleW).toBeCloseTo(idle * (1 - cargoPerSecond / 60), 0);
+    expect(wired.power.peakW).toBeCloseTo(work, 6);
+    // no proliferator belt over it: not wired, so it is not in the sum, and the run says so
+    const unfed = rig(0);
+    expect(unfed.coaters.count).toBe(0);
+    expect(unfed.power.steadyW).toBe(0);
+    expect(unfed.warnings.join('\n')).toMatch(/coater \d+.*never sprays/);
+  });
+
+  it('a layout without coaters reports none', () => {
+    const sim = simulate(smelterRowLayout(3), FAST);
+    expect(sim.coaters).toEqual({ count: 0, sprayedItems: 0, proliferatorPerSecond: 0 });
   });
 
   it('takes the proliferator mode from the plan unless a building sets its own', () => {
@@ -573,10 +638,16 @@ describe('runSimulation: spray coaters', () => {
   it('is inert when the layout has no coaters field, and warns about a coater with no proliferator belt', () => {
     const row = smelterRowLayout(3);
     expect('coaters' in row.kit.layout()).toBe(false);
-    const layout = { ...row.kit.layout(), coaters: [{ id: 1, beltId: row.ore.id, node: 6, yaw: 0 }] } as Layout;
-    const sim = runSimulation(layout, row.plan, fixtureData, fixtureEffects, FAST);
-    expect(sim.warnings.join('\n')).toMatch(/coater 1.*proliferator belt/);
+    row.kit.coater(row.ore, 6);
+    const sim = runSimulation(row.kit.layout(), row.plan, fixtureData, fixtureEffects, FAST);
+    expect(sim.warnings.join('\n')).toMatch(/coater \d+.*proliferator belt/);
     expect(sim.measuredTargetRate).toBeGreaterThan(2.9);
+  });
+
+  it('a coater on a belt or node that is not there is an error, like a sorter on one', () => {
+    const row = smelterRowLayout(3);
+    row.kit.coaters.push({ id: 7, beltId: 99, node: 6, yaw: 90 });
+    expect(() => runSimulation(row.kit.layout(), row.plan, fixtureData, fixtureEffects, FAST)).toThrow(/coater 7/);
   });
 });
 

@@ -13,6 +13,7 @@ import type {
   Layout,
   PlacedBuilding,
   Sorter,
+  SprayCoater,
   StationConfig,
   Yaw,
 } from '../geometry';
@@ -142,9 +143,11 @@ export class LayoutKit {
   readonly buildings: PlacedBuilding[] = [];
   readonly belts: BeltPath[] = [];
   readonly sorters: Sorter[] = [];
+  readonly coaters: SprayCoater[] = [];
   private nextBuilding = 1;
   private nextBelt = 1;
   private nextSorter = 1;
+  private nextCoater = 5000;
 
   constructor(
     readonly data: GameDataIndex = fixtureData,
@@ -205,6 +208,19 @@ export class LayoutKit {
     return s;
   }
 
+  /**
+   * A spray coater on node `node` of `belt`, turned `yaw` (default: the way the belt flows there). Ids start at 5000, away
+   * from the buildings'.
+   */
+  coater(belt: BeltPath, node: number, yaw?: Yaw): SprayCoater {
+    const here = belt.nodes[node];
+    const next = belt.nodes[node + 1] ?? here;
+    const flow = Math.abs(next.x - here.x) > Math.abs(next.y - here.y) ? (next.x > here.x ? 90 : 270) : next.y > here.y ? 0 : 180;
+    const c: SprayCoater = { id: this.nextCoater++, beltId: belt.id, node, yaw: yaw ?? flow };
+    this.coaters.push(c);
+    return c;
+  }
+
   /** The lattice point a span-`span` sorter on `slot` of `building` taps on a belt (from the geometry kernel). */
   tapPoint(building: PlacedBuilding, slot: number, span: 1 | 2 | 3 = 1): { x: number; y: number } {
     const def = this.data.building(building.itemId);
@@ -218,6 +234,8 @@ export class LayoutKit {
       buildings: [...this.buildings],
       belts: [...this.belts],
       sorters: [...this.sorters],
+      // a layout without coaters has no field, like one made before they existed
+      ...(this.coaters.length > 0 ? { coaters: this.coaters.map((c) => ({ ...c })) } : {}),
       meta: { geometrySource: 'approximate', gameVersion: '0.10.29.22015', planTargetItemId: 1101, planTargetRate: 1 },
     };
   }

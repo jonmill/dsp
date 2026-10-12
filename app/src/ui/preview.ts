@@ -11,7 +11,7 @@
  * above it, so a belt lying on a roof is not hidden by the building under it.
  */
 import type { BuildingKind, GameDataIndex } from '../lib/data';
-import { BELT_HALF_WIDTH_TILES, buildingDef, buildingOBBs, layoutIndex, prefabToGrid, sorterEnds, TILE } from '../lib/geometry';
+import { BELT_HALF_WIDTH_TILES, buildingDef, buildingOBBs, coaterBuildings, layoutIndex, prefabToGrid, sorterEnds, TILE } from '../lib/geometry';
 import type { BeltPath, GridPoint, Layout, OBB2, PlacedBuilding, Sorter } from '../lib/geometry';
 import { pointInOBBs } from '../lib/geometry';
 import type { Violation, ViolationEntity } from '../lib/validate';
@@ -110,6 +110,14 @@ const onLevel = (z: number, level: number | 'all'): boolean => level === 'all' |
 
 const spansLevel = (box: OBB2, level: number | 'all'): boolean =>
   level === 'all' || (box.zMin < level + 1 - LEVEL_EPS && box.zMax > level + LEVEL_EPS);
+
+/**
+ * Everything the preview draws and hits as a building: the layout's buildings, and its spray coaters, which stand on belt
+ * nodes and are not in `Layout.buildings` (their ids are far above the buildings', so an id names one thing).
+ */
+function buildingsOf(layout: Layout, data: GameDataIndex): PlacedBuilding[] {
+  return layout.coaters && layout.coaters.length > 0 ? [...layout.buildings, ...coaterBuildings(layout, data)] : layout.buildings;
+}
 
 /** The colliders of `b` and its definition, or null where GameData does not know the building. */
 function boxesOf(b: PlacedBuilding, data: GameDataIndex): OBB2[] | null {
@@ -225,7 +233,7 @@ function drawViolation(ctx: Draw2D, entity: ViolationEntity, layout: Layout, dat
   ctx.lineJoin = 'round';
   ctx.lineCap = 'round';
   if (entity.kind === 'building') {
-    const b = layout.buildings.find((x) => x.id === entity.id);
+    const b = buildingsOf(layout, data).find((x) => x.id === entity.id);
     const boxes = b && boxesOf(b, data);
     if (!boxes) return;
     ctx.beginPath();
@@ -263,7 +271,7 @@ function drawViolation(ctx: Draw2D, entity: ViolationEntity, layout: Layout, dat
  */
 export function renderLayout(ctx: Draw2D, layout: Layout, data: GameDataIndex, opts: RenderOptions): void {
   const shown: { b: PlacedBuilding; kind: BuildingKind; boxes: OBB2[] }[] = [];
-  for (const b of layout.buildings) {
+  for (const b of buildingsOf(layout, data)) {
     const boxes = boxesOf(b, data)?.filter((box) => spansLevel(box, opts.level));
     if (boxes && boxes.length > 0) shown.push({ b, kind: buildingDef(data, b.itemId).kind, boxes });
   }
@@ -347,7 +355,7 @@ export function hitTest(layout: Layout, data: GameDataIndex, x: number, y: numbe
   if (belt) return { kind: 'belt', id: belt.id, node: belt.node };
 
   let building: { id: number; z: number; d: number } | undefined;
-  for (const b of layout.buildings) {
+  for (const b of buildingsOf(layout, data)) {
     const boxes = boxesOf(b, data)?.filter((box) => spansLevel(box, level));
     if (!boxes || !pointInOBBs(x, y, null, boxes, tolerance)) continue;
     const d = Math.hypot(x - b.x, y - b.y);
@@ -365,7 +373,7 @@ const place = (x: number, y: number, z: number): string => `(${+x.toFixed(1)}, $
 /** A few lines of text for the tooltip over `entity`: what it is, what it does and where it is. */
 export function describeEntity(layout: Layout, data: GameDataIndex, entity: ViolationEntity): string {
   if (entity.kind === 'building') {
-    const b = layout.buildings.find((x) => x.id === entity.id);
+    const b = buildingsOf(layout, data).find((x) => x.id === entity.id);
     if (!b) return `building #${entity.id} is not in the layout`;
     const lines = [`${buildingName(data, b.itemId)} #${b.id}`];
     if (b.recipeId !== undefined) {
@@ -403,7 +411,7 @@ export function describeEntity(layout: Layout, data: GameDataIndex, entity: Viol
 /** The grid point at the middle of `entity` (a belt node's own point), or null where the layout does not have it. */
 export function entityCentre(layout: Layout, data: GameDataIndex, entity: ViolationEntity): { x: number; y: number } | null {
   if (entity.kind === 'building') {
-    const b = layout.buildings.find((x) => x.id === entity.id);
+    const b = buildingsOf(layout, data).find((x) => x.id === entity.id);
     return b ? { x: b.x, y: b.y } : null;
   }
   if (entity.kind === 'belt') {
@@ -427,7 +435,7 @@ export function layoutBounds(layout: Layout, data: GameDataIndex): Bounds | null
       ? { minX: Math.min(box.minX, minX), maxX: Math.max(box.maxX, maxX), minY: Math.min(box.minY, minY), maxY: Math.max(box.maxY, maxY) }
       : { minX, maxX, minY, maxY };
   };
-  for (const b of layout.buildings) {
+  for (const b of buildingsOf(layout, data)) {
     for (const o of boxesOf(b, data) ?? []) {
       const c = Math.abs(Math.cos(o.angle));
       const s = Math.abs(Math.sin(o.angle));

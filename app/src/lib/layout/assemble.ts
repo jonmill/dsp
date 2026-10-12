@@ -7,7 +7,11 @@
 //    `dir 2` (input) where a net ends at it and `dir 0` otherwise; `storageIdx` is the 1-based position of the net's
 //    item among the slots. `chargePerTick` is the request's, else the data's default for the station kind. No piler.
 // Belts. One per net, with the net's id: the route's nodes, the net's item and tier, and the station ports the tap
-//    assignment gave it as `source` / `sink`. `plannedRate` is the net's rate.
+//    assignment gave it as `source` / `sink`. `plannedRate` is the net's rate. The proliferator net (Task 28) is routed
+//    after the others, so a call that is given no route for it leaves it out (the layout of the item nets alone).
+// Coaters. The spray coaters the caller placed (proliferator.ts) are the layout's `coaters` as they are.
+// Proliferator mode. A production building or lab of a plan that sprays in `speed` mode carries `prolifMode` 1, which the
+//    blueprint writes as the machine's parameter and the simulator reads; with `extra` (or no proliferator) it carries none.
 // Sorters. One per assigned tap, ids from 1 in assignment order. An `in` tap picks from the belt node at the tap
 //    point and drops into the machine slot; an `out` tap does the reverse. Every sorter is filtered to its net's item,
 //    whichever way it runs (an unfiltered output sorter on a machine with several products would put the wrong one
@@ -18,7 +22,8 @@
 // Meta. The geometry is `'approximate'` as soon as one building, belt or sorter the layout uses is.
 import type { ProductionPlan } from '../calc';
 import type { GameDataIndex } from '../data';
-import type { BeltPath, Endpoint, Layout, PlacedBuilding, Sorter, StationConfig } from '../geometry';
+import { sprayCoaterDef } from '../geometry';
+import type { BeltPath, Endpoint, Layout, PlacedBuilding, Sorter, SprayCoater, StationConfig } from '../geometry';
 import { provisionedRate } from '../validate/sim/run';
 import type { BeltNet, Netlist } from './netlist';
 import { placementBuildingIdOf, stationBuildingId } from './placement';
@@ -76,10 +81,13 @@ function geometrySource(
   buildings: PlacedBuilding[],
   netlist: Netlist,
   data: GameDataIndex,
+  coaters: readonly SprayCoater[],
 ): Layout['meta']['geometrySource'] {
   const items = new Set<number>(buildings.map((b) => b.itemId));
   items.add(netlist.sorterTierItemId);
   for (const n of netlist.nets) items.add(n.tierItemId);
+  const coater = coaters.length > 0 ? sprayCoaterDef(data) : undefined;
+  if (coater) items.add(coater.itemId);
   for (const id of items) {
     const def = data.building(id);
     if (!def) {
@@ -105,13 +113,17 @@ export function assembleLayout(
   powerNodes: PlacedBuilding[],
   plan: ProductionPlan,
   data: GameDataIndex,
+  coaters: readonly SprayCoater[] = [],
 ): Layout {
   const routeOf = new Map(routes.map((r) => [r.netId, r]));
   const stationIdxOf = new Map(netlist.stations.map((_, i) => [stationBuildingId(i), i]));
+  const sprayMode: 0 | 1 | undefined =
+    plan.request.proliferator.tier !== 0 && plan.request.proliferator.mode === 'speed' ? 1 : undefined;
 
   const buildings: PlacedBuilding[] = placement.buildings.map((b) => {
     const idx = stationIdxOf.get(b.id);
-    return idx === undefined ? { ...b } : { ...b, station: stationConfig(netlist, idx, taps, plan, data) };
+    if (idx !== undefined) return { ...b, station: stationConfig(netlist, idx, taps, plan, data) };
+    return sprayMode !== undefined && b.recipeId !== undefined ? { ...b, prolifMode: sprayMode } : { ...b };
   });
   const ids = new Set(buildings.map((b) => b.id));
   for (const node of powerNodes) {
@@ -120,7 +132,9 @@ export function assembleLayout(
     buildings.push({ ...node });
   }
 
-  const belts: BeltPath[] = netlist.nets.map((net) => beltOf(net, routeOf.get(net.id), taps));
+  const belts: BeltPath[] = netlist.nets
+    .filter((net) => !(net.proliferator && !routeOf.has(net.id)))
+    .map((net) => beltOf(net, routeOf.get(net.id), taps));
   const beltById = new Map(belts.map((b) => [b.id, b]));
 
   const sorters: Sorter[] = [];
@@ -158,8 +172,9 @@ export function assembleLayout(
     buildings,
     belts,
     sorters,
+    ...(coaters.length > 0 ? { coaters: coaters.map((c) => ({ ...c })) } : {}),
     meta: {
-      geometrySource: geometrySource(buildings, netlist, data),
+      geometrySource: geometrySource(buildings, netlist, data, coaters),
       gameVersion: data.data.meta.gameVersion,
       planTargetItemId: plan.request.targetItemId,
       planTargetRate: provisionedRate(plan),

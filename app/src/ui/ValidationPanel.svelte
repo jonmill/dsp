@@ -67,6 +67,28 @@
           Measured over {sim.measureSeconds} s after a {Math.round(sim.warmupTicksUsed / 60)} s warm-up (game time).
         </p>
 
+        {#if sim.coaters.count > 0}
+          <h3>Proliferator</h3>
+          <div class="figures">
+            <div>
+              <span class="muted">Spray coaters</span>
+              <strong class="num">{sim.coaters.count}</strong>
+            </div>
+            <div>
+              <span class="muted">Used (simulated)</span>
+              <strong class="num">{formatRate(sim.coaters.proliferatorPerSecond, 's')}</strong>
+            </div>
+            <div>
+              <span class="muted">Plan</span>
+              <strong class="num">{formatRate(plan.proliferatorPerSecond, 's')}</strong>
+            </div>
+          </div>
+          <p class="hint">
+            A coater sprays everything that passes it, including what goes on to the stations, and the machines the plan
+            rounded up work at full speed, so the simulated use can exceed the plan's.
+          </p>
+        {/if}
+
         <h3>Power</h3>
         <table>
           <thead>

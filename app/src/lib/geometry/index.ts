@@ -1,4 +1,21 @@
 export * from './model';
+export {
+  COATER_AXIS_TOLERANCE_TILES,
+  COATER_GROUND_TOLERANCE_LEVELS,
+  COATER_STEP_TILES,
+  COATER_TOP_PASSAGE,
+  COATER_TOP_TOLERANCE_LEVELS,
+  COATER_TOP_TOLERANCE_TILES,
+  COATER_YAW_TOLERANCE_DEG,
+  coaterBuilding,
+  coaterBuildings,
+  coaterPlacementProblem,
+  coaterProliferators,
+  coaterTopPoint,
+  findCoaterTop,
+  isProliferatorBelt,
+  sprayCoaterDef,
+} from './coater';
 export { LEVEL, TILE, beltNodeYaws, headingDeg, prefabDirToGrid, prefabToGrid, rotateYaw } from './transform';
 export { DEFAULT_OVERLAP_EPS, obbOverlap, pointInOBBs } from './obb';
 export type { OBB2 } from './obb';

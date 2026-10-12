@@ -344,6 +344,21 @@ The observed slot values for non-connected buildings are themselves a detail to 
 
 Copy the source values exactly. When generating new buildings, use these patterns.
 
+**Spray coaters (2313, model 120) in the capsule sample [TESTED, 8 records].** A coater record has `outputObjIdx = inputObjIdx = -1`
+and the `14,15,15,14,0,0` slot fields, no parameters, `pos2 = pos`, `yaw2 = yaw` and tilt and pitch 0. No belt record points at it
+and it points at no belt: the sample links coater and belt only by position.
+- Each coater stands exactly on a belt record (same x and y, z within 0.01), on a straight run of ground belt.
+- All 8 coaters have yaw 180, whichever way their belt flows: the belts of columns x = 2, 3, 7, 8, 10, 14, 15 flow south (yaw 180),
+  those of x = 1 and 9 flow north (yaw 0). So a coater is turned *along* its belt, either way round.
+- One belt at z = 1.00 (1.0 to 1.006) runs along y = 18, north of every coater (which stands at y = 17), crossing the item belts at a
+  right angle. It passes the node one step behind each coater (the side its back is on: yaw 180 is south-facing, so north), which
+  is the prefab top-passage point `[0, 1.333, -1.25]` m (one level up, 1.25 m = 0.995 tiles behind the origin). It is a dead end that
+  ends on the last coater's top point, (1, 17.987); it is fed from the north by a splitter chain, not by a station.
+- Every belt runs straight for at least 3 nodes on each side of its coater, and the nearest sorter end is 3.2 tiles from any
+  coater (measured on the 8 records).
+The planner writes coaters the same way (`blueprint/build.ts`) and reads them back by position (`blueprint/import.ts`). The top
+passage and the crossing at a right angle are inferred from this one sample; see Task 30's checklist in the Task 28 report.
+
 ### 3.4 What the game writes (for an encoder)
 
 | Game version | Header cell 0 | Body version | Building marker | Trailer | Evidence |

@@ -565,6 +565,55 @@ describe('layoutToBlueprint', () => {
     expect(ms).toBeLessThanOrEqual(Date.now() + 1000);
   });
 
+  describe('spray coater records (BF §3.3)', () => {
+    const flowing = () => beltOf(1, [[3, 19], [3, 18], [3, 17], [3, 16], [3, 15]], { tierItemId: 2003 });
+
+    test('a coater is one record at its belt node: item 2313, the model of GameData, turned with the belt, no links', () => {
+      const layout = layoutOf({ belts: [flowing()], coaters: [{ id: 900, beltId: 1, node: 2, yaw: 180 }] });
+      const recs = records(layout);
+      const coater = recs.filter((r) => r.itemId === 2313);
+      expect(coater).toHaveLength(1);
+      const [c] = coater;
+      expect(c.modelIndex).toBe(data.building(2313)?.modelIndex);
+      expect([c.yaw, c.yaw2]).toEqual([180, 180]);
+      expect([c.outputObjIdx, c.inputObjIdx]).toEqual([-1, -1]);
+      expect([c.outputToSlot, c.inputFromSlot, c.outputFromSlot, c.inputToSlot, c.outputOffset, c.inputOffset]).toEqual([14, 15, 15, 14, 0, 0]);
+      expect(c.parameters).toHaveLength(0);
+      expect(c.recipeId).toBe(0);
+      expect(c.localOffset).toEqual(recs.filter((r) => r.itemId === 2003)[2].localOffset);
+    });
+
+    test('the coaters are the last records, so every other index is where it was without them', () => {
+      const bare = layoutOf({ buildings: [tower(1, 0, 0)], belts: [flowing()] });
+      const withCoater = { ...bare, coaters: [{ id: 900, beltId: 1, node: 2, yaw: 180 as const }] };
+      const a = records(bare);
+      const b = records(withCoater);
+      expect(b).toHaveLength(a.length + 1);
+      expect(b.slice(0, a.length).map((r) => [r.itemId, r.outputObjIdx])).toEqual(a.map((r) => [r.itemId, r.outputObjIdx]));
+      expect(b[a.length].itemId).toBe(2313);
+      expect(b.map((r) => r.index)).toEqual(b.map((_, i) => i));
+    });
+
+    test('the coaters take part in the translation onto the area origin', () => {
+      const layout = layoutOf({ belts: [beltOf(1, [[-3, 4], [-3, 3], [-3, 2]])], coaters: [{ id: 900, beltId: 1, node: 1, yaw: 180 }] });
+      const recs = records(layout);
+      expect(recs.every((r) => r.localOffset[0] >= 0 && r.localOffset[1] >= 0)).toBe(true);
+      expect(recs[recs.length - 1].localOffset.slice(0, 2)).toEqual(recs[1].localOffset.slice(0, 2));
+    });
+
+    test('a coater on a belt or node that is not there is refused', () => {
+      const build = (l: Layout) => () => layoutToBlueprint(l, data, OPTS);
+      expect(build(layoutOf({ coaters: [{ id: 900, beltId: 4, node: 0, yaw: 0 }] }))).toThrow(/coater 900.*belt 4/);
+      expect(build(layoutOf({ belts: [flowing()], coaters: [{ id: 900, beltId: 1, node: 9, yaw: 0 }] }))).toThrow(/coater 900.*node 9/);
+    });
+
+    test('the blueprint of a layout with coaters round-trips through the codec', () => {
+      const layout = layoutOf({ belts: [flowing()], coaters: [{ id: 900, beltId: 1, node: 2, yaw: 180 }] });
+      const str = layoutToBlueprintString(layout, data, OPTS);
+      expect(encodeBlueprint(decodeBlueprint(str))).toBe(str);
+    });
+  });
+
   describe('lab records (BF §4: research mode, proliferator mode)', () => {
     // A lab with no parameters arrives in game with research mode 0 ("none") and makes nothing.
     const labRecord = (b: Partial<PlacedBuilding>) =>
@@ -759,6 +808,70 @@ describe('real exports as an oracle for what the builder must reproduce', () => 
         near(m[1] - mineAsm.localOffset[1], t[1] - theirAsm.localOffset[1], 0.05, `${label} ${end} y`);
         near(m[2], t[2], 0.05, `${label} ${end} z`);
       }
+    }
+  });
+
+  test('capsule export: a spray coater record has the model, links, slot pattern and parameters the game wrote', () => {
+    const recs = loadBlueprintSample('capsule-production-v2-reform-0.10.33.txt').body.buildings;
+    const theirs = recs.filter((r) => r.itemId === 2313);
+    expect(theirs).toHaveLength(8);
+
+    // the sample's coaters stand on N-S belts flowing south (yaw 180); one of ours stands on the same kind of run
+    const item = beltOf(1, [[3, 19], [3, 18], [3, 17], [3, 16], [3, 15]], { tierItemId: 2003 });
+    const layout = layoutOf({ belts: [item], coaters: [{ id: 900, beltId: 1, node: 2, yaw: 180 }] });
+    const mine = records(layout);
+    const coaterRecs = mine.filter((r) => r.itemId === 2313);
+    expect(coaterRecs).toHaveLength(1);
+    const [m] = coaterRecs;
+
+    for (const t of theirs) {
+      const label = `sample coater ${t.index}`;
+      // Everything that is not a position: byte for byte what the game wrote.
+      const same = (r: BlueprintBuilding) => ({
+        marker: r.marker,
+        areaIndex: r.areaIndex,
+        tilt: r.tilt,
+        pitch: r.pitch,
+        tilt2: r.tilt2,
+        pitch2: r.pitch2,
+        itemId: r.itemId,
+        modelIndex: r.modelIndex,
+        outputObjIdx: r.outputObjIdx,
+        inputObjIdx: r.inputObjIdx,
+        slots: [r.outputToSlot, r.inputFromSlot, r.outputFromSlot, r.inputToSlot, r.outputOffset, r.inputOffset],
+        recipeId: r.recipeId,
+        filterId: r.filterId,
+        parameters: Array.from(r.parameters),
+      });
+      expect(same(m), label).toEqual(same(t));
+      // The positions: both ends of the record are the belt node, the yaw is the coater's own, the height is the ground.
+      expect(m.localOffset2, label).toEqual(m.localOffset);
+      expect(t.localOffset2, label).toEqual(t.localOffset);
+      near(m.localOffset[2], t.localOffset[2], 0.01, `${label} z`);
+      expect(headingGap(m.yaw, t.yaw), `${label} yaw`).toBeLessThan(0.01);
+      expect(headingGap(m.yaw2, t.yaw2), `${label} yaw2`).toBeLessThan(0.01);
+    }
+    expect(m.modelIndex).toBe(120);
+    expect([m.outputToSlot, m.inputFromSlot, m.outputFromSlot, m.inputToSlot, m.outputOffset, m.inputOffset]).toEqual([14, 15, 15, 14, 0, 0]);
+
+    // and, as in the sample, the coater stands exactly where its belt node record is: nothing links to either
+    const beltNode = mine.filter((r) => r.itemId === 2003)[2];
+    expect(m.localOffset).toEqual(beltNode.localOffset);
+    for (const r of mine) expect(r.outputObjIdx === m.index || r.inputObjIdx === m.index, `record ${r.index}`).toBe(false);
+  });
+
+  test('capsule export: the coaters of the sample stand on a belt node, turned along it, with the proliferator belt over the node behind them', () => {
+    // The pattern the builder and the validator rely on (BF §3.3 and geometry/coater.ts), read from the game's own file.
+    const recs = loadBlueprintSample('capsule-production-v2-reform-0.10.33.txt').body.buildings;
+    const belts = recs.filter((r) => r.itemId === 2003);
+    for (const c of recs.filter((r) => r.itemId === 2313)) {
+      const under = belts.find((b) => Math.hypot(b.localOffset[0] - c.localOffset[0], b.localOffset[1] - c.localOffset[1]) < 0.01 && Math.abs(b.localOffset[2] - c.localOffset[2]) < 0.05);
+      expect(under, `coater ${c.index}`).toBeDefined();
+      // turned along its belt, either way round: of the 8 coaters, 2 stand on belts that flow north against their yaw 180
+      expect(Math.min(headingGap(under!.yaw, c.yaw), headingGap(under!.yaw + 180, c.yaw)), `coater ${c.index}`).toBeLessThan(0.5);
+      // one node behind it (yaw 180: to the north) and one level up there is a belt node
+      const top = belts.find((b) => Math.hypot(b.localOffset[0] - c.localOffset[0], b.localOffset[1] - (c.localOffset[1] + 1)) < 0.1 && Math.abs(b.localOffset[2] - 1) < 0.05);
+      expect(top, `coater ${c.index} top`).toBeDefined();
     }
   });
 

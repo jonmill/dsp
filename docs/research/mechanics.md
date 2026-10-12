@@ -780,6 +780,9 @@ re-checked against colliders and sorter rules (§3.5) at the target latitude.
 - It keeps up with that belt's full cargo rate (§4.6).
 - Its proliferator belt enters from the top, so it can be fed from an elevated belt.
 - Coaters stack, so several belts can share a column (W).
+- Capsule sample (BF §3.3): the coater is turned along its item belt, either way round; one belt at z = 1 crosses the item belts at a
+  right angle over the node behind each coater (the prefab top point `[0, 1.333, -1.25]` m) and dead-ends on the last one. **[TESTED,
+  one sample]** The planner lays its proliferator network the same way (Task 28): see `app/src/lib/layout/proliferator.ts`.
 
 ### Global packing rules
 

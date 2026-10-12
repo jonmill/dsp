@@ -12,8 +12,14 @@
 // never taps a belt a producer feeds. (Otherwise consumers fill from the import belt, which the always-full station
 // keeps full, and the producers' belt backs up and blocks them.) A station input port takes any item of a configured
 // slot whatever the slot's logic, so the slot keeps the import role the plan gave it and the station pools both
-// sources. The proliferator import has no flows (spray coaters take it), so it gets a station slot here but no net;
-// Task 28 adds that net.
+// sources.
+//
+// The proliferator (Task 28). Its import has no flows: spray coaters take it, not stages. When the plan spends any
+// (`proliferatorPerSecond`), the netlist adds one more net, last: `proliferator: true`, starting at the station that
+// holds the proliferator's slot, with no taps and a dead end. Where it goes is not known yet: the router lays it through
+// the top passages of the coaters, which are placed on the other nets' routes (proliferator.ts). Every other net that has a
+// consumer in a proliferated stage is marked `sprayed`: a coater goes on its belt. The feed takes a belt port of its
+// station like any other net, so a full station (12 ports) gets a new one.
 //
 // Splitting by rate. A net is cut into several when it carries more than `NET_LOAD` of its belt, or has more than
 // `maxMachinesPerNet` taps. Think of the producers laid end to end along a rate axis [0, R) in id order, and of the
@@ -40,6 +46,7 @@
 // least one import net, and if the sink nets need more stations than there are import nets, the import is cut into
 // more nets (consumers of the import are split between them).
 import type { ItemRate, ProductionPlan, StationSlotDemand } from '../calc';
+import { proliferatorItemId } from '../calc/proliferator';
 import type { GameDataIndex, TechEffects } from '../data';
 import type { StationSlotConfig } from '../geometry';
 import { beltCapacity, sorterRate } from '../validate/capacity';
@@ -80,6 +87,13 @@ export interface BeltNet {
   sink: { kind: 'station'; stationIdx: number } | { kind: 'deadEnd' };
   /** Producers (`out`) first, then consumers (`in`), each in machine id order. */
   taps: NetTap[];
+  /**
+   * Set on the net that carries the proliferator to the spray coaters (see the file comment). It has no taps; it is
+   * routed after the other nets, through the top passage of every coater.
+   */
+  proliferator?: true;
+  /** Set on a net that feeds a machine of a proliferated stage: a spray coater stands on its belt, before the consumers. */
+  sprayed?: true;
 }
 export interface NetStation {
   kind: 'planetary' | 'interstellar';
@@ -548,6 +562,25 @@ export function buildNetlist(
     );
   }
 
+  // the proliferator: the nets whose consumers are proliferated get a coater, and one more net feeds the coaters
+  const sprayTier = plan.request.proliferator.tier;
+  if (sprayTier !== 0 && plan.proliferatorPerSecond > EPS) {
+    for (const net of nets) {
+      const consumesSprayed = net.taps.some((t) => t.dir === 'in' && plan.stages[machines[t.machineId - 1].stageIndex]?.proliferated);
+      if (consumesSprayed) net.sprayed = true;
+    }
+    nets.push({
+      id: nets.length + 1,
+      itemId: proliferatorItemId(sprayTier),
+      tierItemId: beltTierItemId,
+      rate: plan.proliferatorPerSecond,
+      source: { kind: 'station', stationIdx: -1 },
+      sink: { kind: 'deadEnd' },
+      taps: [],
+      proliferator: true,
+    });
+  }
+
   // stations
   const stationKind = plan.request.stationKind;
   const stationItemId = STATION_ITEM[stationKind];
@@ -572,7 +605,9 @@ export function buildNetlist(
     }
     // what a producer of an imported item makes goes back to the station: its slot keeps the import role
     const pooled = !imported && importedItems.has(net.itemId) && role === 'import';
-    if (!pooled && imported === (role === 'export')) {
+    // the proliferator net draws from its slot whatever role the slot has (the plan makes the proliferator it sprays with
+    // when that is the target: the slot is then an export)
+    if (!pooled && !net.proliferator && imported === (role === 'export')) {
       throw new Error(
         `netlist: ${itemName(data, net.itemId)} (${net.itemId}) is ${imported ? 'imported' : 'exported'} ` +
           `but its station slot is ${role}`,

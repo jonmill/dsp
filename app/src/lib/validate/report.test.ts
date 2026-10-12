@@ -173,6 +173,7 @@ describe('checkSimulation thresholds', () => {
     stageStats: [{ stageIndex: 0, crafts: 200, plannedCrafts: 200 }],
     deadlocked: false,
     power: { steadyW: 0, idleW: 0, peakW: 0, stationChargeW: 0 },
+    coaters: { count: 0, sprayedItems: 0, proliferatorPerSecond: 0 },
     measureSeconds: 100,
     warmupTicksUsed: 7200,
     warnings: [],

@@ -54,6 +54,14 @@ export const DEFAULT_PLACEMENT_WEIGHTS = { area: 1, wire: 1 } as const;
 /** A machine's building id is its netlist id plus this; station buildings take 1..S below it. */
 export const MACHINE_ID_OFFSET = 1000;
 
+/**
+ * A spray coater's id is the id of the net whose belt it stands on plus this (a net has at most one coater). The range
+ * lies far above the stations (1..S), the machines (`MACHINE_ID_OFFSET` + id) and the power nodes that follow them (one
+ * above the highest building id, so about `MACHINE_ID_OFFSET` + the machine count and a few hundred more), and the coaters
+ * are not in `Layout.buildings`, so a violation that names a building id can never mean the wrong thing.
+ */
+export const COATER_ID_OFFSET = 1_000_000;
+
 /** The building id of station `stationIdx` of the netlist. */
 export function stationBuildingId(stationIdx: number): number {
   return stationIdx + 1;
@@ -62,9 +70,13 @@ export function stationBuildingId(stationIdx: number): number {
 export function placementBuildingIdOf(machineId: number): number {
   return machineId + MACHINE_ID_OFFSET;
 }
-/** The netlist machine id behind a building id; undefined for a station. */
+/** The id of the spray coater on the belt of net `netId`. */
+export function coaterIdOf(netId: number): number {
+  return netId + COATER_ID_OFFSET;
+}
+/** The netlist machine id behind a building id; undefined for a station and for a spray coater. */
 export function machineIdOfBuilding(buildingId: number): number | undefined {
-  return buildingId > MACHINE_ID_OFFSET ? buildingId - MACHINE_ID_OFFSET : undefined;
+  return buildingId > MACHINE_ID_OFFSET && buildingId < COATER_ID_OFFSET ? buildingId - MACHINE_ID_OFFSET : undefined;
 }
 
 const YAWS: readonly Yaw[] = [0, 90, 180, 270];

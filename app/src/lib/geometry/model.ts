@@ -63,7 +63,7 @@ export type Endpoint =
 export interface BeltPath {
   id: number;
   tierItemId: 2001 | 2002 | 2003;
-  /** The carried item (0 = proliferator/mixed, not used in v1). */
+  /** The carried item. 0: not known (a belt of an imported blueprint that no station port or sorter filter names). */
   itemId: number;
   /** In flow order; consecutive nodes are adjacent. */
   nodes: GridPoint[];
@@ -84,10 +84,26 @@ export interface Sorter {
   plannedRate: number;
 }
 
+/**
+ * A spray coater (2313) standing on node `node` of belt `beltId`, which carries the items it sprays, turned `yaw` along
+ * the belt there (with the flow or against it). It stands where that node is (`coaterBuilding` in coater.ts) and takes
+ * proliferator from a belt that passes its top passage, one node behind it and one level up (`coaterTopPoint`): upstream
+ * for a coater turned with the flow, downstream for one turned against it. Nothing links the coater to either belt, as
+ * in a game export (BF §3.3): `Layout.coaters` is the only place it is recorded.
+ */
+export interface SprayCoater {
+  id: number;
+  beltId: number;
+  node: number;
+  yaw: Yaw;
+}
+
 export interface Layout {
   buildings: PlacedBuilding[];
   belts: BeltPath[];
   sorters: Sorter[];
+  /** The spray coaters. Optional, so layouts made before the proliferator network (and ones that need none) stay valid. */
+  coaters?: SprayCoater[];
   meta: {
     geometrySource: 'extracted' | 'approximate';
     gameVersion: string;

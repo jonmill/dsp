@@ -1468,6 +1468,254 @@ describe('16 STATION_SLOTS', () => {
 
 // ---------------------------------------------------------------------------------------------
 
+describe('17 COATER_PLACEMENT and COATER_UNFED (Task 28)', () => {
+  /**
+   * An item belt flowing south along x = 3 (y 19 down to 11, nodes 0..8), a spray coater on node 4 (3, 15), and the
+   * proliferator belt of the capsule sample's pattern: one level up, crossing the item belt at the node upstream of the
+   * coater, (3, 16), at a right angle. A tower covers it.
+   */
+  function rig(opts: { tower?: boolean } = {}) {
+    const kit = new LayoutKit();
+    const item = kit.belt(3, 1101, line([3, 19], [3, 11]));
+    const coater = kit.coater(item, 4);
+    const prolif = kit.belt(2, 1143, line([6, 16], [0, 16], 1));
+    if (opts.tower !== false) kit.tesla(6, 13);
+    return { kit, item, coater, prolif };
+  }
+  const coaterCodes = (v: Violation[]) => v.filter((x) => x.code === 'COATER_PLACEMENT' || x.code === 'COATER_UNFED');
+
+  test('pass: a coater on a straight ground run with the proliferator belt over its top passage', () => {
+    const { kit } = rig();
+    expect(check(kit)).toEqual([]);
+  });
+
+  test('pass: every direction of flow', () => {
+    for (const [from, to, top] of [
+      [[3, 3], [11, 3], [1, 1]],
+      [[11, 3], [3, 3], [-1, 1]],
+      [[3, 3], [3, 11], [0, 1]],
+    ] as const) {
+      const kit = new LayoutKit();
+      const item = kit.belt(3, 1101, line(from, to));
+      const c = kit.coater(item, 4);
+      const here = item.nodes[4];
+      const dir: [number, number] = to[0] !== from[0] ? [Math.sign(to[0] - from[0]), 0] : [0, Math.sign(to[1] - from[1])];
+      const topNode = item.nodes[3];
+      // a proliferator belt across the item belt, at the node upstream of the coater
+      const across: [number, number] = dir[0] !== 0 ? [0, 1] : [1, 0];
+      kit.belt(2, 1143, line([topNode.x - 3 * across[0], topNode.y - 3 * across[1]], [topNode.x + 3 * across[0], topNode.y + 3 * across[1]], 1));
+      kit.tesla(here.x + 4 * across[0], here.y + 4 * across[1]);
+      expect(c.yaw).toBe(dir[0] > 0 ? 90 : dir[0] < 0 ? 270 : 0);
+      expect(check(kit), `flow ${dir} ${top}`).toEqual([]);
+    }
+  });
+
+  describe('COATER_PLACEMENT', () => {
+    test('fail: a coater at a corner of its belt, naming the coater', () => {
+      const kit = new LayoutKit();
+      const item = kit.belt(3, 1101, [...line([3, 19], [3, 15]), ...line([4, 15], [8, 15])]);
+      const c = kit.coater(item, 4);
+      kit.tesla(6, 13);
+      const v = only(check(kit), 'COATER_PLACEMENT');
+      expect(v).toHaveLength(1);
+      expect(v[0].entities).toEqual([{ kind: 'building', id: c.id }, { kind: 'belt', id: item.id, node: 4 }]);
+      expect(v[0].message).toContain(`coater ${c.id}`);
+      expect(v[0].message).toMatch(/not a straight run/);
+    });
+
+    test('fail: on the first or the last node of a belt', () => {
+      const kit = new LayoutKit();
+      const item = kit.belt(3, 1101, line([3, 19], [3, 11]));
+      const first = kit.coater(item, 0);
+      const last = kit.coater(item, 8);
+      kit.tesla(6, 13);
+      const v = only(check(kit), 'COATER_PLACEMENT');
+      expect(v.map((x) => x.entities[0])).toEqual([
+        { kind: 'building', id: first.id },
+        { kind: 'building', id: last.id },
+      ]);
+      expect(v[0].message).toMatch(/first node/);
+      expect(v[1].message).toMatch(/last node/);
+    });
+
+    test('fail: on an elevated stretch', () => {
+      const kit = new LayoutKit();
+      const item = kit.belt(3, 1101, [...line([3, 19], [3, 15]), ...line([3, 14], [3, 8], 1)]);
+      kit.coater(item, 7);
+      kit.tesla(6, 13);
+      expect(only(check(kit), 'COATER_PLACEMENT')[0].message).toMatch(/not all on the ground/);
+    });
+
+    test('fail: turned across its belt', () => {
+      for (const yaw of [90, 270] as const) {
+        const { kit, item } = rig();
+        kit.coaters[0].yaw = yaw;
+        const v = only(check(kit), 'COATER_PLACEMENT');
+        expect(v, `yaw ${yaw}`).toHaveLength(1);
+        expect(v[0].message).toMatch(new RegExp(`runs along 180 degrees.*turned ${yaw}`));
+        expect(v[0].entities[1]).toEqual({ kind: 'belt', id: item.id, node: 4 });
+      }
+    });
+
+    test('pass: turned against the flow, the way every coater of the capsule sample on a north-flowing belt is', () => {
+      const { kit } = rig();
+      kit.coaters[0].yaw = 0;
+      expect(only(check(kit), 'COATER_PLACEMENT')).toEqual([]);
+    });
+
+    test('fail: on a belt or node that is not in the layout', () => {
+      const { kit } = rig();
+      kit.coaters.push({ id: 5100, beltId: 99, node: 2, yaw: 180 }, { id: 5101, beltId: 1, node: 40, yaw: 180 });
+      const v = only(check(kit), 'COATER_PLACEMENT');
+      expect(v.map((x) => x.entities)).toEqual([[{ kind: 'building', id: 5100 }], [{ kind: 'building', id: 5101 }]]);
+      expect(v[0].message).toMatch(/belt 99, which is not in the layout/);
+      expect(v[1].message).toMatch(/no node 40/);
+    });
+
+    test('mirrors BuildTool_Click.CheckBuildConditions', () => {
+      const { kit } = rig();
+      kit.coaters[0].yaw = 90;
+      expect(only(check(kit), 'COATER_PLACEMENT')[0].mirrors).toBe('BuildTool_Click.CheckBuildConditions');
+    });
+  });
+
+  describe('COATER_UNFED', () => {
+    test('fail: no proliferator belt at all', () => {
+      const { kit, coater } = rig();
+      kit.belts.pop();
+      const v = only(check(kit), 'COATER_UNFED');
+      expect(v).toHaveLength(1);
+      expect(v[0].entities).toEqual([{ kind: 'building', id: coater.id }]);
+      expect(v[0].message).toContain(`coater ${coater.id}`);
+      expect(v[0].message).toMatch(/no proliferator belt/);
+      expect(codesOf(check(kit))).toEqual(['COATER_UNFED']);
+    });
+
+    test('fail: the proliferator belt is one node downstream, at the wrong height, or on the wrong side', () => {
+      for (const [name, nodes] of [
+        ['downstream', line([6, 14], [0, 14], 1)],
+        ['on the ground', line([6, 16], [0, 16], 0)],
+        ['two levels up', line([6, 16], [0, 16], 2)],
+        ['two nodes upstream', line([6, 17], [0, 17], 1)],
+      ] as const) {
+        const { kit, prolif } = rig();
+        prolif.nodes = nodes.map((p) => ({ ...p }));
+        expect(only(check(kit), 'COATER_UNFED'), name).toHaveLength(1);
+      }
+    });
+
+    test('a coater turned against the flow has its top passage downstream, as in the capsule sample', () => {
+      // belt flows south; turned 0 the coater's back is south: the node below it, (3, 14)
+      const { kit, prolif, coater } = rig();
+      coater.yaw = 0;
+      expect(only(check(kit), 'COATER_UNFED')).toHaveLength(1); // the belt is still upstream
+      prolif.nodes = line([6, 14], [0, 14], 1);
+      expect(coaterCodes(check(kit))).toEqual([]);
+      expect(check(kit)).toEqual([]);
+    });
+
+    test('fail: a belt of iron ingots over the top passage is no proliferator belt', () => {
+      const { kit, prolif } = rig();
+      prolif.itemId = 1101;
+      expect(only(check(kit), 'COATER_UNFED')).toHaveLength(1);
+    });
+
+    test('pass: Mk.I, Mk.II and Mk.III belts, and a belt of unknown item (an imported blueprint)', () => {
+      for (const itemId of [1141, 1142, 1143, 0]) {
+        const { kit, prolif } = rig();
+        prolif.itemId = itemId;
+        expect(coaterCodes(check(kit)), `item ${itemId}`).toEqual([]);
+      }
+    });
+
+    test('a coater with no node under it is not also reported unfed', () => {
+      const { kit } = rig();
+      kit.coaters[0].node = 40;
+      expect(codesOf(check(kit))).toEqual(['COATER_PLACEMENT']);
+    });
+  });
+
+  describe('the coater as a building', () => {
+    test('BELT_IN_BUILDING: another belt through the coater body, but not the top passage and not its own belt', () => {
+      const { kit, coater, prolif } = rig();
+      // the proliferator belt, run one node further along the coater instead of across it: (3, 15, 1) is inside the body
+      prolif.nodes = [...line([6, 16], [3, 16], 1), { x: 3, y: 15, z: 1 }, { x: 3, y: 14, z: 1 }];
+      const v = only(check(kit), 'BELT_IN_BUILDING');
+      expect(v.map((x) => x.entities[0])).toEqual([
+        { kind: 'belt', id: prolif.id, node: 4 },
+        { kind: 'belt', id: prolif.id, node: 5 },
+      ]);
+      expect(v[0].entities[1]).toEqual({ kind: 'building', id: coater.id });
+      expect(v[0].message).toMatch(/inside building 5000 \(Spray Coater\)/);
+    });
+
+    test('a belt over the coater at two levels up clears its roof', () => {
+      const { kit, prolif } = rig();
+      kit.belt(3, 1001, line([1, 15], [5, 15], 2));
+      expect(only(check(kit), 'BELT_IN_BUILDING')).toEqual([]);
+      expect(prolif.nodes[0].z).toBe(1);
+    });
+
+    test('BUILDING_OVERLAP: an assembler on the coater, and a second coater a node away on the same belt', () => {
+      const a = rig();
+      const asm = a.kit.assembler(3, 15);
+      const v = only(check(a.kit), 'BUILDING_OVERLAP');
+      expect(v.some((x) => x.entities.some((e) => e.id === a.coater.id) && x.entities.some((e) => e.id === asm.id))).toBe(true);
+
+      const b = rig();
+      const second = b.kit.coater(b.item, 6);
+      const w = only(check(b.kit), 'BUILDING_OVERLAP');
+      expect(w.map((x) => x.entities)).toEqual([[{ kind: 'building', id: b.coater.id }, { kind: 'building', id: second.id }]]);
+    });
+
+    test('pass: coaters on neighbouring belts, a tile apart', () => {
+      const { kit } = rig();
+      const next = kit.belt(3, 1102, line([4, 19], [4, 11]));
+      kit.coater(next, 4);
+      expect(only(check(kit), 'BUILDING_OVERLAP')).toEqual([]);
+      expect(only(check(kit), 'BELT_IN_BUILDING')).toEqual([]);
+    });
+
+    test('POWER_UNCOVERED: a coater is a consumer at the position of its belt node', () => {
+      const covered = rig();
+      expect(only(check(covered.kit), 'POWER_UNCOVERED')).toEqual([]);
+      const bare = rig({ tower: false });
+      const v = only(check(bare.kit), 'POWER_UNCOVERED');
+      expect(v).toHaveLength(1);
+      expect(v[0].entities).toEqual([{ kind: 'building', id: bare.coater.id }]);
+      expect(v[0].message).toContain('Spray Coater');
+      // a tower a cover radius and a bit away leaves it uncovered
+      const far = rig({ tower: false });
+      far.kit.tesla(3 + 10.5 / TILE + 0.1, 15);
+      expect(only(check(far.kit), 'POWER_UNCOVERED')).toHaveLength(1);
+    });
+  });
+
+  test('a coater id that a building has too is a malformed layout, not a violation', () => {
+    const { kit, coater } = rig();
+    kit.building(2201, 20, 20).id = coater.id;
+    expect(() => check(kit)).toThrow(/duplicate building id 5000/);
+  });
+
+  test('coaters in a data set without a spray coater: a loud error', () => {
+    const { kit } = rig();
+    const copy = structuredClone(fixtureData.data);
+    copy.buildings = copy.buildings.filter((b) => b.kind !== 'sprayCoater');
+    const data = new (fixtureData.constructor as new (d: typeof copy) => typeof fixtureData)(copy);
+    expect(() => checkGeometry(kit.layout(), data, fixtureEffects)).toThrow(/spray coater/);
+  });
+
+  test('the codes come out after the other rules, placement before unfed', () => {
+    const { kit } = rig({ tower: false });
+    kit.belts.pop();
+    kit.coaters[0].yaw = 90;
+    const codes = codesOf(check(kit));
+    expect(codes).toEqual(['POWER_UNCOVERED', 'COATER_PLACEMENT', 'COATER_UNFED']);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+
 describe('output', () => {
   test('violations come out grouped by rule in the order of the rule list', () => {
     const kit = new LayoutKit();

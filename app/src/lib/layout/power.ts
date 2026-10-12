@@ -1,9 +1,10 @@
 // Power poles: where the nodes that power a layout stand (Task 23).
 //
 // What has to be powered. Every consumer building (anything GameData lists as a power consumer that is not itself a
-// node) at its position, and every sorter at the midpoint of its two ends: the validator's POWER_UNCOVERED rule, which
-// is judged with the node's power point, the 2D distance in metres and the node's cover radius. `consumerPoints`
-// carries the sorter midpoints (and, later, the spray coaters); `powerTargets` finds them for a layout.
+// node) at its position, every sorter at the midpoint of its two ends, and every spray coater at the belt node it stands
+// on: the validator's POWER_UNCOVERED rule, which is judged with the node's power point, the 2D distance in metres and
+// the node's cover radius. `consumerPoints` carries the sorter midpoints and the coaters (which are not in
+// `Layout.buildings`); `powerTargets` finds them for a layout.
 //
 // Which node. Of the Tesla Tower (2201), the Wireless Power Tower (2202) and the Satellite Substation (2212) that are
 // unlocked, the one with the best `coverRadius² / footprint`. That is the Tesla Tower in the fixture; the others only
@@ -26,7 +27,7 @@
 // the nearest free lattice point when the exact spot is taken). The link phase also runs when the nodes that stand
 // already cover every consumer: covered is not connected.
 import type { GameDataIndex, TechEffects } from '../data';
-import { BELT_HALF_WIDTH_TILES, buildingDef, LayoutIndex, LEVEL, prefabToGrid, sorterEnds, TILE } from '../geometry';
+import { BELT_HALF_WIDTH_TILES, buildingDef, coaterBuildings, LayoutIndex, LEVEL, prefabToGrid, sorterEnds, TILE } from '../geometry';
 import type { Layout, PlacedBuilding } from '../geometry';
 import { MinHeap } from './heap';
 import type { Occupancy } from './occupancy';
@@ -386,26 +387,20 @@ class Placer {
 }
 
 /**
- * What `placePowerNodes` needs to know about a layout that has no nodes yet: the midpoint of each sorter's ends (the
- * sorters are power consumers) and the lattice cells a node's body must keep off. These are every belt node (at any
- * height), and for each sorter its two ends rounded to the lattice and the lattice points strictly between its ends
- * along the longer plan axis, as the validator's SORTER_IN_BUILDING walks them. Throws as `sorterEnds` does for a
- * sorter whose ends cannot be placed.
+ * The lattice cells the sorters of `layout` take, as "x,y" keys, and the midpoint of each sorter's ends (the sorters are
+ * power consumers): the two ends of each sorter rounded to the lattice, and the lattice points strictly between its ends
+ * along the longer plan axis, as the validator's SORTER_IN_BUILDING walks them. Throws as `sorterEnds` does for a sorter
+ * whose ends cannot be placed.
  */
-export function powerTargets(
-  layout: Layout,
-  data: GameDataIndex,
-): { consumerPoints: { x: number; y: number }[]; blockedPoints: Set<string> } {
-  const consumerPoints: { x: number; y: number }[] = [];
-  const blockedPoints = new Set<string>();
-  for (const belt of layout.belts) for (const p of belt.nodes) blockedPoints.add(cell(Math.round(p.x), Math.round(p.y)));
-
+export function sorterGeometry(layout: Layout, data: GameDataIndex): { midpoints: { x: number; y: number }[]; cells: Set<string> } {
+  const midpoints: { x: number; y: number }[] = [];
+  const cells = new Set<string>();
   const index = new LayoutIndex(layout);
   for (const s of layout.sorters) {
     const { pick, drop } = sorterEnds(s, layout, data, index);
-    consumerPoints.push({ x: (pick.x + drop.x) / 2, y: (pick.y + drop.y) / 2 });
-    blockedPoints.add(cell(Math.round(pick.x), Math.round(pick.y)));
-    blockedPoints.add(cell(Math.round(drop.x), Math.round(drop.y)));
+    midpoints.push({ x: (pick.x + drop.x) / 2, y: (pick.y + drop.y) / 2 });
+    cells.add(cell(Math.round(pick.x), Math.round(pick.y)));
+    cells.add(cell(Math.round(drop.x), Math.round(drop.y)));
 
     const dx = drop.x - pick.x;
     const dy = drop.y - pick.y;
@@ -418,8 +413,29 @@ export function powerTargets(
     for (let v = Math.floor(lo + TOL) + 1; v < hi - TOL; v++) {
       const t = (v - a0) / (a1 - a0);
       const lateral = Math.round(alongX ? pick.y + t * dy : pick.x + t * dx);
-      blockedPoints.add(alongX ? cell(v, lateral) : cell(lateral, v));
+      cells.add(alongX ? cell(v, lateral) : cell(lateral, v));
     }
   }
+  return { midpoints, cells };
+}
+
+/**
+ * What `placePowerNodes` needs to know about a layout that has no nodes yet: the midpoint of each sorter's ends (the
+ * sorters are power consumers) and of each spray coater (a consumer at the node it stands on), and the lattice cells a
+ * node's body must keep off. These are every belt node (at any height), and for each sorter its two ends rounded to the
+ * lattice and the lattice points strictly between its ends along the longer plan axis, as the validator's SORTER_IN_BUILDING
+ * walks them (`sorterGeometry`). Throws as `sorterEnds` does for a sorter whose ends cannot be placed.
+ */
+export function powerTargets(
+  layout: Layout,
+  data: GameDataIndex,
+): { consumerPoints: { x: number; y: number }[]; blockedPoints: Set<string> } {
+  const blockedPoints = new Set<string>();
+  for (const belt of layout.belts) for (const p of belt.nodes) blockedPoints.add(cell(Math.round(p.x), Math.round(p.y)));
+
+  const { midpoints, cells } = sorterGeometry(layout, data);
+  for (const c of cells) blockedPoints.add(c);
+  const consumerPoints = midpoints;
+  for (const c of coaterBuildings(layout, data)) consumerPoints.push({ x: c.x, y: c.y });
   return { consumerPoints, blockedPoints };
 }

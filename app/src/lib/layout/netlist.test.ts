@@ -192,6 +192,15 @@ function expectSound(nl: Netlist, plan: ProductionPlan, effects: TechEffects, ma
   const ids = nl.nets.map((n) => n.id);
   expect(new Set(ids).size).toBe(ids.length);
   for (const net of nl.nets) {
+    if (net.proliferator) {
+      // the proliferator net has no machines to tap: it starts at a station and dead-ends at the last coater
+      expect(net.taps).toEqual([]);
+      expect(net.source.kind).toBe('station');
+      expect(net.sink).toEqual({ kind: 'deadEnd' });
+      expect(net.tierItemId).toBe(nl.beltTierItemId);
+      expect(net.rate).toBeCloseTo(plan.proliferatorPerSecond, 9);
+      continue;
+    }
     const stationSourced = net.source.kind === 'station';
     // capacity, tap count, balance
     expect(net.tierItemId).toBe(nl.beltTierItemId);
@@ -234,7 +243,7 @@ function expectSound(nl: Netlist, plan: ProductionPlan, effects: TechEffects, ma
     expect(nl.warnings.some((w) => w.startsWith(`machine ${machineId} (`))).toBe(true);
   }
   // an item the station supplies is not also tapped off a belt that producers feed
-  const supplied = new Set(nl.nets.filter((n) => n.source.kind === 'station').map((n) => n.itemId));
+  const supplied = new Set(nl.nets.filter((n) => n.source.kind === 'station' && !n.proliferator).map((n) => n.itemId));
   for (const net of nl.nets) {
     if (!supplied.has(net.itemId) || net.source.kind !== 'taps') continue;
     expect(net.taps.every((t) => t.dir === 'out'), `net ${net.id} of item ${net.itemId}`).toBe(true);
@@ -912,3 +921,138 @@ describe('buildNetlist: stations', () => {
     ).toThrow(/Iron Ore.*import/);
   });
 });
+
+describe('buildNetlist: the proliferator net (Task 28)', () => {
+  const MK3 = 1143;
+  const proliferated = (tier: 1 | 2 | 3 = 3, mode: 'extra' | 'speed' = 'extra') =>
+    processorRequest({ proliferator: { tier, mode } });
+
+  it('without a proliferator there is no such net and no net is sprayed: the netlist is as it was', async () => {
+    const plan = await planOf(processorRequest());
+    expect(plan.proliferatorPerSecond).toBe(0);
+    const nl = buildNetlist(plan, data, allEffects);
+    for (const net of nl.nets) {
+      expect('proliferator' in net).toBe(false);
+      expect('sprayed' in net).toBe(false);
+    }
+  });
+
+  it('adds one net last, from the station that holds the proliferator slot, with no taps and a dead end', async () => {
+    const plan = await planOf(proliferated());
+    expect(plan.proliferatorPerSecond).toBeGreaterThan(0);
+    const nl = buildNetlist(plan, data, allEffects);
+    const feeds = nl.nets.filter((n) => n.proliferator);
+    expect(feeds).toHaveLength(1);
+    const [feed] = feeds;
+    expect(nl.nets[nl.nets.length - 1]).toBe(feed);
+    expect(feed.id).toBe(nl.nets.length);
+    expect(feed).toMatchObject({ itemId: MK3, tierItemId: nl.beltTierItemId, taps: [], sink: { kind: 'deadEnd' } });
+    expect(feed.rate).toBeCloseTo(plan.proliferatorPerSecond, 9);
+    if (feed.source.kind !== 'station') throw new Error('not station-sourced');
+    // the station that holds the slot is the one the net starts at, and counts the port
+    const station = nl.stations[feed.source.stationIdx];
+    expect(station.slots.map((x) => x.itemId)).toContain(MK3);
+    expectSound(nl, plan, allEffects);
+  });
+
+  it('numbers the item nets from 1 as before, and puts the proliferator net after them', async () => {
+    const plan = await planOf(proliferated());
+    const nl = buildNetlist(plan, data, allEffects);
+    const items = nl.nets.filter((n) => !n.proliferator);
+    expect(items.map((n) => n.id)).toEqual(items.map((_, i) => i + 1));
+    expect(nl.nets.findIndex((n) => n.proliferator)).toBe(items.length);
+  });
+
+  it('marks the nets whose consumers are proliferated: every net with a consuming tap, no net that only exports', async () => {
+    const plan = await planOf(proliferated());
+    expect(plan.stages.every((s) => s.proliferated)).toBe(true);
+    const nl = buildNetlist(plan, data, allEffects);
+    for (const net of nl.nets.filter((n) => !n.proliferator)) {
+      const consumes = net.taps.some((t) => t.dir === 'in');
+      expect(net.sprayed === true, `net ${net.id} (item ${net.itemId})`).toBe(consumes);
+    }
+    expect(nl.nets.filter((n) => n.sprayed).length).toBeGreaterThanOrEqual(4);
+    // the net that carries the processors out is not sprayed
+    expect(netsOf(nl, PROCESSOR).every((n) => !n.sprayed)).toBe(true);
+    expect(nl.nets.find((n) => n.proliferator)?.sprayed).toBeUndefined();
+  });
+
+  it('a stage that is not proliferated does not make its input nets sprayed', async () => {
+    const plan = await planOf(proliferated());
+    plan.stages[0].proliferated = false; // the Processor stage
+    const nl = buildNetlist(plan, data, allEffects);
+    const bySprayed = (item: number) => netsOf(nl, item).map((n) => n.sprayed === true);
+    // circuit boards and microcrystalline are eaten by the processor stage only (and by nobody else)
+    expect(bySprayed(CIRCUIT_BOARD)).toEqual([false]);
+  });
+
+  it('every tier feeds its own item: Mk.I, Mk.II, Mk.III', async () => {
+    for (const tier of [1, 2, 3] as const) {
+      const plan = await planOf(proliferated(tier));
+      const nl = buildNetlist(plan, data, allEffects);
+      expect(nl.nets.find((n) => n.proliferator)?.itemId).toBe(1140 + tier);
+      expectSound(nl, plan, allEffects);
+    }
+  });
+
+  it('speed mode needs the net just the same', async () => {
+    const plan = await planOf(proliferated(2, 'speed'));
+    const nl = buildNetlist(plan, data, allEffects);
+    expect(nl.nets.filter((n) => n.proliferator)).toHaveLength(1);
+    expectSound(nl, plan, allEffects);
+  });
+
+  it('reserves a port: a station with 12 item nets and the proliferator slot gets a new station for the net', () => {
+    // 11 import nets of the spray's station's other slots would fit; make them 12 so the 13th (the feed) cannot
+    const X = 1202;
+    const plan = synthPlan({
+      stages: [{ machines: 24, inputs: [{ itemId: X, perSecond: 24 }], outputs: [{ itemId: GEAR, perSecond: 24 }] }],
+      flows: [
+        { itemId: X, from: 'import', to: 0, perSecond: 24 },
+        { itemId: GEAR, from: 0, to: 'export', perSecond: 24 },
+      ],
+      imports: [{ itemId: X, perSecond: 24 }, { itemId: MK3, perSecond: 0.1 }],
+      exports: [{ itemId: GEAR, perSecond: 24 }],
+      slots: [
+        { itemId: X, role: 'import' },
+        { itemId: MK3, role: 'proliferator' },
+        { itemId: GEAR, role: 'export' },
+      ],
+    });
+    plan.proliferatorPerSecond = 0.1;
+    plan.request.proliferator = { tier: 3, mode: 'extra' };
+    plan.stages[0].proliferated = true;
+    // maxMachinesPerNet 2: 12 nets for X and 12 for gears
+    const nl = buildNetlist(plan, data, allEffects, { maxMachinesPerNet: 2 });
+    const feed = nl.nets.find((n) => n.proliferator);
+    expect(feed).toBeDefined();
+    // the gear sinks fill one station's 12 ports, the 12 nets of X the next one's: the feed needs a third
+    expect(netsOf(nl, GEAR)).toHaveLength(12);
+    expect(netsOf(nl, X)).toHaveLength(12);
+    expect(nl.stations).toHaveLength(3);
+    expect(nl.stations.map((s) => s.portsNeeded)).toEqual([12, 12, 1]);
+    expect(nl.stations[2].slots.map((s) => s.itemId)).toEqual([MK3]);
+    for (const st of nl.stations) expect(st.portsNeeded).toBeLessThanOrEqual(12);
+    const portsByStation = nl.stations.map(() => 0);
+    for (const net of stationNets(nl)) {
+      const end = net.source.kind === 'station' ? net.source : net.sink;
+      if (end.kind === 'station') portsByStation[end.stationIdx]++;
+    }
+    expect(nl.stations.map((s) => s.portsNeeded)).toEqual(portsByStation);
+    if (feed?.source.kind === 'station') expect(nl.stations[feed.source.stationIdx].slots.map((s) => s.itemId)).toContain(MK3);
+  });
+
+  it('a plan that makes the proliferator it sprays with (it is the target) still gets its net', async () => {
+    const plan = await planOf(
+      request({
+        targetItemId: MK3,
+        suppliedItemIds: new Set(ORES.concat([1006, 1114, 1112, 1115, 1301, 1111])),
+        proliferator: { tier: 3, mode: 'speed' },
+      }),
+    ).catch(() => null);
+    if (!plan) return; // the fixture may not be able to make it: the unit above covers the netlist rules
+    const nl = buildNetlist(plan, data, allEffects);
+    expect(nl.nets.filter((n) => n.proliferator).length).toBe(plan.proliferatorPerSecond > 0 ? 1 : 0);
+  });
+});
+

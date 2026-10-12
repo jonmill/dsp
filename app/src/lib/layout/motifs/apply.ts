@@ -41,8 +41,8 @@ export function applyMotifs(base: Netlist, instances: readonly MotifInstance[], 
     groups.push({ kind: instance.kind, members: instance.relative.map((r) => ({ ...r })) });
   }
 
-  // drop the nets that have no taps left, number the rest from 1
-  const kept = nets.filter((n) => n.taps.length > 0).map((n, i) => ({ ...n, id: i + 1 }));
+  // drop the nets that have no taps left (the proliferator net never has any: it stays), number the rest from 1
+  const kept = nets.filter((n) => n.taps.length > 0 || n.proliferator).map((n, i) => ({ ...n, id: i + 1 }));
   return { ...base, nets: kept, warnings: [...base.warnings], motifs: { groups, sorters } };
 }
 

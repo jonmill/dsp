@@ -355,3 +355,58 @@ describe('describeEntity', () => {
     expect(describeEntity(layout, data, { kind: 'sorter', id: 4242 })).toContain('4242');
   });
 });
+
+describe('spray coaters (Task 28)', () => {
+  /** A belt flowing east along y = 10, a coater on its node 5 and the proliferator belt across it one level up. */
+  function sprayed(): { layout: Layout; coaterId: number } {
+    const kit = new LayoutKit();
+    const belt = kit.belt(3, 1101, line([0, 10], [12, 10]));
+    const coater = kit.coater(belt, 5);
+    kit.belt(2, 1143, line([4, 7], [4, 13], 1));
+    return { layout: kit.layout(), coaterId: coater.id };
+  }
+
+  it('draws the coater as a building: one rect', () => {
+    const { layout } = sprayed();
+    const { ctx, count } = fakeContext();
+    renderLayout(ctx, layout, data, ALL);
+    expect(count('rect')).toBe(1);
+    // and only on the levels its body spans: ground and level 1 (it is 1.9 levels high), not level 2
+    const levels = [0, 1, 2].map((level) => {
+      const c = fakeContext();
+      renderLayout(c.ctx, layout, data, { level, scale: 10 });
+      return c.count('rect');
+    });
+    expect(levels).toEqual([1, 1, 0]);
+  });
+
+  it('a layout without coaters draws as before', () => {
+    const kit = new LayoutKit();
+    kit.belt(3, 1101, line([0, 10], [12, 10]));
+    const { ctx, count } = fakeContext();
+    renderLayout(ctx, kit.layout(), data, ALL);
+    expect(count('rect')).toBe(0);
+  });
+
+  it('highlights a violation that names the coater', () => {
+    const { layout, coaterId } = sprayed();
+    const { ctx, calls } = fakeContext();
+    const violation: Violation = { code: 'COATER_UNFED', entities: [{ kind: 'building', id: coaterId }], message: 'x' };
+    renderLayout(ctx, layout, data, { ...ALL, highlight: [violation] });
+    expect(calls.some((c) => c.name === 'rect' && c.strokeStyle === VIOLATION_COLOR)).toBe(true);
+  });
+
+  it('describes the coater and finds its centre', () => {
+    const { layout, coaterId } = sprayed();
+    expect(describeEntity(layout, data, { kind: 'building', id: coaterId })).toContain(`Spray Coater #${coaterId}`);
+    expect(entityCentre(layout, data, { kind: 'building', id: coaterId })).toEqual({ x: 5, y: 10 });
+  });
+
+  it('the bounds and the hit test take it in; the belt under it is still hit first', () => {
+    const { layout, coaterId } = sprayed();
+    expect(layoutBounds(layout, data)).not.toBeNull();
+    // on the axis the belt is hit; a little off it (0.27 tiles, past a belt's 0.25) the coater's body is
+    expect(hitTest(layout, data, 5, 10)).toMatchObject({ kind: 'belt' });
+    expect(hitTest(layout, data, 5, 10.27)).toEqual({ kind: 'building', id: coaterId });
+  });
+});

@@ -172,7 +172,10 @@
 
   const tip = $derived(hover && layout ? describeEntity(layout, app.index, hover.entity) : '');
   const counts = $derived(
-    layout ? `${layout.buildings.length} buildings, ${layout.belts.length} belts, ${layout.sorters.length} sorters` : '',
+    layout
+      ? `${layout.buildings.length} buildings, ${layout.belts.length} belts, ${layout.sorters.length} sorters` +
+        (layout.coaters?.length ? `, ${layout.coaters.length} spray coaters` : '')
+      : '',
   );
 </script>
 

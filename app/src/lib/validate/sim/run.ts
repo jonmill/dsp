@@ -11,6 +11,7 @@
 // stations), and `steadyW` leaves it out.
 import type { ProductionPlan, ItemRate } from '../../calc';
 import type { Building, GameDataIndex, Recipe, TechEffects } from '../../data';
+import { coaterBuilding, coaterProliferators, findCoaterTop, sprayCoaterDef } from '../../geometry';
 import type { Endpoint, Layout, PlacedBuilding, Sorter } from '../../geometry';
 import { CoaterSim, coaterConfig } from './coater';
 import { LabStack } from './labstack';
@@ -108,6 +109,15 @@ export interface SimResult {
     /** The sum of the stations' `chargePerTick`, drawn in full while the stations are empty. */
     stationChargeW: number;
   };
+  /** What the spray coaters did in the measurement window: zeros for a layout without any. */
+  coaters: {
+    /** Coaters in the layout that have a proliferator belt over their top passage and so can spray. */
+    count: number;
+    /** Items sprayed in the window (the stacks of the cargo summed). */
+    sprayedItems: number;
+    /** Proliferator items per second the coaters took from the proliferator belts. */
+    proliferatorPerSecond: number;
+  };
   /** The length of the measurement window, in seconds. */
   measureSeconds: number;
   /** The ticks run before the window: `SimOptions.warmupTicks` as given, else what the adaptive warm-up needed. */
@@ -131,18 +141,6 @@ const DEFAULT_MEASURE_TICKS = 18000;
 /** Consecutive measured ticks without progress that make a deadlock. */
 export const DEADLOCK_TICKS = 600;
 const STAGE_ROLE = /^stage:(\d+)$/;
-/** A proliferator belt passes a coater's top passage one level above the item belt (Task 28's layout pattern). */
-const COATER_TOP_LEVELS = 1;
-/** How far, in tiles, a proliferator belt node may be from the coater's belt node and still be its top passage. */
-const COATER_TOP_REACH_TILES = 1.5;
-
-/** What `Layout.coaters` holds once Task 28 adds it. Read through an optional field so older layouts stay valid. */
-interface CoaterPlacement {
-  id: number;
-  beltId: number;
-  node: number;
-}
-
 const itemName = (data: GameDataIndex, itemId: number): string => {
   try {
     return data.item(itemId).name;
@@ -205,7 +203,7 @@ export function runSimulation(
   const machines = addMachines(world, layout, plan, data, meter, progress, warnings);
   addLabStacks(world, layout, machines.byBuilding, warnings);
   addSorters(world, layout, data, effects, buildingById, machines.byBuilding, meter, progress, warnings);
-  addCoaters(world, layout, data, meter, warnings);
+  const coaters = addCoaters(world, layout, data, meter, warnings);
 
   const stationItems = layout.buildings.flatMap((b) =>
     b.station ? [{ station: world.station(b.id), items: b.station.slots.map((s) => s.itemId).filter((id) => id !== 0) }] : [],
@@ -287,6 +285,7 @@ export function runSimulation(
     if (!settled && opts.warmupCapTicks !== undefined && opts.warmupCapTicks < MAX_WARMUP_TICKS) throw new WarmupNotSettled(warmupTicksUsed);
   }
   for (const m of machines.list) m.machine.resetStats();
+  const coatersAtStart = coaters.map((c) => ({ sprayed: c.sprayedItems, taken: c.proliferatorTaken }));
   const receivedAtStart = new Map<number, number>();
   for (const id of [targetItem, ...exportItems]) receivedAtStart.set(id, received(id));
   measuring = true;
@@ -312,11 +311,19 @@ export function runSimulation(
   for (const b of layout.buildings) chargePerTick += b.station?.chargePerTick ?? 0;
   const stationChargeW = chargePerTick * tps;
 
+  let sprayedItems = 0;
+  let proliferatorTaken = 0;
+  coaters.forEach((c, i) => {
+    sprayedItems += c.sprayedItems - coatersAtStart[i].sprayed;
+    proliferatorTaken += c.proliferatorTaken - coatersAtStart[i].taken;
+  });
+
   return {
     measuredTargetRate: rate(targetItem),
     measuredExports: exportItems.map((itemId) => ({ itemId, perSecond: rate(itemId) })),
     machineStats,
     stageStats,
+    coaters: { count: coaters.length, sprayedItems, proliferatorPerSecond: proliferatorTaken / measureSeconds },
     deadlocked: expectsOutput && longestStreak >= DEADLOCK_TICKS,
     power: {
       steadyW: (sumTick / measureTicks) * tps,
@@ -490,42 +497,32 @@ function sorterEntity(world: World, sorter: SorterSim, proto: Building, meter: P
 }
 
 /**
- * A coater in every `layout.coaters` entry (a field Task 28 adds; absent in older layouts, which keeps this inert).
- * The proliferator belt is the one carrying a proliferator that has a node one level above the coater's belt node,
- * within `COATER_TOP_REACH_TILES` tiles; Task 28 can tighten this to the prefab's exact top-passage point.
+ * A coater in every `layout.coaters` entry (a layout without the field has none). The proliferator belt is the one that has
+ * a node at the coater's exact top passage (`findCoaterTop`: one node upstream of the coater, one level up), the same
+ * point COATER_UNFED looks for; a coater without one warns and never sprays. Returns the coaters that were wired.
  */
-function addCoaters(world: World, layout: Layout, data: GameDataIndex, meter: PowerMeter, warnings: string[]): void {
-  const placements = (layout as { coaters?: readonly CoaterPlacement[] }).coaters;
-  if (!placements || placements.length === 0) return;
-  const def = data.data.buildings.find((b) => b.kind === 'sprayCoater');
+function addCoaters(world: World, layout: Layout, data: GameDataIndex, meter: PowerMeter, warnings: string[]): CoaterSim[] {
+  const placements = layout.coaters;
+  if (!placements || placements.length === 0) return [];
+  const def = sprayCoaterDef(data);
   if (!def?.sprayCoater) {
     warnings.push('the layout has spray coaters but GameData has no spray coater building; they are ignored');
-    return;
+    return [];
   }
-  const proliferators = new Set(def.sprayCoater.incItemIds);
+  const proliferators = coaterProliferators(def);
+  const beltById = new Map(layout.belts.map((belt) => [belt.id, belt]));
+  const wired: CoaterSim[] = [];
   for (const c of placements) {
-    const itemBelt = layout.belts.find((belt) => belt.id === c.beltId);
-    const at = itemBelt?.nodes[c.node];
-    if (!itemBelt || !at) throw new Error(`coater ${c.id}: no node ${c.node} on belt ${c.beltId}`);
-    let top: { beltId: number; node: number } | null = null;
-    let topDistance = Infinity;
-    for (const belt of layout.belts) {
-      if (belt.id === itemBelt.id || !proliferators.has(belt.itemId)) continue;
-      for (let node = 0; node < belt.nodes.length; node++) {
-        const p = belt.nodes[node];
-        if (p.z - at.z !== COATER_TOP_LEVELS) continue;
-        const distance = Math.hypot(p.x - at.x, p.y - at.y);
-        if (distance <= COATER_TOP_REACH_TILES && distance < topDistance) {
-          top = { beltId: belt.id, node };
-          topDistance = distance;
-        }
-      }
-    }
+    const itemBelt = beltById.get(c.beltId);
+    const pose = coaterBuilding(c, itemBelt, def);
+    if (!itemBelt || !pose) throw new Error(`coater ${c.id}: no node ${c.node} on belt ${c.beltId}`);
+    const top = findCoaterTop(layout, pose, proliferators);
     if (top === null) {
       warnings.push(`coater ${c.id}: no proliferator belt passes above node ${c.node} of belt ${c.beltId}; it never sprays`);
       continue;
     }
-    const coater = new CoaterSim(coaterConfig(def, world.beltCell(c.beltId, c.node), world.beltCell(top.beltId, top.node), data));
+    const coater = new CoaterSim(coaterConfig(def, world.beltCell(c.beltId, c.node), world.beltCell(top.belt.id, top.node), data));
+    wired.push(coater);
     const work = def.power.workPerTick;
     const idle = def.power.idlePerTick;
     world.addEntity(
@@ -539,6 +536,7 @@ function addCoaters(world: World, layout: Layout, data: GameDataIndex, meter: Po
       'coaters',
     );
   }
+  return wired;
 }
 
 /**

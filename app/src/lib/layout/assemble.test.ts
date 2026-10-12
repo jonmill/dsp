@@ -307,3 +307,89 @@ describe('assembleLayout with motifs', () => {
     expect(layout.buildings.find((b) => b.id === machineId)).toMatchObject({ z: 3, stackParentId: stationBuildingId(0) });
   });
 });
+
+describe('assembleLayout: the proliferator network (Task 28)', () => {
+  const sprayed = (tier: 1 | 2 | 3 = 3, mode: 'extra' | 'speed' = 'extra') => processorPlan(1, { tier, mode });
+
+  /** Netlist, placement, taps and the routes of the item nets (every net but the feed) of the sprayed Processor plan. */
+  async function itemNets(mode: 'extra' | 'speed' = 'extra') {
+    const plan = await sprayed(3, mode);
+    const net = buildNetlist(plan, data, effects);
+    const placement = constructivePlacement(net, data, 3);
+    const occ = occupancyOf(placement.buildings);
+    const taps = assignTaps(net, placement, occ, data, effects);
+    if ('failed' in taps) throw new Error(taps.failed);
+    const res = routeNets(net, taps, occ, defaultRouteParams(occ), () => false);
+    if (!res.ok) throw new Error('routing');
+    return { plan, net, placement, taps, routes: res.routes };
+  }
+
+  it('leaves the proliferator net out while it has no route: the layout of the item nets alone', async () => {
+    const s = await itemNets();
+    const feed = s.net.nets.find((n) => n.proliferator)!;
+    expect(s.routes.some((r) => r.netId === feed.id)).toBe(false); // routeNets leaves it alone
+    const layout = assembleLayout(s.net, s.placement, s.taps, s.routes, [], s.plan, data);
+    expect(layout.belts.map((b) => b.id)).toEqual(s.net.nets.filter((n) => !n.proliferator).map((n) => n.id));
+    expect(layout.coaters).toBeUndefined();
+    // the station still has the feed's port configured, so a later call with the route finds it in place
+    const station = layout.buildings.find((b) => b.id === stationBuildingId(feed.source.kind === 'station' ? feed.source.stationIdx : 0));
+    expect(station?.station?.ports.some((p) => p.dir === 1 && station.station?.slots[p.storageIdx - 1]?.itemId === 1143)).toBe(true);
+  });
+
+  it('with the feed route and the coaters: a belt for the feed (item 1143, from its port, no sink) and the coaters as given', async () => {
+    const s = await itemNets();
+    const feed = s.net.nets.find((n) => n.proliferator)!;
+    const coaters = [{ id: 1_000_001, beltId: 1, node: 5, yaw: 90 as const }];
+    const route: RoutedNet = { netId: feed.id, nodes: [{ x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 }] };
+    const layout = assembleLayout(s.net, s.placement, s.taps, [...s.routes, route], [], s.plan, data, coaters);
+    const belt = layout.belts.find((b) => b.id === feed.id)!;
+    expect(belt).toMatchObject({ itemId: 1143, tierItemId: s.net.beltTierItemId, plannedRate: feed.rate });
+    expect(belt.sink).toBeUndefined();
+    const port = s.taps.stationPorts.find((p) => p.netId === feed.id)!;
+    expect(belt.source).toEqual({ buildingId: port.stationBuildingId, port: port.port });
+    expect(layout.coaters).toEqual(coaters);
+    // copies: editing the layout's coaters leaves the caller's
+    layout.coaters![0].node = 99;
+    expect(coaters[0].node).toBe(5);
+  });
+
+  it('a layout with coaters is approximate while the coater geometry is', async () => {
+    const s = await itemNets();
+    const coaters = [{ id: 1_000_001, beltId: 1, node: 5, yaw: 90 as const }];
+    const plain = assembleLayout(s.net, s.placement, s.taps, s.routes, [], s.plan, data, []);
+    const withCoaters = assembleLayout(s.net, s.placement, s.taps, s.routes, [], s.plan, data, coaters);
+    expect(withCoaters.meta.geometrySource).toBe('approximate');
+    expect(plain.meta.geometrySource).toBe(withCoaters.meta.geometrySource); // everything is approximate in the fixture
+    const real = new GameDataIndex({
+      ...data.data,
+      buildings: data.data.buildings.map((b) => ({ ...b, geometry: { ...b.geometry, source: 'extracted' as const } })).map((b) => (b.kind === 'sprayCoater' ? { ...b, geometry: { ...b.geometry, source: 'approximate' as const } } : b)),
+    });
+    expect(assembleLayout(s.net, s.placement, s.taps, s.routes, [], s.plan, real).meta.geometrySource).toBe('extracted');
+    expect(assembleLayout(s.net, s.placement, s.taps, s.routes, [], s.plan, real, coaters).meta.geometrySource).toBe('approximate');
+  });
+
+  it('speed mode: every machine and lab carries the speed-up (prolifMode 1); extra products and no proliferator carry none', async () => {
+    const speed = await itemNets('speed');
+    const layout = assembleLayout(speed.net, speed.placement, speed.taps, speed.routes, [], speed.plan, data);
+    const machines = layout.buildings.filter((b) => b.recipeId !== undefined);
+    expect(machines.length).toBeGreaterThan(5);
+    expect(machines.every((b) => b.prolifMode === 1)).toBe(true);
+    expect(layout.buildings.filter((b) => b.recipeId === undefined).every((b) => b.prolifMode === undefined)).toBe(true);
+
+    const extra = await itemNets('extra');
+    const plain = assembleLayout(extra.net, extra.placement, extra.taps, extra.routes, [], extra.plan, data);
+    expect(plain.buildings.every((b) => b.prolifMode === undefined)).toBe(true);
+
+    // without a proliferator the mode of the request means nothing
+    const none = await processorPlan(1, { tier: 0, mode: 'speed' });
+    const net = buildNetlist(none, data, effects);
+    const placement = constructivePlacement(net, data, 3);
+    const occ = occupancyOf(placement.buildings);
+    const taps = assignTaps(net, placement, occ, data, effects);
+    if ('failed' in taps) throw new Error(taps.failed);
+    const res = routeNets(net, taps, occ, defaultRouteParams(occ), () => false);
+    if (!res.ok) throw new Error('routing');
+    expect(assembleLayout(net, placement, taps, res.routes, [], none, data).buildings.every((b) => b.prolifMode === undefined)).toBe(true);
+  });
+});
+

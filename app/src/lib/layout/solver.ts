@@ -1,7 +1,8 @@
 // The solver: the pipeline of Tasks 20-23 run as an anytime search (Task 24).
 //
 // Pipeline. One candidate is a placement taken through tap assignment, routing (elevation on), power nodes and
-// assembly, then the validator's static checks (`validateLayout` with `simulate: false`: geometry, then the rate
+// assembly (with a proliferator: spray coaters on the sprayed nets and the feed belt through their top passages, placed
+// between the routing and the power nodes, proliferator.ts), then the validator's static checks (`validateLayout` with `simulate: false`: geometry, then the rate
 // capacity). Only a candidate that would become the new best goes on to the full validator with the tick simulation,
 // which is what costs time.
 //
@@ -17,22 +18,25 @@
 // tried again with the exact router (`ladderRungs`): the simulated output of a plan with no slack swings by up to 10 %
 // between two routings of one placement, and three layouts of one kind can fail together (Conveyor Belt MK.II).
 //
-// Improvement loop. Until a stop condition holds: pick a margin from {1, 2}, anneal the placement of the best layout
+// Improvement loop. Until a stop condition holds: pick a margin from {1, 2} ({1, 2, 3} with a proliferator net, whose
+// coaters and feed want the room of a wider placement), anneal the placement of the best layout
 // (or, if that was made at a smaller margin than this one, the constructive placement at this margin: an annealed
 // placement is only collision free at the margin it was annealed at) with a new seed, then build a candidate from it.
 // Margins 0-2 often leave nets unrouted; a failed candidate is normal, is counted and the loop goes on. A candidate
 // whose footprint is smaller than the best's goes to the full validator, and is emitted if it passes. A candidate that
 // passes only over the doubled window of a near miss never replaces a best that passes the plain window: it may be adopted
 // only while the best is itself such a pass, or when there is no best yet (`mayReplaceBest`; the ordinary chain's best and
-// the overall best both count). It is turned down like a failed simulation.
+// the overall best both count). It is turned down like a failed simulation, and its doubled window is not simulated at all
+// when it could not replace the best anyway (`SimSettings.nearMissRetry`).
 // Adaptive effort (Task 27). The margin is picked by the record of the margins so far (`MarginPicker`): margin 1 is
 // often unroutable on large plans (a Quantum Chip candidate costs 25 s to fail), so its share shrinks, to 15 % at least,
 // while it fails. A candidate gives up its routing when the negotiation stalls or is far from converging
 // (`IMPROVE_STALL_ROUNDS`, `IMPROVE_HOPELESS`). Its simulation waits for the target to reach its rate for twice the
 // warm-up of the best layout at most, if that is at most half the 72000 ticks of the adaptive limit (`warmupCapFor`): a
-// candidate that settles within the cap warms up and measures exactly as plain `validateLayout` would, so what passes passes it too;
-// and the simulation ends as soon as the budget is used up (`SimOptions.shouldAbort`), so a 60 s budget is not overrun by a
-// 20 s simulation. The anneals of a chain start hotter the longer its best layout has stood (`Reheat`, for the anneals
+// candidate that settles within the cap warms up and measures as plain `validateLayout` would. (It can still pass only over the
+// doubled window of a near miss, which plain `validateLayout` does not give it; `mayReplaceBest` lets such a pass in only
+// while the best is itself one.) The simulation ends as soon as the budget is used up (`SimOptions.shouldAbort`), so a
+// 60 s budget is not overrun by a 20 s simulation. The anneals of a chain start hotter the longer its best layout has stood (`Reheat`, for the anneals
 // that have all the moves they can use): at the base temperature the chain finds nothing better round after round once it
 // has reached its local best. The ordinary chain
 // and the motif chains keep their own record of margins and their own temperature, so that the ordinary chain does the
@@ -66,8 +70,8 @@
 // (a stop request) in between. `solve` runs it to the end.
 import type { ProductionPlan } from '../calc';
 import type { GameDataIndex, TechEffects } from '../data';
-import { buildingDef, buildingOBBs, LayoutIndex, sorterEnds } from '../geometry';
-import type { Layout } from '../geometry';
+import { buildingDef, buildingOBBs, coaterBuildings, LayoutIndex, sorterEnds } from '../geometry';
+import type { Layout, SprayCoater } from '../geometry';
 import { MAX_WARMUP_TICKS, SimulationAborted, validateLayout, WarmupNotSettled } from '../validate';
 import type { ValidateOptions, ValidationReport } from '../validate';
 import { assembleLayout } from './assemble';
@@ -78,9 +82,10 @@ import type { Netlist } from './netlist';
 import { obbsBounds, Occupancy } from './occupancy';
 import { annealPlacement, constructivePlacement, DEFAULT_PLACEMENT_WEIGHTS, placementCost } from './placement';
 import type { Placement } from './placement';
-import { placePowerNodes, powerTargets } from './power';
+import { placePowerNodes, powerTargets, sorterGeometry } from './power';
+import { feedProliferator } from './proliferator';
 import { Rng } from './rng';
-import { defaultRouteParams, routeNets } from './router';
+import { COATER_LEAD, defaultRouteParams, routeNets } from './router';
 import type { RouteParams } from './router';
 import { assignTaps } from './taps';
 
@@ -139,10 +144,15 @@ export const DEFAULT_SOLVE_OPTIONS: SolveOptions = {
 /** The fallback ladder's margins. */
 const LADDER_MARGINS = [3, 4, 6] as const;
 
-/** One rung of the fallback ladder: a constructive placement at `margin`, routed by the fast router or the exact one. */
+/**
+ * One rung of the fallback ladder: a constructive placement at `margin`, routed by the fast router or the exact one. `lead`
+ * (Task 28, only for a plan with a proliferator net): the router is asked to keep the room a coater wants on the sprayed nets
+ * (`RouteParams.lead`).
+ */
 export interface Rung {
   margin: number;
   exact: boolean;
+  lead?: true;
 }
 
 /**
@@ -151,15 +161,30 @@ export interface Rung {
  * and the tap assignment that the ladder had before Task 27). The simulated output of a layout that has no slack in the
  * plan swings by 10 % from one routing of the same placement to another, and a ladder of three layouts of one kind can
  * fail them all (Conveyor Belt MK.II); the exact rungs are another chance that costs nothing when the first three pass.
+ * `sprayed`: the plan has a proliferator net, see `Rung.lead`.
  */
-export function ladderRungs(): Rung[] {
-  return [false, true].flatMap((exact) => LADDER_MARGINS.map((margin) => ({ margin, exact })));
+export function ladderRungs(sprayed = false): Rung[] {
+  const rungs: Rung[] = [false, true].flatMap((exact) => LADDER_MARGINS.map((margin) => ({ margin, exact })));
+  // A plan with a proliferator net has three more rungs, the last chance: the router asked to keep room for the coaters. They
+  // come last because they cost footprint and, on a large plan, routing time (the room is rigid), where the plain rungs
+  // find a place for the coaters in a placement as wide as these.
+  if (sprayed) rungs.push(...LADDER_MARGINS.map((margin): Rung => ({ margin, exact: false, lead: true })));
+  return rungs;
 }
 
 /** The router's settings of an exact rung: A* without a weight and no rerouting of a failed net. */
 const EXACT_ROUTE: Partial<RouteParams> = { heuristicWeight: 1, maxReorders: 0, maxNetFailures: Infinity };
 /** The improvement loop's margins. */
 const IMPROVE_MARGINS = [1, 2] as const;
+/**
+ * ...and with a proliferator net: a spray coater wants a straight run of five ground nodes between the producers and the first
+ * consumer of its net, and a feed belt wants cells at z 1 beside it, which a placement annealed at margin 1 or 2 rarely leaves.
+ * Of 15 Processor placements (the constructive one and 14 annealed ones) with Mk.III, 0 at margin 2 and 2 at margin 3 had room
+ * for all eight coaters; with the router asked to keep room (`RouteParams.lead`, which the loop does), 2 at margin 2 and 10 at
+ * margin 3. Margin 3 is the ladder's first rung, so the loop can improve on it; the picker's record keeps the margins that fail
+ * from costing time.
+ */
+const IMPROVE_MARGINS_SPRAYED = [1, 2, 3] as const;
 /**
  * The improvement loop's candidates give up their routing after this many negotiation rounds in a row without a better
  * result (the ladder's routing never does: it is the guarantee). A negotiation that stays stuck this long resolves
@@ -173,6 +198,8 @@ const IMPROVE_STALL_ROUNDS = 10;
  * or fewer by then.
  */
 const IMPROVE_HOPELESS = { afterRounds: 6, perNet: 4 };
+/** How the improvement loop builds a candidate: a routing that is stuck is given up early. */
+const IMPROVE_ROUTE: Partial<RouteParams> = { stallRounds: IMPROVE_STALL_ROUNDS, hopeless: IMPROVE_HOPELESS };
 /** The share of improvement iterations after which a motif iteration follows (when motifs are on). */
 const MOTIF_SHARE = 0.5;
 /** The motif chains' random source is the seed mixed with this, so the ordinary chain's draws are not touched. */
@@ -242,6 +269,11 @@ export interface SimSettings {
   shouldAbort?: () => boolean;
   /** An adaptive warm-up still short of the rate after this many ticks fails the candidate (`SimOptions.warmupCapTicks`). */
   warmupCapTicks?: number;
+  /**
+   * Whether a near miss is validated once more over a doubled measure window (`validateGated`; default true). The improvement
+   * loop turns it off for a candidate that could not replace the best anyway (`mayReplaceBest`), which saves the simulation.
+   */
+  nearMissRetry?: boolean;
 }
 
 /** The adaptive warm-up of a candidate is given up on after this many times the best layout's warm-up... */
@@ -315,6 +347,7 @@ export function validateGated(
   const first = validate(layout, plan, data, effects, opts);
   if (first.pass || !first.sim) return { report: first, longerWindow: false };
   if (first.violations.length !== 1 || first.violations[0].code !== 'SIM_OUTPUT_LOW') return { report: first, longerWindow: false };
+  if (sim.nearMissRetry === false) return { report: first, longerWindow: false };
   const wanted = layout.meta.planTargetRate;
   if (!(wanted > 0) || first.sim.measuredTargetRate < (1 - NEAR_MISS) * wanted) return { report: first, longerWindow: false };
   const window = Math.round(first.sim.measureSeconds * TICKS_PER_SECOND);
@@ -573,32 +606,61 @@ export function* solveSteps(
   /**
    * A placement of `netlist` taken through taps, routes and power to a layout that passes the static checks. `route`
    * overrides the router's defaults (the improvement loop's candidates give up a stuck negotiation early); `exact`
-   * assigns the taps in netlist order only (an exact rung of the ladder).
+   * assigns the taps in netlist order only (an exact rung of the ladder); `lead` asks the router for the room a coater wants
+   * on the sprayed nets (`RouteParams.lead`, `COATER_LEAD`).
    */
-  const build = (netlist: Netlist, placement: Placement, stop: () => boolean, route: Partial<RouteParams> = {}, exact = false): Built => {
+  const build = (
+    netlist: Netlist,
+    placement: Placement,
+    stop: () => boolean,
+    route: Partial<RouteParams> = {},
+    exact = false,
+    lead = 0,
+  ): Built => {
     const occ = new Occupancy(data);
     for (const b of placement.buildings) occ.addBuilding(b);
-    const taps = assignTaps(netlist, placement, occ, data, effects, { repass: !exact });
+    const taps = assignTaps(netlist, placement, occ, data, effects, { repass: !exact, lead });
     if ('failed' in taps) return { failures: [`tap assignment failed: ${taps.failed}`] };
-    const routed = routeNets(netlist, taps, occ, defaultRouteParams(occ, route), stop);
+    const routeParams = defaultRouteParams(occ, lead > 0 ? { ...route, lead } : route);
+    const routed = routeNets(netlist, taps, occ, routeParams, stop);
     if (!routed.ok) {
       if (stop()) return { stopped: true };
       return { failures: [`routing left ${routed.conflicts} conflicts; nets without a route: ${routed.unroutable.join(', ') || 'none'}`] };
     }
-    const bare = assembleLayout(netlist, placement, taps, routed.routes, [], plan, data);
+    // the proliferator network (Task 28): coaters on the sprayed nets, and the feed belt through their top passages
+    let routes = routed.routes;
+    let coaters: SprayCoater[] = [];
+    if (netlist.nets.some((n) => n.proliferator)) {
+      const itemsOnly = assembleLayout(netlist, placement, taps, routes, [], plan, data);
+      const fed = feedProliferator(netlist, taps, routes, occ, sorterGeometry(itemsOnly, data).cells, routeParams, data, stop);
+      if ('stopped' in fed) return { stopped: true };
+      if ('failed' in fed) return { failures: [fed.failed] };
+      routes = [...routes, fed.route];
+      coaters = fed.coaters;
+    }
+    const bare = assembleLayout(netlist, placement, taps, routes, [], plan, data, coaters);
+    // a power node keeps off the coaters' bodies as it does off any building
+    for (const c of coaterBuildings(bare, data)) occ.addBuilding(c);
     const targets = powerTargets(bare, data);
     const poles = placePowerNodes(bare.buildings, targets.consumerPoints, targets.blockedPoints, occ, data, effects);
     if (!poles) return { failures: ['no power node placement covers and links the layout'] };
-    const layout = assembleLayout(netlist, placement, taps, routed.routes, poles, plan, data);
+    const layout = assembleLayout(netlist, placement, taps, routes, poles, plan, data, coaters);
     const checked = validateLayout(layout, plan, data, effects, { simulate: false });
     if (!checked.pass) return { failures: violationMessages(checked) };
     return { layout, footprint: footprintOf(layout, data) };
   };
 
   /** Builds a candidate, turning a crash into a failure so one bad candidate never costs the best layout so far. */
-  const tryBuild = (netlist: Netlist, placement: Placement, stop: () => boolean, route: Partial<RouteParams> = {}, exact = false): Built => {
+  const tryBuild = (
+    netlist: Netlist,
+    placement: Placement,
+    stop: () => boolean,
+    route: Partial<RouteParams> = {},
+    exact = false,
+    lead = 0,
+  ): Built => {
     try {
-      return build(netlist, placement, stop, route, exact);
+      return build(netlist, placement, stop, route, exact, lead);
     } catch (err) {
       return { failures: [`internal error: ${err instanceof Error ? err.message : String(err)}`] };
     }
@@ -615,11 +677,12 @@ export function* solveSteps(
     placed: MarginPlacement,
     abort: () => boolean,
     warmupCap?: number,
+    nearMissRetry = true,
   ): { best: Best } | { failures: string[] } | { stopped: true } => {
     let report: ValidationReport;
     let longerWindow: boolean;
     try {
-      ({ report, longerWindow } = validateGated(built.layout, plan, data, effects, { ...sim, shouldAbort: abort, warmupCapTicks: warmupCap }, validate));
+      ({ report, longerWindow } = validateGated(built.layout, plan, data, effects, { ...sim, shouldAbort: abort, warmupCapTicks: warmupCap, nearMissRetry }, validate));
     } catch (err) {
       if (err instanceof SimulationAborted) return { stopped: true };
       if (err instanceof WarmupNotSettled) return { failures: [`SIM_OUTPUT_LOW: ${err.message} (the improvement loop waits twice as long as the best layout did)`] };
@@ -634,7 +697,8 @@ export function* solveSteps(
    * bests are placements only) and the overall best? Not if it passes only over the doubled window and either best passes the
    * plain one (`mayReplaceBest`).
    */
-  const mayTake = (chainBest: Best | null, candidate: Best): boolean => mayReplaceBest(chainBest, candidate) && mayReplaceBest(keeper.best, candidate);
+  const mayTake = (chainBest: { longerWindow: boolean } | null, candidate: { longerWindow: boolean }): boolean =>
+    mayReplaceBest(chainBest, candidate) && mayReplaceBest(keeper.best, candidate);
 
   /** Makes a layout that passed the full validator the overall best if it is smaller, and reports it. */
   const adopt = (candidate: Best): void => {
@@ -643,7 +707,8 @@ export function* solveSteps(
 
   // --- fallback ladder
   progress('start');
-  const rungs = ladderRungs();
+  const sprayed = net.nets.some((n) => n.proliferator);
+  const rungs = ladderRungs(sprayed);
   /** The first layout that passed only over the doubled window; kept until the rungs end or the user stops (see `validateGated`). */
   let provisional: { best: Best; tag: string } | null = null;
   /** Takes the parked layout, if the ladder found no plain pass: it is the layout the ladder found, whichever way it ends. */
@@ -657,14 +722,15 @@ export function* solveSteps(
     // the exact rungs are a second chance for a ladder that found nothing: a layout over the doubled window is enough
     if (provisional && i === LADDER_MARGINS.length) break;
     const { margin } = rung;
-    const tag = rung.exact ? `margin ${margin} (exact routes)` : `margin ${margin}`;
+    const tag = rung.exact ? `margin ${margin} (exact routes)` : rung.lead ? `margin ${margin} (room for coaters)` : `margin ${margin}`;
     yield;
     if (shouldStop()) {
       takeProvisional();
       return result('user');
     }
     const placed: MarginPlacement = { placement: constructive(margin), margin };
-    const built = tryBuild(net, placed.placement, shouldStop, rung.exact ? EXACT_ROUTE : {}, rung.exact);
+    // the rungs that keep room for the coaters are a last chance, not the guarantee: a routing that is stuck is given up early
+    const built = tryBuild(net, placed.placement, shouldStop, rung.exact ? EXACT_ROUTE : rung.lead ? IMPROVE_ROUTE : {}, rung.exact, rung.lead ? COATER_LEAD : 0);
     attempts++;
     if ('stopped' in built) {
       takeProvisional();
@@ -708,10 +774,11 @@ export function* solveSteps(
   const improveStop = (): boolean => shouldStop() || elapsed() >= opts.timeBudgetMs;
   // Each chain has its own record of margins and its own temperature, so that the ordinary chain does exactly the same
   // whether the motif chains run or not.
-  const marginPicker = new MarginPicker(IMPROVE_MARGINS);
+  const improveMargins = sprayed ? IMPROVE_MARGINS_SPRAYED : IMPROVE_MARGINS;
+  /** The candidates of the improvement loop ask the router for the room a coater wants: their placements are tight. */
+  const improveLead = sprayed ? COATER_LEAD : 0;
+  const marginPicker = new MarginPicker(improveMargins);
   const reheat = new Reheat();
-  /** How the improvement loop builds a candidate: a routing that is stuck is given up early. */
-  const IMPROVE_ROUTE: Partial<RouteParams> = { stallRounds: IMPROVE_STALL_ROUNDS, hopeless: IMPROVE_HOPELESS };
   let itersPerMs = DEFAULT_ITERS_PER_MS;
   const stopReason = (): SolveResult['stoppedBy'] | null => {
     if (shouldStop()) return 'user';
@@ -781,7 +848,7 @@ export function* solveSteps(
     }
 
     const placed: MarginPlacement = { placement: annealed, margin };
-    const built = tryBuild(net, annealed, improveStop, IMPROVE_ROUTE);
+    const built = tryBuild(net, annealed, improveStop, IMPROVE_ROUTE, false, improveLead);
     if ('stopped' in built) {
       progress(`improve: margin ${margin} stopped`);
       return;
@@ -799,7 +866,9 @@ export function* solveSteps(
       progress(`improve: margin ${margin}, no smaller (${built.footprint.toFixed(0)} against ${current.footprint.toFixed(0)})`);
       return;
     }
-    const accepted = accept(built, placed, improveStop, warmupCapFor(current.report));
+    // a near miss that passes only over the doubled window cannot replace a best that passes the plain one: not worth the simulation
+    const retry = mayTake(current, { longerWindow: true });
+    const accepted = accept(built, placed, improveStop, warmupCapFor(current.report), retry);
     if ('stopped' in accepted) {
       progress(`improve: margin ${margin} stopped`);
     } else if ('best' in accepted && !mayTake(current, accepted.best)) {
@@ -831,10 +900,12 @@ export function* solveSteps(
     best: (MarginPlacement & { footprint: number }) | null;
   }
   const motifKinds = enabledMotifKinds(opts.useUnverifiedMotifs);
-  const motifMarginPicker = new MarginPicker(IMPROVE_MARGINS);
+  const motifMarginPicker = new MarginPicker(improveMargins);
   const motifReheat = new Reheat();
   let variants: Variant[] | null = null;
-  let motifsOff = motifKinds.size === 0;
+  // The motifs' direct sorters move items from machine to machine without a belt, so without a coater: a layout with a
+  // proliferator net does not use them (a machine fed that way would get unsprayed ingredients and lose its bonus).
+  let motifsOff = motifKinds.size === 0 || net.nets.some((n) => n.proliferator);
   const motifRng = new Rng((opts.seed ^ MOTIF_SEED_MIX) >>> 0);
 
   /** The variants: one per non-empty subset of the enabled motifs that changes the netlist, the fewest motifs first. */
@@ -924,7 +995,7 @@ export function* solveSteps(
     }
     // a candidate for the overall best: the full validator decides. Only a layout that passes it starts the variant's
     // next anneal (a rejected one would also keep every later candidate of its size out of the validator).
-    const accepted = accept(built, placed, improveStop, warmupCapFor((keeper.best as Best).report));
+    const accepted = accept(built, placed, improveStop, warmupCapFor((keeper.best as Best).report), mayTake(null, { longerWindow: true }));
     if ('stopped' in accepted) {
       progress(`motif ${name}: margin ${margin} stopped`);
     } else if ('best' in accepted && !mayTake(null, accepted.best)) {

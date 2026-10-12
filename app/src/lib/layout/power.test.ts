@@ -221,3 +221,55 @@ describe('placePowerNodes', () => {
     expect(a).toEqual(b);
   });
 });
+
+describe('spray coaters as consumers (Task 28)', () => {
+  /** An item belt flowing east along y = 10 with a coater on node 5, as a layout. */
+  function withCoater(): Layout {
+    const kit = new LayoutKit();
+    const belt = kit.belt(3, 1101, line([0, 10], [12, 10]));
+    kit.coater(belt, 5);
+    return kit.layout();
+  }
+
+  it('powerTargets lists each coater at the belt node it stands on, after the sorters\' midpoints', () => {
+    const layout = withCoater();
+    const { consumerPoints } = powerTargets(layout, data);
+    expect(consumerPoints).toEqual([{ x: 5, y: 10 }]);
+
+    const kit = new LayoutKit();
+    const asm = kit.assembler(6, 12);
+    const belt = kit.belt(3, 1101, line([0, 10], [12, 10]));
+    kit.sorter(onNode(belt, 5), onSlot(asm, 3));
+    kit.coater(belt, 9);
+    const targets = powerTargets(kit.layout(), data);
+    expect(targets.consumerPoints).toHaveLength(2);
+    expect(targets.consumerPoints[1]).toEqual({ x: 9, y: 10 });
+  });
+
+  it('a layout without coaters has the same targets as before', () => {
+    const kit = new LayoutKit();
+    kit.belt(3, 1101, line([0, 10], [12, 10]));
+    expect(powerTargets(kit.layout(), data).consumerPoints).toEqual([]);
+  });
+
+  it('placePowerNodes covers the coater: a node within its cover radius, and the validator agrees', () => {
+    const layout = withCoater();
+    const targets = powerTargets(layout, data);
+    const nodes = placePowerNodes(layout.buildings, targets.consumerPoints, targets.blockedPoints, occupancyOf(layout.buildings), data, effects);
+    expect(nodes).not.toBeNull();
+    expect(nodes!.length).toBeGreaterThanOrEqual(1);
+    const powered: Layout = { ...layout, buildings: [...layout.buildings, ...nodes!] };
+    expect(codes(powered, /^POWER_/)).toEqual([]);
+    // and without the coater among the targets, no node is placed at all: the coater is what needs one
+    expect(placePowerNodes(layout.buildings, [], new Set(), occupancyOf(layout.buildings), data, effects)).toEqual([]);
+  });
+
+  it('the node keeps off the cells of the belt the coater stands on', () => {
+    const layout = withCoater();
+    const targets = powerTargets(layout, data);
+    expect(targets.blockedPoints.has('5,10')).toBe(true);
+    const nodes = placePowerNodes(layout.buildings, targets.consumerPoints, targets.blockedPoints, occupancyOf(layout.buildings), data, effects)!;
+    for (const n of nodes) expect(n.y === 10 && n.x >= 0 && n.x <= 12).toBe(false);
+  });
+});
+

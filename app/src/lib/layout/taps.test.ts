@@ -7,7 +7,7 @@ import { netStack } from './netlist';
 import type { Netlist } from './netlist';
 import { constructivePlacement, placementBuildingIdOf, stationBuildingId } from './placement';
 import type { Placement } from './placement';
-import { defaultRouteParams, routeNets } from './router';
+import { COATER_LEAD, defaultRouteParams, routeNets } from './router';
 import { assignTaps } from './taps';
 import type { AssignedTap, TapAssignment } from './taps';
 import {
@@ -694,5 +694,62 @@ describe('assignTaps multi-lane taps (MX §9 M2)', () => {
     const res = assignTaps(inputNets([1.0, 0.5]), placement, blocked, data, effects);
     expect(res).toHaveProperty('failed');
     expect((res as { failed: string }).failed).toMatch(/net 2/);
+  });
+});
+
+describe('assignTaps: the proliferator net (Task 28)', () => {
+  it('gives the net one source port on the station that holds the slot, no tap, and takes no other net\'s port', async () => {
+    const net = await processorNetlist(1, { tier: 3, mode: 'extra' });
+    const feed = net.nets.find((n) => n.proliferator);
+    if (!feed || feed.source.kind !== 'station') throw new Error('the netlist has no proliferator net');
+    const placement = constructivePlacement(net, data, 3);
+    const res = ok(assignTaps(net, placement, occupancyOf(placement.buildings), data, effects));
+
+    expect(res.taps.filter((t) => t.netId === feed.id)).toEqual([]);
+    const ports = res.stationPorts.filter((p) => p.netId === feed.id);
+    expect(ports).toHaveLength(1);
+    expect(ports[0]).toMatchObject({ end: 'source', stationBuildingId: stationBuildingId(feed.source.stationIdx) });
+    const taken = res.stationPorts.map((p) => `${p.stationBuildingId}:${p.port}`);
+    expect(new Set(taken).size).toBe(taken.length);
+    // one port per station end of every net, the feed's included
+    const ends = net.nets.reduce((n, x) => n + (x.source.kind === 'station' ? 1 : 0) + (x.sink.kind === 'station' ? 1 : 0), 0);
+    expect(res.stationPorts).toHaveLength(ends);
+  });
+
+  it('chooses the feed\'s port by where the consumers of the sprayed nets are: a port that faces the machines', async () => {
+    const net = await processorNetlist(1, { tier: 3, mode: 'extra' });
+    const feed = net.nets.find((n) => n.proliferator);
+    if (!feed || feed.source.kind !== 'station') throw new Error('the netlist has no proliferator net');
+    const placement = constructivePlacement(net, data, 3);
+    const port = ok(assignTaps(net, placement, occupancyOf(placement.buildings), data, effects)).stationPorts.find((p) => p.netId === feed.id);
+    // the machines stand east of the column of stations
+    expect(port?.dir).toEqual([1, 0]);
+  });
+
+  it('keeps every tap off the room a sprayed net\'s coater wants out of its port (the five nodes straight out of it)', async () => {
+    const net = await processorNetlist(1, { tier: 3, mode: 'extra' });
+    const placement = constructivePlacement(net, data, 3);
+    const occ = occupancyOf(placement.buildings);
+    const res = ok(assignTaps(net, placement, occ, data, effects, { lead: COATER_LEAD }));
+    const sources = res.stationPorts.filter((p) => p.end === 'source' && net.nets.find((n) => n.id === p.netId)?.sprayed);
+    expect(sources.length).toBeGreaterThan(0);
+    for (const p of sources) {
+      for (let i = 0; i <= 4; i++) {
+        const x = p.point.x + i * p.dir[0];
+        const y = p.point.y + i * p.dir[1];
+        const other = res.taps.find((t) => t.netId !== p.netId && needed(t).includes(key(x, y)));
+        expect(other, `net ${p.netId}: cell ${i} out of its port (${x}, ${y}) is a tap of net ${other?.netId}`).toBeUndefined();
+      }
+    }
+  });
+
+  it('asks for no room unless told to: lead 0 is the default, and the room is only held for sprayed nets that start at a port', async () => {
+    const net = await processorNetlist(1, { tier: 3, mode: 'extra' });
+    const placement = constructivePlacement(net, data, 3);
+    const occ = occupancyOf(placement.buildings);
+    expect(ok(assignTaps(net, placement, occ, data, effects, { lead: 0 }))).toEqual(ok(assignTaps(net, placement, occ, data, effects)));
+    // a netlist with nothing sprayed is assigned the same whatever the room asked for
+    const unsprayed = { ...net, nets: net.nets.map((n) => ({ ...n, sprayed: undefined })) };
+    expect(ok(assignTaps(unsprayed, placement, occ, data, effects, { lead: COATER_LEAD }))).toEqual(ok(assignTaps(unsprayed, placement, occ, data, effects)));
   });
 });

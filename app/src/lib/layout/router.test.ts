@@ -3,8 +3,8 @@ import type { GridPoint, PlacedBuilding } from '../geometry';
 import { checkGeometry } from '../validate/geometry-checks';
 import { LayoutKit } from '../validate/testkit';
 import type { BeltNet, Netlist } from './netlist';
-import { routeNets } from './router';
-import type { RouteParams, RoutedNet } from './router';
+import { COATER_LEAD, routeFeed, routeNets } from './router';
+import type { FeedOption, RouteParams, RoutedNet } from './router';
 import type { AssignedTap, TapAssignment } from './taps';
 import { ASSEMBLER, data, effects, ILS, occupancyOf, PLS, synthNetlist } from './testkit';
 
@@ -944,3 +944,238 @@ describe('a negotiation that does not get better', () => {
     expect(route(specs, { hopeless: { afterRounds: 2, perNet: 2 } }).ok).toBe(true);
   });
 });
+
+describe('the proliferator feed (Task 28)', () => {
+  const flat = (nodes: GridPoint[], i: number): boolean => nodes[i].z === nodes[i + 1].z && Math.abs(nodes[i].x - nodes[i + 1].x) + Math.abs(nodes[i].y - nodes[i + 1].y) === 1;
+  const port = (x: number, y: number, dir: Dir) => ({ netId: 9, stationBuildingId: 1, port: 0, point: { x, y }, end: 'source' as const, dir });
+  const cell = (nodes: readonly GridPoint[], x: number, y: number, z: number): number => nodes.findIndex((p) => p.x === x && p.y === y && p.z === z);
+
+  /** A top passage over the node (x, y) of an item belt that runs along y: the feed crosses it north or south. */
+  const topOver = (x: number, y: number, tag: number, over: Partial<FeedOption> = {}): FeedOption => ({
+    x,
+    y,
+    dirs: [1, 3],
+    through: [1, 3],
+    body: [
+      { x: x - 1, y, z: 1 },
+      { x: x - 2, y, z: 1 },
+    ],
+    tag,
+    ...over,
+  });
+  /** An east-west item belt along row `y` from `x0` to `x1`, as nodes. */
+  const row = (y: number, x0: number, x1: number): GridPoint[] => Array.from({ length: x1 - x0 + 1 }, (_, i) => ({ x: x0 + i, y, z: 0 }));
+
+  const feed = (groups: FeedOption[][], taken: GridPoint[] = [], over: Partial<RouteParams> = {}, obstacles: PlacedBuilding[] = [], stop = never) =>
+    routeFeed(port(2, 10, E), groups, taken, occupancyOf(obstacles), params(over), stop);
+
+  it('routeNets leaves the net marked proliferator alone, and keeps the two cells outside its port free', () => {
+    const specs: Spec[] = [
+      { id: 1, source: { x: 0, y: 10, dir: E }, sink: { x: 20, y: 10, dir: W } },
+      { id: 2, source: { x: 10, y: 0, dir: N } },
+    ];
+    const { net, taps } = build(specs);
+    net.nets[1].proliferator = true;
+    net.nets[1].source = { kind: 'station', stationIdx: 0 };
+    // the feed's port sits on the straight line of net 1; its first two cells are nobody else's
+    const withFeed: TapAssignment = { ...taps, stationPorts: [...taps.stationPorts.filter((p) => p.netId === 1), { netId: 2, stationBuildingId: 1, port: 5, point: { x: 8, y: 10 }, end: 'source', dir: N }] };
+    const res = routeNets(net, withFeed, occupancyOf([]), params(), never);
+    expect(res.ok).toBe(true);
+    expect(res.routes.map((r) => r.netId)).toEqual([1]);
+    const nodes = routeOf(res, 1);
+    expect(at(nodes, 8, 10)).toBe(-1);
+    expect(at(nodes, 8, 11)).toBe(-1);
+    // and the same net without the reservation goes straight through them
+    const free = routeNets(net, { ...taps, stationPorts: taps.stationPorts.filter((p) => p.netId === 1) }, occupancyOf([]), params(), never);
+    expect(at(routeOf(free, 1), 8, 10)).toBeGreaterThanOrEqual(0);
+  });
+
+  it('leads a belt from the port, lifts to z 1 and crosses the top passage at a right angle, where it ends', () => {
+    const item = row(14, 4, 16);
+    const res = feed([[topOver(10, 14, 7)]], item);
+    if (!res.ok) throw new Error(res.reason);
+    expect(res.chosen).toEqual([7]);
+    const nodes = res.nodes;
+    expect(nodes[0]).toEqual({ x: 2, y: 10, z: 0 });
+    expect(nodes[1]).toEqual({ x: 3, y: 10, z: 0 });
+    for (let i = 0; i + 1 < nodes.length; i++) {
+      const lift = nodes[i].x === nodes[i + 1].x && nodes[i].y === nodes[i + 1].y && Math.abs(nodes[i].z - nodes[i + 1].z) === 1;
+      expect(flat(nodes, i) || lift, `step ${i}`).toBe(true);
+    }
+    // the last node is the top passage, entered across the item belt (north or south)
+    const last = nodes[nodes.length - 1];
+    expect(last).toEqual({ x: 10, y: 14, z: 1 });
+    expect(nodes[nodes.length - 2].x).toBe(10);
+    expect(Math.abs(nodes[nodes.length - 2].y - 14)).toBe(1);
+    expect(nodes[nodes.length - 2].z).toBe(1);
+    // none of the item belt's cells, and none of the coater's body
+    for (const p of item) expect(cell(nodes, p.x, p.y, 0)).toBe(-1);
+    expect(cell(nodes, 9, 14, 1)).toBe(-1);
+    expect(cell(nodes, 8, 14, 1)).toBe(-1);
+  });
+
+  it('the belt it lays passes the validator: lifts with flat steps either side, nothing in the coater but the top passage', () => {
+    const item = row(14, 4, 16);
+    const res = feed([[topOver(10, 14, 0, { body: [{ x: 9, y: 14, z: 1 }, { x: 8, y: 14, z: 1 }] })]], item);
+    if (!res.ok) throw new Error(res.reason);
+    const kit = new LayoutKit();
+    const itemBelt = kit.belt(1, 1101, item);
+    // top passage over node 6 (x = 10); turned against the flow its top is the next node: a coater on node 5 (x = 9)... here
+    // the pattern is the coater on x = 11 turned with the flow (east): its top passage is the node behind it, x = 10
+    kit.coater(itemBelt, 7, 90);
+    kit.belt(1, 1143, res.nodes);
+    kit.tesla(10, 17);
+    const violations = checkGeometry(kit.layout(), data, effects);
+    expect(violations.map((v) => `${v.code}: ${v.message}`)).toEqual([]);
+  });
+
+  it('visits the coaters nearest first and ends at the last; each goes through one of its options', () => {
+    const itemA = row(14, 4, 16);
+    const itemB = row(18, 4, 16);
+    const res = feed([[topOver(6, 14, 0)], [topOver(14, 18, 1)]], [...itemA, ...itemB]);
+    if (!res.ok) throw new Error(res.reason);
+    expect(res.chosen).toEqual([0, 1]);
+    expect(res.order).toEqual([0, 1]);
+    const a = cell(res.nodes, 6, 14, 1);
+    const b = cell(res.nodes, 14, 18, 1);
+    expect(a).toBeGreaterThan(0);
+    expect(b).toBeGreaterThan(a);
+    expect(b).toBe(res.nodes.length - 1);
+  });
+
+  it('takes the cheapest option of a coater that offers several', () => {
+    const item = row(14, 4, 16);
+    const res = feed([[topOver(15, 14, 0), topOver(6, 14, 1), topOver(11, 14, 2)]], item);
+    if (!res.ok) throw new Error(res.reason);
+    expect(res.chosen).toEqual([1]); // the port is at x = 2: the nearest top passage
+  });
+
+  it('drops an option whose cheapest path crosses its own coater, and takes another', () => {
+    // coming from the west along row 14 the shortest way to the top passage at x = 10 passes the body cells x = 8, 9;
+    // with a wall of buildings north and south of the top passage the belt has to cross the body or pick the other option
+    const item = row(14, 4, 16);
+    const wall: PlacedBuilding[] = [];
+    const res = feed([[topOver(10, 14, 0, { body: [{ x: 9, y: 14, z: 1 }, { x: 8, y: 14, z: 1 }], dirs: [1], through: [1] }), topOver(14, 14, 1, { body: [{ x: 13, y: 14, z: 1 }, { x: 12, y: 14, z: 1 }] })]], item, {}, wall);
+    if (!res.ok) throw new Error(res.reason);
+    const body = res.chosen[0] === 0 ? [{ x: 9, y: 14 }, { x: 8, y: 14 }] : [{ x: 13, y: 14 }, { x: 12, y: 14 }];
+    for (const c of body) expect(cell(res.nodes, c.x, c.y, 1), `body cell ${c.x}`).toBe(-1);
+  });
+
+  it('a stop the belt goes on from needs a free cell after it: only the options that leave one count', () => {
+    const item = row(14, 4, 16);
+    // the first coater's passage can only be left to the south (through: []) so it must be the last stop; with a second
+    // coater to visit, the first order fails and the other one is found
+    const last = topOver(10, 14, 0, { through: [] });
+    const other = topOver(14, 14, 1);
+    const res = feed([[last], [other]], item);
+    if (!res.ok) throw new Error(res.reason);
+    expect(res.order).toEqual([1, 0]);
+    expect(res.chosen).toEqual([1, 0]);
+  });
+
+  it('says why when no option of a coater can be reached, and which', () => {
+    // a ring of obstacles round the top passage: the belt cannot get to z 1 beside it
+    const item = row(14, 4, 16);
+    const around = [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].flatMap((x) => [{ x, y: 15, z: 1 }, { x, y: 13, z: 1 }]);
+    const res = feed([[topOver(10, 14, 0, { dirs: [], through: [] })]], [...item, ...around]);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toMatch(/no route to the top passage of coater 1 of 1/);
+    const none = feed([[]], item);
+    expect(none.ok).toBe(false);
+    if (!none.ok) expect(none.reason).toMatch(/no place to stand/);
+  });
+
+  it('stops when shouldStop says so', () => {
+    const item = row(14, 4, 16);
+    const res = feed([[topOver(10, 14, 0)]], item, {}, [], () => true);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.stopped).toBe(true);
+  });
+
+  it('is deterministic', () => {
+    const item = row(14, 4, 16);
+    const groups = [[topOver(10, 14, 0), topOver(6, 14, 1)]];
+    expect(feed(groups, item)).toEqual(feed(groups, item));
+  });
+});
+
+describe('room for a coater on a sprayed net (Task 28)', () => {
+  /** The nets of `specs` marked sprayed and routed with the room for a coater asked for (`lead`). */
+  const sprayedRoute = (specs: Spec[], obstacles: PlacedBuilding[] = [], over: Partial<RouteParams> = {}) => {
+    const { net, taps } = build(specs);
+    for (const n of net.nets) n.sprayed = true;
+    return routeNets(net, taps, occupancyOf(obstacles), params({ lead: COATER_LEAD, ...over }), never);
+  };
+  const straight = (nodes: GridPoint[], from: number, count: number): boolean =>
+    nodes.slice(from, from + count).every((p, i, a) => i === 0 || (p.z === 0 && p.x - a[i - 1].x === a[1].x - a[0].x && p.y - a[i - 1].y === a[1].y - a[0].y));
+
+  it('a net that starts at a station port keeps straight out of it for five nodes', () => {
+    // the sink is up and to the east: an unsprayed net turns north as soon as the router likes; a sprayed one does not before node 4
+    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 14, y: 12, axis: 'x', dir: 'in' }] }];
+    const res = sprayedRoute(spec);
+    expect(res.ok).toBe(true);
+    const nodes = routeOf(res, 1);
+    expect(COATER_LEAD).toBe(4);
+    expect(nodes.slice(0, 5)).toEqual([2, 3, 4, 5, 6].map((x) => ({ x, y: 5, z: 0 })));
+  });
+
+  it('a net that is not sprayed is routed as before: it turns as soon as it likes, and is shorter for it', () => {
+    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 4, y: 12, axis: 'x', dir: 'in' }] }];
+    const { net, taps } = build(spec);
+    const plain = routeOf(routeNets(net, taps, occupancyOf([]), params(), never), 1);
+    const sprayed = routeOf(sprayedRoute(spec), 1);
+    expect(plain.slice(0, 4).every((p) => p.y === 5)).toBe(false); // it turns north before the fourth node
+    expect(plain.length).toBeLessThan(sprayed.length);
+    expect(sprayed.slice(0, 5).map((p) => p.y)).toEqual([5, 5, 5, 5, 5]);
+  });
+
+  it('the stretch is taken whole or not at all: a building in the way of the fifth node, and the net is routed without it', () => {
+    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 14, y: 12, axis: 'x', dir: 'in' }] }];
+    // an assembler whose footprint covers (5, 5) and (6, 5) but leaves the first three cells
+    const wall: PlacedBuilding[] = [{ id: 1, itemId: ASSEMBLER, x: 7, y: 5, z: 0, yaw: 0 }];
+    const res = sprayedRoute(spec, wall);
+    expect(res.ok).toBe(true);
+    const nodes = routeOf(res, 1);
+    expect(nodes[0]).toEqual({ x: 2, y: 5, z: 0 });
+    expect(nodes.slice(0, 5).every((p, i) => i === 0 || (p.x === 2 + i && p.y === 5))).toBe(false); // not five out of the port
+    expect(beltViolations(res.routes, wall)).toEqual([]);
+  });
+
+  it('after the last run that holds a producer the belt keeps straight for the exit node and four more', () => {
+    // producers at (6, 8) and (7, 8) on a row, a consumer further along and up: the belt is passed east along y = 8
+    const spec: Spec[] = [
+      {
+        id: 1,
+        taps: [
+          { x: 6, y: 8, axis: 'x', dir: 'out' },
+          { x: 7, y: 8, axis: 'x', dir: 'out' },
+          { x: 12, y: 16, axis: 'x', dir: 'in' },
+        ],
+      },
+    ];
+    const res = sprayedRoute(spec);
+    expect(res.ok).toBe(true);
+    const nodes = routeOf(res, 1);
+    const last = at(nodes, 7, 8);
+    expect(last).toBeGreaterThanOrEqual(1);
+    // the exit node (8, 8) and four more, straight on
+    expect(nodes.slice(last + 1, last + 6).map((p) => [p.x, p.y])).toEqual([[8, 8], [9, 8], [10, 8], [11, 8], [12, 8]]);
+    expect(straight(nodes, last - 1, 7)).toBe(true);
+  });
+
+  it('a sprayed net is routed as any other unless the room is asked for (lead): the default asks for none', () => {
+    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 4, y: 12, axis: 'x', dir: 'in' }] }];
+    const { net, taps } = build(spec);
+    const plain = routeNets(net, taps, occupancyOf([]), params(), never);
+    for (const n of net.nets) n.sprayed = true;
+    expect(routeNets(net, taps, occupancyOf([]), params(), never)).toEqual(plain);
+    expect(routeNets(net, taps, occupancyOf([]), params({ lead: 0 }), never)).toEqual(plain);
+    expect(routeNets(net, taps, occupancyOf([]), params({ lead: COATER_LEAD }), never).routes).not.toEqual(plain.routes);
+  });
+
+  it('is deterministic', () => {
+    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 14, y: 12, axis: 'x', dir: 'in' }] }];
+    expect(sprayedRoute(spec)).toEqual(sprayedRoute(spec));
+  });
+});
+

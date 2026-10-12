@@ -97,9 +97,26 @@ describe('ValidationPanel', () => {
     stageStats: [],
     deadlocked: false,
     power: { steadyW: 1_500_000, idleW: 0, peakW: 4_000_000, stationChargeW: 2_000_000 },
+    coaters: { count: 0, sprayedItems: 0, proliferatorPerSecond: 0 },
     measureSeconds: 300,
     warmupTicksUsed: 7200,
     warnings: [],
+  });
+
+  it('shows the spray coaters and the proliferator they used next to the plan\'s, only when there are coaters', async () => {
+    const sprayed = { ...simulated(1)!, coaters: { count: 8, sprayedItems: 6000, proliferatorPerSecond: 0.32 } };
+    const report: ValidationReport = { ...passing, stage: 'simulation', sim: sprayed };
+    const { app, finish } = await appWith(undefined, report);
+    await finish();
+    const page = html(ValidationPanel, app);
+    expect(page).toContain('Proliferator');
+    expect(page).toContain('Spray coaters');
+    expect(page).toContain('Used (simulated)');
+    const bare = await appWith(undefined, { ...passing, stage: 'simulation', sim: simulated(1) });
+    await bare.finish();
+    const plain = html(ValidationPanel, bare.app);
+    expect(plain).toContain('Capacity (simulated)');
+    expect(plain).not.toContain('Spray coaters');
   });
 
   it('says PASS with the simulated capacity next to the provisioned rate, and the measured power next to the estimate', async () => {

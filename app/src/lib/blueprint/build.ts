@@ -12,8 +12,9 @@ import {
   LayoutIndex,
   portPosition,
   sorterEnds,
+  sprayCoaterDef,
 } from '../geometry';
-import type { BeltPath, Endpoint, GridPoint, Layout, PlacedBuilding, Sorter, StationConfig } from '../geometry';
+import type { BeltPath, Endpoint, GridPoint, Layout, PlacedBuilding, Sorter, SprayCoater, StationConfig } from '../geometry';
 import { encodeBlueprint } from './codec';
 import type { Blueprint, BlueprintBuilding, BlueprintHeader } from './model';
 
@@ -254,6 +255,29 @@ function sorterRecord(
   });
 }
 
+/**
+ * The record of a spray coater, written the way the game wrote the 8 of the capsule sample (BF §3.3): at the node of its
+ * belt (both ends of the record), turned `yaw`, item 2313 and the model of GameData, linked to nothing (outputObjIdx and
+ * inputObjIdx -1, the belts do not point at it either) and with the slot fields `14,15,15,14,0,0` that splitters and
+ * depots carry, no parameters.
+ */
+function coaterRecord(c: SprayCoater, ctx: Context): BlueprintBuilding {
+  const what = `coater ${c.id}`;
+  const def = sprayCoaterDef(ctx.data);
+  if (!def) throw new Error(`${what}: GameData has no spray coater building`);
+  const p = beltNodeAt(ctx.index.belt(c.beltId, `${what} belt`), c.node, what);
+  return record(def.itemId, def.modelIndex, {
+    localOffset: [p.x, p.y, p.z],
+    localOffset2: [p.x, p.y, p.z],
+    yaw: c.yaw,
+    yaw2: c.yaw,
+    outputToSlot: 14,
+    inputFromSlot: 15,
+    outputFromSlot: 15,
+    inputToSlot: 14,
+  });
+}
+
 // ---------------------------------------------------------------------------------------------
 // Blueprint
 
@@ -276,7 +300,8 @@ const EPS = 1e-6;
 
 /**
  * Build the blueprint for `layout`. Records are ordered buildings, then belt records (belt by belt: source
- * stubs, nodes, sink stubs), then sorters, so `index == position` as the game requires. Every position is
+ * stubs, nodes, sink stubs), then sorters, then spray coaters (which nothing links to, so they can come last without
+ * moving any other index), so `index == position` as the game requires. Every position is
  * shifted by the integer `(-floor(minX), -floor(minY))` so buildings keep their grid parity.
  */
 export function layoutToBlueprint(layout: Layout, data: GameDataIndex, opts: BuildOptions): Blueprint {
@@ -288,6 +313,7 @@ export function layoutToBlueprint(layout: Layout, data: GameDataIndex, opts: Bui
     ...layout.buildings.map((b) => buildingRecord(b, ctx)),
     ...layout.belts.flatMap((belt) => beltRecords(belt, ctx, layouts, buildingIndex)),
     ...layout.sorters.map((s) => sorterRecord(s, ctx, layouts, buildingIndex)),
+    ...(layout.coaters ?? []).map((c) => coaterRecord(c, ctx)),
   ];
   records.forEach((r, i) => {
     r.index = i;

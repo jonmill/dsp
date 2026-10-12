@@ -6,7 +6,7 @@ import { loadBlueprintSample } from '../../../test/fixtures/blueprintSamples';
 import type { ProductionPlan } from '../calc';
 import { GameDataIndex, parseGameData } from '../data';
 import type { TechEffects } from '../data';
-import { portInfos } from '../geometry';
+import { coaterBuilding, findCoaterTop, portInfos, sprayCoaterDef } from '../geometry';
 import type {
   BeltPath,
   Endpoint,
@@ -19,12 +19,12 @@ import type {
 } from '../geometry';
 import { DEFAULT_SOLVE_OPTIONS, solve } from '../layout/solver';
 import { data as kitData, effects as kitEffects, planFor, SMELTER } from '../layout/testkit';
-import { runSimulation } from '../validate';
+import { checkGeometry, runSimulation } from '../validate';
 import { compositeLayout } from '../validate/testkit';
 import { layoutToBlueprintString } from './build';
 import { decodeBlueprint } from './codec';
 import { blueprintToLayout, regressionPlanFor } from './import';
-import type { Blueprint } from './model';
+import type { Blueprint, BlueprintBuilding } from './model';
 
 const fixturePath = fileURLToPath(new URL('../../../../data/fixture/dsp-fixture.json', import.meta.url));
 const data = new GameDataIndex(parseGameData(JSON.parse(readFileSync(fixturePath, 'utf8')), 'dsp-fixture.json'));
@@ -584,11 +584,121 @@ describe('blueprintToLayout: real exports', () => {
     expect(layout.sorters).toHaveLength(36);
 
     const text = warnings.join('\n');
-    for (const skipped of [/9 x Splitter/, /9 x Depot MK\.I/, /9 x Logistics Distributor/, /1 x Traffic Monitor/, /8 x Spray Coater/]) {
+    for (const skipped of [/9 x Splitter/, /9 x Depot MK\.I/, /9 x Logistics Distributor/, /1 x Traffic Monitor/]) {
       expect(text).toMatch(skipped);
     }
+    // The spray coaters are imported now (Task 28), not skipped.
+    expect(text).not.toMatch(/Spray Coater/);
+    expect(layout.coaters).toHaveLength(8);
     // Aggregated, not one line per record.
-    expect(warnings.filter((w) => /^\d+ x /.test(w))).toHaveLength(5);
+    expect(warnings.filter((w) => /^\d+ x /.test(w))).toHaveLength(4);
+  });
+
+  describe('spray coaters (Task 28)', () => {
+    const sample = () => loadBlueprintSample('capsule-production-v2-reform-0.10.33.txt');
+
+    test('the capsule sample: all 8 coaters stand on a belt node, turned 180, with the position of their record', () => {
+      const bp = sample();
+      const { layout } = blueprintToLayout(bp, data);
+      const records = bp.body.buildings.filter((r) => r.itemId === 2313);
+      expect(records).toHaveLength(8);
+      expect(layout.coaters?.map((c) => c.id)).toEqual(records.map((r) => r.index));
+      for (const c of layout.coaters ?? []) {
+        const rec = bp.body.buildings[c.id];
+        const belt = layout.belts.find((b) => b.id === c.beltId) as BeltPath;
+        const node = belt.nodes[c.node];
+        // within the float noise of a game export (its belts and coaters are a few millionths of a tile apart)
+        expect(node.x).toBeCloseTo(rec.localOffset[0], 3);
+        expect(node.y).toBeCloseTo(rec.localOffset[1], 3);
+        expect(node.z).toBeCloseTo(rec.localOffset[2], 2);
+        expect(c.yaw).toBe(180);
+      }
+    });
+
+    test('the capsule sample: the coaters pass the placement and feed rules of the validator, and have no overlap with anything', () => {
+      const { layout } = blueprintToLayout(sample(), data);
+      const violations = checkGeometry(layout, data, kitEffects);
+      const coaterRules = violations.filter((v) => v.code === 'COATER_PLACEMENT' || v.code === 'COATER_UNFED');
+      expect(coaterRules.map((v) => v.message)).toEqual([]);
+      // nothing else is wrong with the coaters either: no overlap or belt through them
+      const ids = new Set((layout.coaters ?? []).map((c) => c.id));
+      expect(violations.filter((v) => v.entities.some((e) => e.kind === 'building' && ids.has(e.id))).map((v) => v.message)).toEqual([]);
+    });
+
+    test('the capsule sample: a proliferator belt crosses over every coater, one node behind it', () => {
+      const { layout } = blueprintToLayout(sample(), data);
+      const proliferators = new Set([1141, 1142, 1143]);
+      const tops = (layout.coaters ?? []).map((c) => {
+        const pose = coaterBuilding(c, layout.belts.find((b) => b.id === c.beltId), sprayCoaterDef(data) as never) as PlacedBuilding;
+        return findCoaterTop(layout, pose, proliferators);
+      });
+      expect(tops.every((t) => t !== null)).toBe(true);
+      // one belt, the elevated one along y = 18, serves all eight
+      expect(new Set(tops.map((t) => t?.belt.id)).size).toBe(1);
+    });
+
+    test('the coaters of the sample simulate: the run wires all 8 and does not throw', () => {
+      const { layout } = blueprintToLayout(sample(), data);
+      const plan = regressionPlanFor(layout, data, kitEffects, { targetItemId: 1607 });
+      const sim = runSimulation(layout, plan, data, kitEffects, { warmupTicks: 600, measureTicks: 600 });
+      expect(sim.coaters.count).toBe(8);
+      expect(sim.warnings.filter((w) => /coater/.test(w))).toEqual([]);
+    });
+
+    test('what the builder wrote comes back: the same node, yaw and a coater of its own', () => {
+      const layout = layoutOf({
+        belts: [beltOf(1, [[3, 19], [3, 18], [3, 17], [3, 16], [3, 15]], { tierItemId: 2003 })],
+        coaters: [{ id: 900, beltId: 1, node: 2, yaw: 180 }],
+      });
+      const { layout: back, warnings } = roundTrip(layout);
+      expect(warnings).toEqual([]);
+      expect(back.coaters).toHaveLength(1);
+      const [c] = back.coaters as NonNullable<Layout['coaters']>;
+      expect(back.belts).toHaveLength(1);
+      expect(c).toMatchObject({ beltId: back.belts[0].id, node: 2, yaw: 180 });
+      expect(c.id).toBe(5); // the record index: 5 belt records, then the coater
+    });
+
+    test('a coater with no belt node under it is skipped with one warning', () => {
+      const layout = layoutOf({
+        belts: [beltOf(1, [[3, 19], [3, 18], [3, 17]], { tierItemId: 2003 })],
+        coaters: [{ id: 900, beltId: 1, node: 1, yaw: 180 }],
+      });
+      const { bp } = roundTrip(layout);
+      const coater = bp.body.buildings.find((r) => r.itemId === 2313) as BlueprintBuilding;
+      coater.localOffset = [coater.localOffset[0] + 5, coater.localOffset[1], coater.localOffset[2]];
+      const { layout: back, warnings } = blueprintToLayout(bp, data);
+      expect(back.coaters).toBeUndefined();
+      expect(warnings.filter((w) => /Spray Coater/.test(w))).toEqual([expect.stringMatching(/^1 x Spray Coater \(item 2313\) skipped: no belt node under it \(records \d+\)$/)]);
+    });
+
+    test('a coater on an elevated node is not matched to the ground node below it', () => {
+      const layout = layoutOf({
+        belts: [beltOf(1, [[3, 19], [3, 18], [3, 17]], { tierItemId: 2003 })],
+        coaters: [{ id: 900, beltId: 1, node: 1, yaw: 180 }],
+      });
+      const { bp } = roundTrip(layout);
+      const coater = bp.body.buildings.find((r) => r.itemId === 2313) as BlueprintBuilding;
+      coater.localOffset = [coater.localOffset[0], coater.localOffset[1], 1];
+      expect(blueprintToLayout(bp, data).layout.coaters).toBeUndefined();
+    });
+
+    test('a yaw that is not a quarter turn is snapped with a warning, like a building', () => {
+      const layout = layoutOf({
+        belts: [beltOf(1, [[3, 19], [3, 18], [3, 17]], { tierItemId: 2003 })],
+        coaters: [{ id: 900, beltId: 1, node: 1, yaw: 180 }],
+      });
+      const { bp } = roundTrip(layout);
+      const coater = bp.body.buildings.find((r) => r.itemId === 2313) as BlueprintBuilding;
+      coater.yaw = 200;
+      const { layout: back, warnings } = blueprintToLayout(bp, data);
+      expect(back.coaters?.[0].yaw).toBe(180);
+      expect(warnings.join('\n')).toMatch(/coater \d+.*yaw 200\.0 is not a quarter turn and was snapped to 180/);
+    });
+
+    test('a blueprint without coaters has no coaters field', () => {
+      expect(blueprintToLayout(roundTrip(richLayout()).bp, data).layout.coaters).toBeUndefined();
+    });
   });
 
   test('the capsule sample keeps fractional and curved belt nodes', () => {

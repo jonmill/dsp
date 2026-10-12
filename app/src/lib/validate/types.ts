@@ -20,7 +20,8 @@ export type ViolationCode =
   | 'POWER_UNCOVERED'
   | 'POWER_DISCONNECTED'
   | 'STATION_SLOTS'
-  // Spray coaters (Task 28 implements the rules; the codes exist so the union is stable).
+  // Spray coaters (Task 28): a coater off a straight ground run of its belt or turned across it, and a coater with no
+  // proliferator belt over its top passage.
   | 'COATER_PLACEMENT'
   | 'COATER_UNFED'
   | 'RATE_BELT'

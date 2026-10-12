@@ -69,6 +69,10 @@ export function coaterConfig(def: Building, item: BeltRef, prolif: BeltRef, data
 export class CoaterSim {
   /** Cargo sprayed so far. */
   sprayedCargo = 0;
+  /** Items (the stacks of that cargo added up) sprayed so far. */
+  sprayedItems = 0;
+  /** Proliferator items taken from the proliferator belt so far. */
+  proliferatorTaken = 0;
 
   private readonly cfg: CoaterConfig;
   private readonly accept: (item: number) => boolean;
@@ -116,6 +120,7 @@ export class CoaterSim {
     this.sprayTime -= SPRAY_UNIT;
     this.store -= cargo.stack;
     this.sprayedCargo++;
+    this.sprayedItems += cargo.stack;
     if (this.store === 0) this.storeItem = 0;
   }
 
@@ -132,5 +137,6 @@ export class CoaterSim {
     const bonus = Math.trunc((info.sprays * cfg.incTableMilli[level]) / 1000 + 0.1);
     this.store += c.stack * (info.sprays + bonus);
     this.storeItem = c.item;
+    this.proliferatorTaken += c.stack;
   }
 }

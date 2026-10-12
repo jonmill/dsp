@@ -8,7 +8,7 @@ import type { SimResult } from '../validate/sim/run';
 import { annealHeat, annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, mayReplaceBest, Reheat, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
 import { VERIFIED_MOTIFS } from './motifs';
-import { ASSEMBLER, data, effects, matrixPlan, occupancyOf, planFor, SMELTER } from './testkit';
+import { ASSEMBLER, data, effects, matrixPlan, occupancyOf, planFor, processorPlan, SMELTER } from './testkit';
 
 /** 3 Iron Ingots/s on three smelters from supplied Iron Ore: three machines, one station. Small and quick to solve. */
 const ingotPlan = (): Promise<ProductionPlan> =>
@@ -402,6 +402,16 @@ describe('ladderRungs (what the fallback ladder tries, in this order)', () => {
       { margin: 6, exact: true },
     ]);
   });
+
+  it('with a proliferator net there are three more, the last chance: the fast router asked to keep room for the coaters', () => {
+    const rungs = ladderRungs(true);
+    expect(rungs.slice(0, 6)).toEqual(ladderRungs());
+    expect(rungs.slice(6)).toEqual([
+      { margin: 3, exact: false, lead: true },
+      { margin: 4, exact: false, lead: true },
+      { margin: 6, exact: false, lead: true },
+    ]);
+  });
 });
 
 describe('validateGated (validateWithRetry, saying whether the longer window decided)', () => {
@@ -434,6 +444,19 @@ describe('validateGated (validateWithRetry, saying whether the longer window dec
     expect(gated.longerWindow).toBe(true);
     const far = report([low], sim(1.5));
     expect(validateGated(layout, plan, data, effects, { simulate: true }, answers(far))).toEqual({ report: far, longerWindow: false });
+  });
+
+  it('with nearMissRetry off a near miss is not validated again: the first verdict stands, and the validator is asked once', () => {
+    const near = report([low], sim(1.97));
+    let calls = 0;
+    const once = ((): ValidationReport => (calls++, near)) as unknown as typeof validateLayout;
+    expect(validateGated(layout, plan, data, effects, { simulate: true, nearMissRetry: false }, once)).toEqual({ report: near, longerWindow: false });
+    expect(calls).toBe(1);
+    // on by default and when set: the doubled window runs
+    calls = 0;
+    const twice = ((): ValidationReport => (calls++, calls === 1 ? near : report([], sim(2, 600)))) as unknown as typeof validateLayout;
+    expect(validateGated(layout, plan, data, effects, { simulate: true, nearMissRetry: true }, twice).longerWindow).toBe(true);
+    expect(calls).toBe(2);
   });
 });
 
@@ -801,14 +824,26 @@ describe('solve', () => {
         return { result, improved, phases, calls: v.calls };
       };
 
-      it('keeps a plain best when every candidate passes only over the doubled window', async () => {
-        const { result, improved, phases, calls } = await loop([undefined, ...nearMisses(80)]);
-        expect(calls()).toBeGreaterThanOrEqual(3); // a candidate reached the validator: the ladder's one call and its two (near miss, doubled window)
+      it('keeps a plain best when every candidate is a near miss, and runs the doubled window for none of them', async () => {
+        // the ladder's answer is the real validator's (a plain pass); every candidate after it is short of the rate by under 2 %
+        const { result, improved, phases, calls } = await loop([undefined, ...Array.from({ length: 80 }, () => nearMiss())]);
+        const rejected = phases.filter((p) => /^improve: margin \d rejected by the simulation$/.test(p)).length;
+        expect(rejected).toBeGreaterThanOrEqual(1);
+        // one validator call for the ladder and one per candidate: a near miss that cannot replace a plain best is not simulated again
+        expect(calls()).toBe(1 + rejected);
         expect(improved).toHaveLength(1); // the ladder's
         expect(result.report).toBe(improved[0]);
-        expect(result.report!.sim!.measureSeconds).toBe(SIM.simMeasureTicks / 60); // a plain window, not the scripted 600 s
-        expect(phases.some((p) => /^improve: margin \d, over the longer window only, the best passes the plain one$/.test(p))).toBe(true);
+        expect(result.report!.sim!.measureSeconds).toBe(SIM.simMeasureTicks / 60); // a plain window, not the scripted 300 s
+        expect(phases.some((p) => /over the longer window only/.test(p))).toBe(false);
         expect(result.failures).toEqual([]);
+      }, 120_000);
+
+      it('still runs the doubled window of a near miss when the best is itself a doubled-window pass (it could replace it)', async () => {
+        const { calls, improved } = await loop([...nearMisses(3), ...nearMisses(80)]);
+        // six calls for the ladder's three rungs (near miss, doubled window) and two for each candidate that was tried
+        expect(calls()).toBeGreaterThanOrEqual(8);
+        expect(calls() % 2).toBe(0);
+        expect(improved.length).toBeGreaterThan(1);
       }, 120_000);
 
       it('takes candidates that pass only over the doubled window while the best is itself such a pass', async () => {
@@ -1139,4 +1174,70 @@ describe('solve with dense motifs', () => {
     expect(withMotifs.result.footprint).toBeLessThanOrEqual(without.result.footprint as number);
     expect(withMotifs.result.failures).toEqual([]);
   }, 180_000);
+});
+
+describe('solve with a proliferator (Task 28)', () => {
+  /** The geometry and capacity checks, no simulation: quick. */
+  const STATIC = { simulate: false };
+
+  it('the last rungs keep room for the coaters: when the six plain rungs are turned down, the seventh is built with it', async () => {
+    const plan = await processorPlan(1, { tier: 3, mode: 'extra' });
+    // the plain rungs build and pass the static checks; the full validator (scripted) turns the first six down
+    let calls = 0;
+    const reject = { pass: false, violations: [{ code: 'SIM_STALLED' as const, entities: [], message: 'made up' }], checkedAt: '', stage: 'simulation' as const };
+    const validate = ((layout, p, d, fx, o) => (calls++ < 6 ? reject : validateLayout(layout, p, d, fx, o))) as typeof validateLayout;
+    const phases: string[] = [];
+    const fake = fakeClock(1000);
+    const result = solve(
+      plan, data, effects,
+      { ...DEFAULT_SOLVE_OPTIONS, ...STATIC, seed: 7, timeBudgetMs: 0, minRunMs: 1e9, now: fake.now },
+      (p) => fake.onProgress(p, (q) => phases.push(q.phase)), () => {}, () => false, validate,
+    );
+    expect(phases.filter((p) => p.startsWith('ladder'))).toEqual([
+      'ladder: margin 3 rejected',
+      'ladder: margin 4 rejected',
+      'ladder: margin 6 rejected',
+      'ladder: margin 3 (exact routes) rejected',
+      'ladder: margin 4 (exact routes) rejected',
+      'ladder: margin 6 (exact routes) rejected',
+      'ladder: margin 3 (room for coaters)',
+    ]);
+    expect(result.report?.pass).toBe(true);
+    // the room was kept: every sprayed net that starts at a station port runs straight out of it for five nodes
+    const layout = result.layout as Layout;
+    const fromPort = layout.belts.filter((b) => b.source && b.itemId !== 1143);
+    expect(fromPort.length).toBeGreaterThan(0);
+    for (const b of fromPort) {
+      const dx = b.nodes[1].x - b.nodes[0].x;
+      const dy = b.nodes[1].y - b.nodes[0].y;
+      expect(b.nodes.slice(0, 5).every((p, i) => p.z === 0 && p.x === b.nodes[0].x + i * dx && p.y === b.nodes[0].y + i * dy), `belt ${b.id}`).toBe(true);
+    }
+  }, 60_000);
+
+  it('the ladder\'s first rung lays the network: a coater on every sprayed net, a feed belt of the proliferator, and it passes', async () => {
+    const plan = await processorPlan(1, { tier: 3, mode: 'extra' });
+    const out = run(plan, { ...STATIC, timeBudgetMs: 0 }, 1000);
+    const layout = out.result.layout as Layout;
+    expect(out.result.failures).toEqual([]);
+    expect(out.result.report?.pass).toBe(true);
+    expect(out.progress.map((p) => p.phase).filter((p) => p.startsWith('ladder'))).toEqual(['ladder: margin 3']);
+    expect(layout.coaters).toHaveLength(8);
+    expect(new Set(layout.coaters!.map((c) => c.beltId)).size).toBe(8);
+    const feeds = layout.belts.filter((b) => b.itemId === 1143);
+    expect(feeds).toHaveLength(1);
+    expect(feeds[0].source).toBeDefined();
+    expect(feeds[0].sink).toBeUndefined();
+    // the coaters are consumers: powered by the nodes the solver placed
+    expect(layout.buildings.some((b) => b.role === 'power')).toBe(true);
+    // the layout the solver emits is the one a fresh validation passes
+    expect(validateLayout(layout, plan, data, effects, { simulate: false }).pass).toBe(true);
+  }, 60_000);
+
+  it('without a proliferator the layout has no coaters and no feed: the pipeline is the old one', async () => {
+    const plan = await processorPlan(1);
+    const out = run(plan, { ...STATIC, timeBudgetMs: 0 }, 1000);
+    const layout = out.result.layout as Layout;
+    expect(layout.coaters).toBeUndefined();
+    expect(layout.belts.some((b) => b.itemId === 1141 || b.itemId === 1142 || b.itemId === 1143)).toBe(false);
+  }, 60_000);
 });
