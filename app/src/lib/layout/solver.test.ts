@@ -5,7 +5,7 @@ import { LayoutKit, compositeLayout } from '../validate/testkit';
 import { MAX_WARMUP_TICKS, SimulationAborted, validateLayout, WarmupNotSettled } from '../validate';
 import type { ValidateOptions, ValidationReport } from '../validate';
 import type { SimResult } from '../validate/sim/run';
-import { annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, Reheat, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
+import { annealHeat, annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, Reheat, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
 import { VERIFIED_MOTIFS } from './motifs';
 import { ASSEMBLER, data, effects, matrixPlan, occupancyOf, planFor, SMELTER } from './testkit';
@@ -218,6 +218,24 @@ describe('Reheat (the anneal starts hotter the longer the best layout has stood)
     expect(reheat.heat()).toBe(3.5);
     reheat.improved();
     expect(reheat.heat()).toBe(1);
+  });
+});
+
+describe('annealHeat (only an anneal that could use more moves than it gets in the cap is reheated)', () => {
+  const stale = (iterations: number): Reheat => {
+    const reheat = new Reheat();
+    for (let i = 0; i < iterations; i++) reheat.iteration();
+    return reheat;
+  };
+
+  it('is the reheat factor when the time would allow the cap or more', () => {
+    expect(annealHeat(stale(8), 400_000, 380_000)).toBe(3);
+    expect(annealHeat(stale(8), 380_000, 380_000)).toBe(3);
+  });
+
+  it('is 1 when the time allows fewer moves than the cap: such an anneal needs all its moves to cool down', () => {
+    expect(annealHeat(stale(8), 2_000_000, 4_620_000)).toBe(1);
+    expect(annealHeat(stale(40), 379_999, 380_000)).toBe(1);
   });
 });
 

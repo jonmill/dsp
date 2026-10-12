@@ -28,8 +28,9 @@
 // warm-up of the best layout at most (`warmupCapFor`), not for the 72000 ticks of the adaptive limit: a candidate that
 // settles within the cap warms up and measures exactly as plain `validateLayout` would, so what passes passes it too;
 // and the simulation ends as soon as the budget is used up (`SimOptions.shouldAbort`), so a 60 s budget is not overrun by a
-// 20 s simulation. The anneals of a chain start hotter the longer its best layout has stood (`Reheat`): at the base
-// temperature the chain finds nothing better round after round once it has reached its local best. The ordinary chain
+// 20 s simulation. The anneals of a chain start hotter the longer its best layout has stood (`Reheat`, for the anneals
+// that have all the moves they can use): at the base temperature the chain finds nothing better round after round once it
+// has reached its local best. The ordinary chain
 // and the motif chains keep their own record of margins and their own temperature, so that the ordinary chain does the
 // same with or without motifs.
 //
@@ -405,11 +406,13 @@ const HEAT_PER_STALE_ITERATION = 0.25;
 const MAX_HEAT = 8;
 
 /**
- * How hot the next anneal starts. Once the loop has found its best placement, annealing from it at the base
- * temperature (2 % of its cost) finds nothing better round after round (Processor: 76 of 122 iterations of a 60 s run
- * built a layout that was no smaller, 20 more found no better placement). Every such iteration of a chain therefore
- * raises its temperature, a quarter of the base each, to 8 times at most, and a new best layout of the chain brings it back. On Processor and
- * Smelter Row runs of 30 s (8 seeds each) the mean footprint came out 9 % and 6 % lower.
+ * How hot the next anneal starts. Once a chain has found its best placement, annealing from it at the base temperature
+ * (2 % of its cost) finds nothing better round after round (Processor: 76 of 122 iterations of a 60 s run built a layout
+ * that was no smaller, 20 more found no better placement; the best layout of a 60 s run was the one of 30 s). Every
+ * such iteration of a chain therefore raises its temperature, a quarter of the base each, to 8 times at most, and a new
+ * best layout of the chain brings it back (`annealHeat` leaves out the anneals that are short of moves). Over 8 seeds of
+ * 60 s (six runs at once) the mean footprint came out 12 % lower for the Processor (805 to 705 tiles) and 8 % lower for the
+ * Smelter Row (463 to 424); a gentler reheat (a tenth per iteration, to 3 times) gained 1 % and 5 %.
  */
 export class Reheat {
   private stale = 0;
@@ -428,6 +431,16 @@ export class Reheat {
   improved(): void {
     this.stale = 0;
   }
+}
+
+/**
+ * The factor on the base temperature for an anneal that would like `wanted` moves and may have `cap` (see
+ * `MAX_ITERS_PER_MACHINE`). Only an anneal that is capped, one that could use more time than it is given, is reheated:
+ * a hotter anneal needs more moves to cool down, and a Quantum Chip anneal that the time limits to a fraction of the
+ * moves it could use (2M of 4.6M) comes out worse, not better, from a higher start.
+ */
+export function annealHeat(reheat: Reheat, wanted: number, cap: number): number {
+  return wanted >= cap ? reheat.heat() : 1;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -675,7 +688,10 @@ export function* solveSteps(
     reheat: Reheat,
   ): { annealed: Placement } | { error: string } => {
     const slotMs = clamp((opts.timeBudgetMs - elapsed()) * SLICE_SHARE, MIN_SLICE_MS, MAX_SLICE_MS);
-    const iterations = Math.round(clamp(slotMs * itersPerMs, MIN_ITERS, Math.max(MIN_ITERS, netlist.machines.length * MAX_ITERS_PER_MACHINE)));
+    const wanted = slotMs * itersPerMs;
+    const cap = Math.max(MIN_ITERS, netlist.machines.length * MAX_ITERS_PER_MACHINE);
+    const iterations = Math.round(clamp(wanted, MIN_ITERS, cap));
+    const heat = annealHeat(reheat, wanted, cap);
     const annealStarted = now();
     let annealed: Placement;
     try {
@@ -683,7 +699,7 @@ export function* solveSteps(
         netlist,
         data,
         start,
-        { margin, seed, iterations, startTemp: Math.max(START_TEMP_SHARE * reheat.heat() * startCost, COST_EPS), weights },
+        { margin, seed, iterations, startTemp: Math.max(START_TEMP_SHARE * heat * startCost, COST_EPS), weights },
         improveStop,
       );
     } catch (err) {
