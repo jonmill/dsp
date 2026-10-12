@@ -27,8 +27,9 @@ import type {
 const EPS = 1e-9;
 
 /**
- * Spare machine capacity every stage is sized with (`PlanRequest.machineHeadroom`): a stage that `ceil(exact)` machines
- * would run above 99 % gets one more. A stage with under 1 % of slack swings around the simulator's 0.99 output gate
+ * Spare machine capacity every stage is sized with (`PlanRequest.machineHeadroom`): a stage gets `ceil(exact × (1 + headroom))`
+ * machines, so one that `ceil(exact)` machines would run above 99 % gets at least one more (a large stage gets more than one,
+ * as the headroom is a share of its machine count). A stage with under 1 % of slack swings around the simulator's 0.99 output gate
  * (Plasma Refining for a Quantum Chip: 5.977 machines on 6), and a factory that only works some of the time is no plan.
  */
 export const DEFAULT_MACHINE_HEADROOM = 0.01;

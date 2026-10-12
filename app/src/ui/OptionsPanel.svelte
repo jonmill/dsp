@@ -142,9 +142,10 @@
         <span class="muted">%</span>
       </label>
       <p class="hint">
-        A stage that would keep less than this much of its machines spare gets one more machine: at 1 %, any stage that
-        would run above 99 % busy. That keeps the output from swinging around the plan rate. 0 sizes every stage to its
-        exact need. The building count you ask for stays as it is.
+        A stage that would keep less than this much of its machines spare gets at least one more machine: it gets
+        ceil(exact need × (1 + headroom)) machines, so at 1 % any stage that would run above 99 % busy gets another, and a
+        large stage gets more than one. That keeps the output from swinging around the plan rate. 0 sizes every stage to
+        its exact need. The building count you ask for stays as it is.
       </p>
     </fieldset>
 

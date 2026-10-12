@@ -31,7 +31,8 @@ export interface PlanRequest {
   /**
    * Spare machine capacity as a fraction of what a stage needs (0.01 = 1 %); defaults to
    * `DEFAULT_MACHINE_HEADROOM`. A stage is sized `ceil(exact * (1 + headroom))`, so any stage that
-   * `ceil(exact)` machines would run above `1 / (1 + headroom)` (99 % at the default) gets one more.
+   * `ceil(exact)` machines would run above `1 / (1 + headroom)` (99 % at the default) gets at least one more machine:
+   * `ceil(exact * (1 + headroom))`; a large stage gets more than one.
    * The stage that `quantity.kind === 'buildings'` pins keeps the count the user asked for.
    */
   machineHeadroom?: number;
