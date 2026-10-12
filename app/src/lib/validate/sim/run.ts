@@ -47,13 +47,14 @@ export interface SimOptions {
    * `WarmupNotSettled` and nothing is measured. A run
    * that does settle before the cap warms up for exactly as long as it would without it and measures the same, so a
    * layout it passes is one that the run without the cap passes too. The warm-up that `acceptable` asks for never goes
-   * beyond it either. Ignored when `warmupTicks` is given.
+   * beyond a cap below `MAX_WARMUP_TICKS` either; at `MAX_WARMUP_TICKS` or more it is limited by `MAX_FILL_WARMUP_TICKS`
+   * alone. Ignored when `warmupTicks` is given.
    */
   warmupCapTicks?: number;
   /**
    * Whether a result needs no more waiting (for `validateLayout`: that it passes). Asked once, after the measurement that
    * follows the adaptive warm-up. When it says no and the block is still filling, the run warms up on (no verdict in between)
-   * until it is not or `MAX_FILL_WARMUP_TICKS` (or `warmupCapTicks`, if less) is reached, and then measures again as it did
+   * until it is not or `MAX_FILL_WARMUP_TICKS` (or a `warmupCapTicks` below `MAX_WARMUP_TICKS`, if less) is reached, and then measures again as it did
    * the first time: that measurement is the result. A block is still filling if the total of what its belts and machines
    * hold grew in each of the last two windows of 36000 ticks by more than its jitter allows (see `stillFilling`). Omitted: the
    * first measurement stands. Ignored when `warmupTicks` is given.
@@ -391,7 +392,9 @@ export function runSimulation(
     // A start-up still going on has not been judged. The window just measured was warm-up as far as the next one is concerned;
     // the run warms up on, a window at a time, while the total stored in belts and machines keeps growing and the limit allows,
     // and then measures as it did the first time. That measurement is the result: no window in between is looked at.
-    const limit = Math.min(MAX_FILL_WARMUP_TICKS, opts.warmupCapTicks ?? Infinity);
+    // A cap of MAX_WARMUP_TICKS or more is no cap here either (see `SimOptions.warmupCapTicks`).
+    const cap = opts.warmupCapTicks !== undefined && opts.warmupCapTicks < MAX_WARMUP_TICKS ? opts.warmupCapTicks : Infinity;
+    const limit = Math.min(MAX_FILL_WARMUP_TICKS, cap);
     let used = warmupTicksUsed + measureTicks;
     if (stillFilling(stored) && used + FILL_STEP_TICKS <= limit) {
       do {

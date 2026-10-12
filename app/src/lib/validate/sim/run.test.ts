@@ -4,7 +4,7 @@ import type { Layout } from '../../geometry';
 import { checkSimulation } from '../report';
 import { codesOf, fixtureData, fixtureEffects, ITEM, LayoutKit, line, only, onNode, onSlot, planOf, refineryLayout, smelterRowLayout, stationConfig, stationPairLayout } from '../testkit';
 import { ABORT_CHECK_TICKS, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, runSimulation, SimulationAborted, stillFilling, WarmupNotSettled } from './run';
-import type { SimResult } from './run';
+import type { SimOptions, SimResult } from './run';
 
 const TPS = 60;
 const FAST = { warmupTicks: 1800, measureTicks: 3600 };
@@ -275,18 +275,22 @@ describe('runSimulation: a start-up that is still going on', () => {
     expect(stillFilling([])).toBe(false);
   });
 
-  it('never goes past warmupCapTicks, however much is still filling; without a cap it does', () => {
+  it('a cap below MAX_WARMUP_TICKS limits the extension of a block that is still filling; MAX_WARMUP_TICKS or more is no cap', () => {
+    // 5.8/s is what the six smelters make beside the decoy, so the adaptive warm-up settles in its first windows and the
+    // store (full at 200000 ticks) is what is still filling when the measurement has been taken
     const row = decoyRow(200);
-    const uncapped = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: (r) => passes(r, row) });
-    expect(uncapped.warmupTicksUsed).toBeGreaterThan(150000);
-    // a cap of MAX_WARMUP_TICKS or more is no cap for the adaptive warm-up (it does not give up), but the extension keeps to it
-    const capped = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { warmupCapTicks: 150000, acceptable: (r) => passes(r, row) });
-    expect(capped.warmupTicksUsed).toBeLessThanOrEqual(150000);
-    expect(capped.warmupTicksUsed).toBeGreaterThan(MAX_WARMUP_TICKS);
-    expect(passes(capped, row)).toBe(false); // still short of the store: it was not allowed to wait
+    row.plan.exports = [{ itemId: 1101, perSecond: 5.8 }];
+    const never = (): boolean => false; // always asks for more waiting
+    const run = (opts: SimOptions): SimResult => runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: never, ...opts });
+    const uncapped = run({});
+    expect(uncapped.warmupTicksUsed).toBeGreaterThan(200000);
+    // a cap that lets one 36000-tick step in (the warm-up and the measurement take about 25000) and not a second
+    const capped = run({ warmupCapTicks: 66000 });
+    expect(capped.warmupTicksUsed).toBeLessThanOrEqual(66000);
+    expect(capped.warmupTicksUsed).toBeGreaterThan(36000);
     expect(capped).toEqual(plainAt(row, capped.warmupTicksUsed));
-    const tight = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { warmupCapTicks: MAX_WARMUP_TICKS, acceptable: (r) => passes(r, row) });
-    expect(tight.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
+    // at MAX_WARMUP_TICKS the adaptive warm-up does not give up, and the extension is not limited either
+    for (const cap of [MAX_WARMUP_TICKS, MAX_WARMUP_TICKS + 3600, 150000]) expect(run({ warmupCapTicks: cap }), `cap ${cap}`).toEqual(uncapped);
   }, 60_000);
 
   it('is not fooled by a rate that swings about the gate: only the one measurement after the warm-up is the verdict', () => {
