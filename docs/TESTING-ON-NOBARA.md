@@ -36,9 +36,15 @@ cd dsp
 git checkout feat/planner
 ```
 
-**Node 22** (`.nvmrc` pins it; 22.13 or newer is needed). Check with `node --version`. If `sudo dnf install nodejs` gives
-you something older or newer than 22, use [nvm](https://github.com/nvm-sh/nvm): after installing it, `nvm install` in the
-repository root reads `.nvmrc`.
+**Node 22** (`.nvmrc` pins it; 22.13 or newer is needed):
+
+```bash
+sudo dnf install nodejs npm
+node --version        # must print v22.13 or newer in the v22 series
+```
+
+If it prints another major version, use [nvm](https://github.com/nvm-sh/nvm) instead: after installing it, `nvm install` in
+the repository root reads `.nvmrc`.
 
 **Python 3.11 or newer** (`python3 --version`; Nobara ships a recent one).
 
@@ -72,7 +78,9 @@ pip install -e 'tools/extract[game,dev]'
 ```
 
 Run `source tools/extract/.venv/bin/activate` again in every new shell before `dsp-extract`. The `game` extra (UnityPy and
-TypeTreeGeneratorAPI) is what reads the game; without it the command stops at once and prints the install command.
+TypeTreeGeneratorAPI) is what reads the game; without it the command stops at once (exit 3) and prints
+`pip install 'dsp-extract[game]'`. That hint does not work from a checkout: run `pip install -e 'tools/extract[game,dev]'`
+in the activated environment, as above.
 
 **The app's packages**:
 
@@ -131,15 +139,42 @@ for the developer only.)
 **What a good run ends with** (the "dsp-extract result" block):
 
 ```
-Game version: 0.10.xx.xxxxx
+Game version: 0.10.xx.xxxxx, Steam build NNNNNNN
 Wrote .../data/dsp-<gameVersion>.json (N items, N recipes, N techs, N buildings)
 Building geometry: N extracted, M approximate
 Code constants read from the game: ...
-Fingerprints (.../data/fingerprints.json): written (N methods)
+Fingerprints (.../data/fingerprints.json): written (19 methods)
+Drift: 0 changed, 0 missing, 19 new (mirrored game methods)
+  new     AssemblerComponent.InternalUpdate -> app/src/lib/validate/sim/machine.ts
+  new     AssemblerComponent.UpdateNeeds -> app/src/lib/validate/sim/machine.ts
+  new     BlueprintData.Export -> app/src/lib/blueprint/codec.ts
+  new     BlueprintData.Import -> app/src/lib/blueprint/codec.ts
+  new     BuildTool_Click.CheckBuildConditions -> app/src/lib/validate/geometry-checks.ts
+  new     BuildTool_Inserter.CheckBuildConditions -> app/src/lib/geometry/sorter-rules.ts
+  new     BuildTool_Path.CheckBuildConditions -> app/src/lib/validate/geometry-checks.ts
+  new     CargoPath.TryInsertItem -> app/src/lib/validate/sim/belt.ts
+  new     CargoPath.TryInsertItemAtHeadAndFillBlank -> app/src/lib/validate/sim/belt.ts
+  new     CargoPath.TryPickItem -> app/src/lib/validate/sim/belt.ts
+  new     CargoPath.TryPickItemAtRear -> app/src/lib/validate/sim/belt.ts
+  new     CargoPath.Update -> app/src/lib/validate/sim/belt.ts
+  new     InserterComponent.InternalUpdate -> app/src/lib/validate/sim/sorter.ts
+  new     LabComponent.InternalUpdateAssemble -> app/src/lib/validate/sim/machine.ts
+  new     MD5F.Compute -> app/src/lib/blueprint/md5f.ts
+  new     PowerSystem.GameTick -> app/src/lib/validate/sim/world.ts
+  new     SpraycoaterComponent.InternalUpdate -> app/src/lib/validate/sim/coater.ts
+  new     StationComponent.UpdateInputSlots -> app/src/lib/validate/sim/station.ts
+  new     StationComponent.UpdateOutputSlots -> app/src/lib/validate/sim/station.ts
 Icons: N exported to .../app/public/icons
 Blueprints: N copied to .../app/test/fixtures/blueprints/game
 Report: 0 errors, K warnings -> .../local/extract-report.json
 ```
+
+The `, Steam build NNNNNNN` is there when the Steam manifest was found. If the version line instead ends with "(no GameConfig
+version: this is the Steam build id ...)", `ilspycmd` did not run: install it and run again. The **Drift block** is what the
+first run looks like: `data/fingerprints.json` is committed empty (`{}`), so every game method the app re-implements is
+reported as `new` and recorded. That is not drift. The count is the number of those methods the decompile found (19 when
+every game class decompiled; fewer, with a warning in the report, otherwise). From the second run on the line reads
+`Drift: 0 changed, 0 missing, 0 new` unless the game changed. Commit `data/fingerprints.json` after the first run.
 
 "approximate" geometry means a building whose collider or slot positions the extractor could not read; the summary lists the
 first ten. A few are expected; most of them are not. A line "WARNING: N buildings could not be read from the game prefab" is
@@ -151,7 +186,7 @@ the one to report.
 |---|---|---|
 | 0 | GameData written. | Go on. |
 | 2 | Dyson Sphere Program not found (the message lists everything it searched), or a command line mistake. | Use `--game-dir`. If that fails too, send back what section 6 lists for exit 2. |
-| 3 | Extraction failed and nothing was written: a missing class, key or field (the game version differs from the one the reader was written against), the missing `game` extra, or too many unreadable buildings. Also `--strict` with errors in the report. | Send the report and the terminal output. |
+| 3 | Extraction failed and nothing was written: a missing class, key or field (the game version differs from the one the reader was written against), the missing `game` extra (fix: `pip install -e 'tools/extract[game,dev]'`), or too many unreadable buildings. Also `--strict` with errors in the report. | Send the report and the terminal output. |
 | 4 | The extracted data failed schema validation; nothing was written. | Send the report and the terminal output. |
 | 5 | `--check` found a mirrored game method that changed. | Only after a patch, section 8. |
 
@@ -185,7 +220,16 @@ backend. After a new extraction, stop the server (Ctrl+C) and start it again so 
 the one with the highest game version. Only when there is none does it fall back to `data/fixture/dsp-fixture.json`. The
 top right of the page says which one is in use: "Game 0.10.xx.xxxxx, extracted data" or "..., fixture data". If a data file
 is damaged, or has a `schemaVersion` the app does not know, the page shows "Cannot use game data file <name>" with the
-reason instead of silently using something else; send that text back.
+reason. **It does not fall back to the fixture in that case** (a broken extraction must not be ignored silently), so the page
+stays stuck on that message until the file is fixed or moved. To carry on with the fixture meanwhile, move the extracted
+files out of `data/` from the repository root and restart `npm run dev`:
+
+```bash
+mkdir -p local/aside && mv data/dsp-*.json local/aside/      # data/fingerprints.json stays where it is
+```
+
+(`local/` is gitignored.) Send back the full text of the message, `head -c 600 local/aside/dsp-*.json`, the output of the
+extraction run that wrote the file, and `local/extract-report.json`.
 
 **Using it**
 
@@ -230,7 +274,9 @@ close to the equator as you can: the planner assumes a grid tile of 1.2566 m, wh
 game can refuse a blueprint pasted in the wrong band. Find flat, open ground (the larger blocks need hundreds of
 tiles; the Quantum Chip block would need far more than that, so start small). Make sure the buildings the plan uses are
 unlocked in that save, and that the app's technology selection matches it. The block carries Tesla towers; connect one to
-a power source (a few generators are enough for the small blocks; the app's Validation panel shows the power it draws).
+a power source sized by the power figures in the app's Validation panel (steady and peak; the plan table shows an estimate
+before you solve). The peak includes the stations charging: 12 MW for each Planetary Logistics Station and 60 MW for each
+Interstellar one.
 
 **Getting a blueprint into the game.** Either:
 
@@ -239,20 +285,31 @@ a power source (a few generators are enough for the small blocks; the app's Vali
 - press **Download .txt**, and put the file into the game's Blueprint folder (the path in section 2) so that the blueprint
   browser lists it.
 
-I wrote this without the game at hand, so the button names and hotkeys may differ a little in your version. Under Proton
-the clipboard usually works between a native browser and the game; if the game says the clipboard holds no blueprint, use the file
-route (I have not verified that the browser lists a file dropped in by hand; tell me which route worked).
+The names of the buttons and hotkeys above are not checked against a running game and may differ a little in your version.
+Under Proton the clipboard usually works between a native browser and the game; if the game says the clipboard holds no
+blueprint, use the file route (that the browser lists a file dropped in by hand is itself unverified). Report which route
+worked in the result sheet (section 6).
 
 **Before measuring.** The block takes its raw materials from its station and delivers its product to it. Open the station:
 the product has a supply slot, every supplied item a demand slot. In sandbox mode put enough of each supplied item into its
-slot (a block that uses 6 Iron Ore per second needs about 3,600 for ten minutes), and do not let anything else take the
-product out (no drones or vessels that demand it).
+slot, and do not let anything else take the product out (no drones or vessels that demand it). A slot holds at most its
+`max`, which the planner writes from the station data: 5000 items for a Planetary Logistics Station and 10000 for an
+Interstellar one. So a supplied item that the block uses at 6 per second empties a 5000-item slot in about 14 minutes (5000 /
+6 = 833 s): top it up during the test, or connect the station to your network so that something keeps it stocked.
+
+**The product slot fills up too.** Nothing takes the product out of its supply slot, so the slot rises to its `max`, the
+station then refuses more and the block stalls. A block that delivers 1 item per second fills a 5000-item slot in about 83
+minutes (3 per second: 28 minutes). Either read the rate early, within the first minutes after the block has filled, or keep
+the product slot below its `max` by taking items out by hand in sandbox mode (or by connecting the station to the network, so
+that another station demands the product). If you take items out between two readings, add them: rate = (second reading -
+first reading + items taken out) / seconds.
 
 **Measuring the output rate.** Let the block run until it is full: all machines busy, belts full. Then read the station's
 stock of the product, wait at least 60 seconds of game time (several minutes is better, and use the game clock, not wall
 time; do not change the game speed), read it again. Rate = difference / seconds. A small block fills in minutes. A large
-one can take hours of game time before its output settles, so for the measured number that you send back, wait at least ten
-game minutes after the block is full.
+one can take hours of game time before its output settles, and its product slot would reach its `max` long before that if
+left alone (3 per second: 28 minutes), so keep emptying it while the block fills, as above. For the measured number that you
+send back, wait at least ten game minutes after the block is full.
 
 ### The three tests, in this order
 
@@ -262,13 +319,45 @@ game minutes after the block is full.
 npm run emit:test-bp
 ```
 
-writes `local/test-blueprints/m0-smelter-row.txt` (the file you paste, one `BLUEPRINT:...` line). It is built by hand from
-the fixture geometry, not by the solver, and describes itself: an Interstellar Logistics Station feeds Iron Ore along a
-belt past three Arc Smelters, each with an input and an output sorter, and the ingots return on a second belt to the
-station; three Tesla towers. Paste it on flat ground and connect a tower to power. Put Iron Ore into the station's ore
-slot. Check that the buildings and belts are positioned and connected as intended (items move on the ore belt, into the
-smelters, out again and into the station, whose Iron Ingot count rises) and measure the ingot rate. Expected: about 3
-ingots per second (three smelters at one ingot per second each). This test mostly exercises checklist items 1, 2, 4 and 5.
+writes `local/test-blueprints/m0-smelter-row.txt` (the file you paste, one `BLUEPRINT:...` line). It is built by hand, not
+by the solver, and always from the fixture geometry, also after the extraction (so it does not change when you extract). The
+app therefore has no preview of it, and the preview of the other blocks does not show which way a belt flows (it shows
+buildings, belts by item, and sorters as arrows from pick to drop). This plan view is the reference. North is up, east is
+right, one cell is one tile; the x numbers are tiles east of the station's centre, the y numbers tiles north of it:
+
+```
+      -15 -14 -13 -12 -11 -10  -9  -8  -7  -6  -5  -4  -3  -2  -1   0
+y=2        T                   T                   T
+y=1        <   <   <   <   <   <   <   <   <   <  <P3 ILS ILS ILS ILS
+               v           v           v
+y=0    #   #   #   #   #   #   #   #   #       >  >P4 ILS ILS ILS ILS
+y=-1   #   3   #   #   2   #   #   1   #       ^      ILS ILS ILS ILS
+y=-2   #   #   #   #   #   #   #   #   #       ^
+               v           v           v
+y=-3       >   >   >   >   >   >   >   >   >   ^
+```
+
+- `ILS`: the Interstellar Logistics Station, centre (0, 0), continuing east. Its slot 1 is Iron Ore (demand) and slot 2 Iron
+  Ingot (supply). Two of its ports are used, both on its west face: **P3**, the north one, is an output port for slot 1
+  (the ore leaves here), **P4**, the south one, an input port (the ingots arrive here; the hand-made blueprint writes
+  storage index 0 on it, see item 5).
+- `<` `>` `^`: belt nodes, pointing the way items flow. The **ore belt** (Mk.I) runs along y = 1 from P3 at (-4, 1) west to
+  (-14, 1) and ends there. The **ingot belt** starts at (-14, -3), flows east along y = -3 to (-5, -3), turns north there
+  (corner 1), runs north to (-5, 0), turns east there (corner 2) and ends in P4 through (-4, 0).
+- `#` and the digits: the three Arc Smelters (3 x 3 tiles, recipe Iron Ingot), `1` at (-8, -1) nearest the station, `2` at
+  (-11, -1), `3` at (-14, -1).
+- `v` between the ore belt and a smelter: an **input sorter** (Mk.I) taking from the ore belt into the smelter's north face.
+  `v` between a smelter and the ingot belt: an **output sorter** (Mk.I, filter Iron Ingot) taking from the smelter's south
+  face onto the ingot belt. Each sorter stands at the east (station-side) end of its smelter's face, 0.8 tile east of the
+  smelter's centre, at x = -7.2, -10.2 and -13.2.
+- `T`: Tesla towers at (-4, 2), (-9, 2) and (-14, 2).
+
+Paste it on flat ground; **you choose the paste orientation** in the game, so turn the ghost until the station is on the
+east side as drawn (or compare after turning your screenshot; see item 1). Connect a tower to power. Put Iron Ore into the
+station's ore slot. Check that the buildings and belts are positioned and connected as the figure shows (ore flows west out
+of P3, each input sorter feeds its smelter, the output sorters put the ingots on the south belt, the ingots flow east round
+both corners into P4, and the station's Iron Ingot count rises) and measure the ingot rate. Expected: about 3 ingots per
+second (three smelters at one ingot per second each). This test mostly exercises checklist items 1, 2, 4 and 5.
 
 **B. One Circuit Board per second.** In the app: target Circuit Board, Rate 1 /s, proliferator None, everything else at the
 defaults; Solve; copy the blueprint; paste. Put Iron Ore and Copper Ore into the station. Expected output: 1 Circuit Board
@@ -294,7 +383,8 @@ These cover the checklist items that the three tests cannot (build them after A 
 - **More than one station** (item 8): any plan that says "2 stations" in the plan table, for example the Processor with
   Mk.III above.
 - **Dense motifs** (item 12): any of the above again with the motif box ticked.
-- **Interstellar station** (item 6): Test B again with the station kind set to Interstellar.
+- **Interstellar station** (item 6): Test B again with the station kind set to Interstellar, and the two-station Processor with
+  Mk.III (above) once more with it, to see an Interstellar station as the second one.
 
 ## 5. Unverified conventions — please check in game
 
@@ -304,14 +394,23 @@ say so rather than guessing. In "send back", "the blueprint" always means the `.
 best taken from above with the app's layout preview next to it.
 
 **1. Yaw and axis convention** (every block; test A shows it best).
-- Look at: whether buildings and belts face the way the app's layout preview shows. Compare orientation of the
-  smelters/assemblers, which side each sorter is on, the direction belts flow and which side of the station the ports are.
-  The planner measures yaw clockwise from north, with x east and y north.
-- Right: the pasted block is the preview, same orientation. Wrong: the whole block is rotated by 90, 180 or 270 degrees, or
-  mirrored, or some building types (belts, sorters) disagree with others.
-- Send back: the blueprint, a screenshot of the game and of the preview, and which way it is off. The fix is one function
-  (`prefabToGrid`), so an exact description (for example "rotated 90 degrees clockwise" or "mirrored east-west") is what
-  makes it a one-line change.
+- Look at: the **relative arrangement**, not the absolute orientation. You choose how the blueprint is turned when you place
+  it, so a block that is turned as a whole (by 90, 180 or 270 degrees) is **not** a fault: turn the ghost, or your screenshot,
+  until it reads like the reference, then compare. For test A the reference is the plan view above: with the station on the
+  east, the ore belt is the north row and flows west, the ingot belt the south row and flows east and then north, the input
+  sorters are on the smelters' north faces and the output sorters on their south faces, all at the end nearest the station,
+  and P3 (ore, output) is the northern of the two ports on the station's west face. For the generated blocks the reference is
+  the app's layout preview (north up; boxes are buildings, arrows are sorters, belts are lines, belt flow is not shown): which
+  side of each machine its sorters are on, which side of the station the ports are, which way the machines are turned
+  relative to one another. The planner measures yaw clockwise from north, with x east and y north.
+- Right: after turning the block as a whole, it is the reference. Wrong: a mirror image (with the station on the east, the ore
+  belt on the south row, or the sorters on the far end of the smelters), a belt flowing the wrong way, or one kind of piece
+  turned differently from the rest (for example the belts and sorters as in the reference but the station or the machines
+  quarter-turned relative to them).
+- Send back: the blueprint, a screenshot of the game and (for B and C) of the preview, and which relative difference you see.
+  The fix is one function (`prefabToGrid`), so an exact description (for example "mirrored: the ore belt is south of the
+  smelters when the station is east" or "the station is rotated 90 degrees clockwise relative to the smelters") is what makes
+  it a one-line change.
 
 **2. Corner belts** (test A has two corners on the ingot belt; every block has more).
 - Look at: each place a belt turns. The planner turns a corner belt to the bisector of the incoming and outgoing headings.
@@ -350,8 +449,13 @@ best taken from above with the app's layout preview next to it.
 - Look at: the same things as item 5, plus that every slot's local and remote logic are equal, and that the belt stubs at the
   station's ports (two extra belt records between the station and the first node) connect, as they do at a Planetary
   station.
-- Right: it behaves like the Planetary one. Wrong: ports that do not connect at the Interstellar station only.
-- Send back: as item 5.
+- Also, with the same Interstellar setting, a plan that needs two stations (the Processor with Mk.III proliferator): the
+  second station is an Interstellar one as well. In the data an Interstellar station has 5 item slots and 12 ports; open
+  it and check that its slots (remote logic equal to local logic on each) and its ports are what the blueprint should have
+  given it, not only the first station's.
+- Right: it behaves like the Planetary one. Wrong: ports that do not connect at the Interstellar station only, a second
+  station that lacks slots or ports, or with a slot count or port count other than the first.
+- Send back: as item 5, for each station.
 
 **7. By-products and pooled slots** (the Plasma Refining block; the Quantum Chip block made from raw materials).
 - Look at: the Hydrogen from the Plasma Refining refineries arrives at an input port of the station, into a slot that is a
@@ -382,16 +486,29 @@ best taken from above with the app's layout preview next to it.
 - Send back: a screenshot of a lab's panel, the blueprint.
 
 **10. Spray coaters** (proliferator set to Mk.I, Mk.II or Mk.III).
-- Look at: the coaters on the item belts. The planner assumes: the proliferator belt passes through the top of each coater,
-  at a point 1.25 m behind it and one level (1.33 m) above the item belt; that proliferator belt runs at that raised level
-  and crosses the item belts at a right angle; and a coater may face either way on belts flowing in either direction. In
-  the one real sample no sorter stands closer than 3.2 tiles to a coater, but the planner lets another net's sorter stand 1
-  to 2 tiles beside a coater's body, which may be too close for the game.
+- Look at: the coaters on the item belts. The planner assumes:
+  - **(a) The top passage.** The proliferator belt passes through the top of each coater, at a point 1.25 m behind it and one
+    level (1.33 m) above the item belt. That proliferator belt runs at that raised level and crosses the item belts at a
+    right angle. This is what the one real sample shows; whether the game reads the belt at exactly that point is not known.
+  - **(b) Either way round.** A coater may face either way on belts flowing in either direction.
+  - **(c) Facings other than yaw 180.** All eight coaters of the one real sample are turned the same way (yaw 180) on
+    north-south belts. Coaters at the other three facings (yaw 0, and 90 and 270 on east-west belts) exist only through the
+    planner's yaw convention (item 1), so look at one coater of each facing in the block and check that each takes
+    proliferator from the belt behind it.
+  - **(d) Room beside a coater.** In the sample no sorter stands closer than 3.2 tiles to a coater, but the planner lets
+    another net's sorter stand 1 to 2 tiles beside a coater's body, which may be too close for the game.
+  - **(e) A coater near a station.** The planner may put a coater as close as 2 belt nodes from a station's port; nothing in
+    the sample shows a coater near a station.
 - Right: every coater draws proliferator from the belt above it and its output items are sprayed; the raised belt pastes and
-  connects at every crossing; coaters work whichever way they face. Wrong: a coater that shows no proliferator although a
-  belt runs above it; a raised belt that will not connect to a coater; a coater beside another net's sorter that cannot be
-  placed or blocks it.
-- Send back: a screenshot of one working and one failing coater from the side and from above, the blueprint.
+  connects at every crossing; coaters work whichever way they face; a coater beside a sorter, or close to a station port,
+  is built and works. Wrong: a coater that shows no proliferator although a belt runs above it (name its facing); a raised
+  belt that will not connect to a coater; a coater beside another net's sorter, or next to a port, that cannot be placed
+  or blocks it.
+- Open question (an experiment, only if you like; it does not check the planner's output): the planner never runs a
+  proliferator belt **along** a coater's axis over it, because its next node would be inside the coater's body. Whether the
+  game would accept that arrangement is unknown. If you try one by hand, say whether the game lets you build it and
+  whether the coater then takes proliferator from it.
+- Send back: a screenshot of one working and one failing coater from the side and from above (with its facing), the blueprint.
 
 **11. The proliferator feed belt** (same blocks as item 10).
 - Look at: the belt leaves the station's output port flat for two cells, then lifts one level, runs over the item belts
@@ -419,15 +536,17 @@ best taken from above with the app's layout preview next to it.
 
 **14. Approximate geometry.**
 - Look at: building footprints and slot positions come from estimates until the extractor has run. After the extraction
-  regenerate and paste A to C again and compare with the earlier result. The coater rules in particular were tuned on the
-  estimated coater body; redo item 10 on extracted data.
+  regenerate and paste B and C again (and any optional block) and compare with the earlier result. Test A is the exception:
+  `npm run emit:test-bp` always builds from the fixture, so A is the same blueprint before and after the extraction. The
+  coater rules in particular were tuned on the estimated coater body; redo item 10 on extracted data.
 - Right: no overlaps, no gaps in belts. Wrong: buildings overlapping or standing too far apart.
 - Send back: the "Building geometry: N extracted, M approximate" line of the extractor and the buildings it lists, plus a
   screenshot of the error.
 
 **15. Measured output.**
-- Look at: the station's stock of the product, measured as in section 4, for at least ten game minutes after the block is full
-  (large blocks can take hours of game time to fill). Compare with the plan table's rate ("planned") and with the Validation
+- Look at: the station's stock of the product, measured as in section 4 (with the product slot kept below its `max`, which
+  is 5000 for a Planetary station), for at least ten game minutes after the block is full (large blocks can take hours of game
+  time to fill, and need the product slot emptied from time to time while they do). Compare with the plan table's rate ("planned") and with the Validation
   panel's "Capacity (simulated)", which is what the layout should deliver; the layout is built with spare machines, so it
   normally delivers a little more than planned.
 - Right: within 2 % of the simulated capacity (that is the simulator's accuracy target) and never below the planned rate.
@@ -491,11 +610,18 @@ dsp-extract --check
 
 This is the whole extraction again (it writes the new `data/dsp-<gameVersion>.json` too; the app uses the highest version,
 so delete the old file if you do not want it around) plus a comparison of the game methods the app re-implements (belts,
-sorters, stations, machines, labs, spray coaters, power, the blueprint codec ...) with `data/fingerprints.json`. Exit 0
-means nothing changed; exit 5 lists the methods that changed or went missing, with a diff, and the TypeScript module to
-re-check for each. `--check` never rewrites the fingerprints, so you can run it again and see the same drift. Send back the
-output of an exit 5 and `local/extract-report.json`. When the drift is understood, run `dsp-extract` without `--check`: it
-accepts the new fingerprints. Redo sections 3 to 5 on the new data if the patch touched anything you rely on.
+sorters, stations, machines, labs, spray coaters, power, the blueprint codec ...) with `data/fingerprints.json`. Exit 5
+lists the methods that changed or went missing, with a diff, and the TypeScript module to re-check for each. **Exit 0 only
+means "nothing changed" if the summary says `Drift: 0 changed, 0 missing, 0 new`.** Two other exit-0 outcomes compared
+nothing:
+- Without `ilspycmd` (or if it cannot decompile), or if `data/fingerprints.json` cannot be read, there is no Drift line, and
+  the run prints `dsp-extract: --check could not compare the mirrored game methods: fingerprints ...` on stderr and exits 0.
+- With `data/fingerprints.json` still `{}` (no plain extraction has recorded the fingerprints yet; commit the file after the
+  first run, section 2) every method is reported as `new`, which is not drift: `Drift: 0 changed, 0 missing, 19 new`, exit 0.
+
+`--check` never rewrites the fingerprints, so you can run it again and see the same drift. Send back the output of an exit 5
+and `local/extract-report.json`. When the drift is understood, run `dsp-extract` without `--check`: it accepts the new
+fingerprints. Redo sections 3 to 5 on the new data if the patch touched anything you rely on.
 
 ## 9. Known approximations
 
