@@ -337,9 +337,9 @@ y=-2   #   #   #   #   #   #   #   #   #       ^
 y=-3       >   >   >   >   >   >   >   >   >   ^
 ```
 
-- `ILS`: the Interstellar Logistics Station, centre (0, 0), continuing east. Its slot 1 is Iron Ore (demand) and slot 2 Iron
-  Ingot (supply). Two of its ports are used, both on its west face: **P3**, the north one, is an output port for slot 1
-  (the ore leaves here), **P4**, the south one, an input port (the ingots arrive here; the hand-made blueprint writes
+- `ILS`: the Interstellar Logistics Station, centre (0, 0), continuing east. Its first slot ("slot 0" in the in-game blueprint description) is Iron Ore (demand) and its second ("slot 1") Iron
+  Ingot (supply). Two of its three west-face ports are used: **P3**, the north one, is an output port for the ore slot
+  (the ore leaves here), **P4**, the middle one (y = 0), an input port (the ingots arrive here; the hand-made blueprint writes
   storage index 0 on it, see item 5).
 - `<` `>` `^`: belt nodes, pointing the way items flow. The **ore belt** (Mk.I) runs along y = 1 from P3 at (-4, 1) west to
   (-14, 1) and ends there. The **ingot belt** starts at (-14, -3), flows east along y = -3 to (-5, -3), turns north there
@@ -399,7 +399,7 @@ best taken from above with the app's layout preview next to it.
   until it reads like the reference, then compare. For test A the reference is the plan view above: with the station on the
   east, the ore belt is the north row and flows west, the ingot belt the south row and flows east and then north, the input
   sorters are on the smelters' north faces and the output sorters on their south faces, all at the end nearest the station,
-  and P3 (ore, output) is the northern of the two ports on the station's west face. For the generated blocks the reference is
+  and P3 (ore, output) is the northernmost of the station's three west-face ports and P4 (ingots, input) the middle one. For the generated blocks the reference is
   the app's layout preview (north up; boxes are buildings, arrows are sorters, belts are lines, belt flow is not shown): which
   side of each machine its sorters are on, which side of the station the ports are, which way the machines are turned
   relative to one another. The planner measures yaw clockwise from north, with x east and y north.
@@ -454,7 +454,8 @@ best taken from above with the app's layout preview next to it.
   it and check that its slots (remote logic equal to local logic on each) and its ports are what the blueprint should have
   given it, not only the first station's.
 - Right: it behaves like the Planetary one. Wrong: ports that do not connect at the Interstellar station only, a second
-  station that lacks slots or ports, or with a slot count or port count other than the first.
+  station that lacks slots or ports, or with a slot count or port count other than the layout configured for that station (later stations legitimately
+  differ from the first).
 - Send back: as item 5, for each station.
 
 **7. By-products and pooled slots** (the Plasma Refining block; the Quantum Chip block made from raw materials).
