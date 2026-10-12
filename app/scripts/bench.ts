@@ -165,7 +165,8 @@ const DOC_INTRO = `# Solver benchmarks
 Produced by \`npm run bench -- --budget 60 --plans processor,quantum-chip,circuit-board,smelter-row\` (\`app/scripts/bench.ts\`).
 Each row is one plan on one run of the solver with the fixture data, one thread, seed 1 unless the label says otherwise, the
 early stop off (so the whole budget is used), motifs off. Times are wall-clock on the machine that ran it, so compare rows
-of one machine only, and expect a few percent of noise.
+of one machine only. A run does not repeat: the annealer makes as many moves as the time allows, so the footprint of a run
+varies by 10-20 % with the seed and the load; compare means over several \`--seed\`s.
 
 - **First valid**: seconds from the start of \`solve\` to the first layout that passed the full validator (placement, taps,
   routing, power, static checks and the tick simulation). The fallback ladder is not bound by the budget, so this can exceed it.

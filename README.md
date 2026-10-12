@@ -16,7 +16,7 @@ App (`app/`):
 cd app && npm install && npm test && npm run lint && npm run build
 npm run dev     # dev server
 npm run check   # svelte-check
-npm run test:e2e   # slow end-to-end tests (the solver on real plans, the 102-item ladder sweep; about 5 minutes); `npm test` leaves them out
+npm run test:e2e   # slow end-to-end tests (the solver on real plans, the 102-item ladder sweep; about 3 minutes); `npm test` leaves them out
 npm run test:all   # both
 npm run emit:test-bp   # hand-made in-game test blueprint -> local/test-blueprints/m0-smelter-row.txt
 npm run bench -- --budget 60 --plans processor,quantum-chip,circuit-board,smelter-row   # solver benchmark; appends rows to docs/benchmarks.md
