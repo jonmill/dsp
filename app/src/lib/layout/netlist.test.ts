@@ -5,8 +5,10 @@ import { allTechs, computeTechEffects, GameDataIndex } from '../data';
 import type { TechEffects } from '../data';
 import { beltCapacity, sorterRate } from '../validate/capacity';
 import { loadFixtureGameData } from '../../../test/fixtures/fixtureGameData';
-import { buildNetlist, netCapacity, sortersNeeded } from './netlist';
+import { buildNetlist, netCapacity, pooledImbalances, sortersNeeded } from './netlist';
 import type { BeltNet, Netlist } from './netlist';
+import { Rng } from './rng';
+import { pooledPlan } from './testkit';
 
 const parsed = loadFixtureGameData();
 const data = new GameDataIndex(parsed);
@@ -272,6 +274,11 @@ function expectSound(nl: Netlist, plan: ProductionPlan, effects: TechEffects, ma
     for (const input of m.inputs) expect(tapRate(m.id, input.itemId, 'in')).toBeCloseTo(input.perSecond, 7);
     for (const output of m.outputs) expect(tapRate(m.id, output.itemId, 'out')).toBeCloseTo(output.perSecond, 7);
   }
+
+  // a station that takes in an item the plan also imports gives it out at least as fast (else its slot fills and blocks the producers)
+  expect(pooledImbalances(nl)).toEqual([]);
+  // an item has one slot on a station, whatever number of its nets end there
+  for (const st of nl.stations) expect(new Set(st.slots.map((x) => x.itemId)).size).toBe(st.slots.length);
 
   // stations: slot and port limits, every station net lands on a station that has its item
   for (const st of nl.stations) {
@@ -1063,3 +1070,149 @@ describe('buildNetlist: the proliferator net (Task 28)', () => {
   });
 });
 
+
+describe('buildNetlist: what a station takes in of an imported and made item, it gives out (Task 29, carry 1)', () => {
+  const X = IRON_INGOT;
+  const piled = { ...allEffects, stationPilerLevel: 4 };
+  const perStation = (nl: Netlist): { stationIdx: number; imports: number; sinks: number }[] =>
+    nl.stations.map((_, stationIdx) => ({
+      stationIdx,
+      imports: sum(netsOf(nl, X).filter((n) => n.source.kind === 'station' && n.source.stationIdx === stationIdx).map((n) => n.rate)),
+      sinks: sum(netsOf(nl, X).filter((n) => n.sink.kind === 'station' && n.sink.stationIdx === stationIdx).map((n) => n.rate)),
+    }));
+
+  it('finds a station that takes in more than it gives out, and one that does not', () => {
+    const net = (id: number, source: BeltNet['source'], sink: BeltNet['sink'], rate: number): BeltNet => ({
+      id, itemId: X, tierItemId: 2001, rate, source, sink, taps: [],
+    });
+    const slot = (localLogic: 1 | 2) => ({ itemId: X, localLogic, remoteLogic: 0 as const, max: 5000 });
+    const station = (localLogic: 1 | 2) => ({ kind: 'planetary' as const, buildingItemId: PLS, slots: [slot(localLogic)], portsNeeded: 0 });
+    const nets = [
+      net(1, { kind: 'station', stationIdx: 0 }, { kind: 'deadEnd' }, 5),
+      net(2, { kind: 'taps' }, { kind: 'station', stationIdx: 0 }, 3),
+      net(3, { kind: 'station', stationIdx: 1 }, { kind: 'deadEnd' }, 1),
+      net(4, { kind: 'taps' }, { kind: 'station', stationIdx: 1 }, 1.5),
+    ];
+    expect(pooledImbalances({ nets, stations: [station(2), station(2)] })).toEqual([
+      { stationIdx: 1, itemId: X, inflow: 1.5, outflow: 1 },
+    ]);
+    // an export slot is drained from outside: what it takes in is not a surplus
+    expect(pooledImbalances({ nets, stations: [station(2), station(1)] })).toEqual([]);
+    // the same nets with the ends moved to other stations, as a port assignment could
+    expect(
+      pooledImbalances({ nets, stations: [station(2), station(2)] }, [
+        { netId: 1, end: 'source', stationIdx: 0 },
+        { netId: 2, end: 'sink', stationIdx: 1 },
+      ]),
+    ).toEqual([{ stationIdx: 1, itemId: X, inflow: 3, outflow: 0 }]);
+  });
+
+  // Cases found by the random search below that the first dealing of the nets (import nets in runs of near-equal size, the
+  // sinks to the group with the most import rate left) did not balance, and what balanced them.
+  const FOUND: {
+    name: string;
+    consumers: { machines: number; rate: number }[];
+    producers: number;
+    made: number;
+    piler: number;
+    importNets: number;
+    stationsWithX: number;
+  }[] = [
+    {
+      // 12 sinks of 1.5/s, imports of 20 and 1: the 12th sink could only go to the station of the 1/s import
+      name: 'a small import net next to a big one: 12 sinks of 1.5/s, imports of 20/s and 1/s',
+      consumers: [{ machines: 2, rate: 20 }, { machines: 1, rate: 1 }],
+      producers: 24,
+      made: 18,
+      piler: 4,
+      importNets: 3,
+      stationsWithX: 2,
+    },
+    {
+      name: 'import nets of 23.3, 13.7, 4, 4, 4 and 6 /s dealt by rate',
+      consumers: [{ machines: 3, rate: 35 }, { machines: 7, rate: 14 }, { machines: 1, rate: 6 }],
+      producers: 44,
+      made: 39,
+      piler: 4,
+      importNets: 6,
+      stationsWithX: 3,
+    },
+    {
+      // imports of 27/s and 9/s cannot drain 17 sinks on 2 stations (the 27/s station has 11 ports left for 13 sinks, the 9/s
+      // one takes 4): the 27/s import is cut into two nets of 13.5/s, and the stations balance
+      name: 'two consumers of 27/s and 9/s and 17 sinks: the big import is cut into one more net',
+      consumers: [{ machines: 1, rate: 27 }, { machines: 1, rate: 9 }],
+      producers: 33,
+      made: 32,
+      piler: 4,
+      importNets: 3,
+      stationsWithX: 2,
+    },
+    {
+      name: 'more stations than the ports ask for: one more group balances',
+      consumers: [{ machines: 2, rate: 3 }, { machines: 5, rate: 7 }, { machines: 1, rate: 26 }],
+      producers: 38,
+      made: 21,
+      piler: 4,
+      importNets: 5,
+      stationsWithX: 3,
+    },
+    {
+      name: 'groups of one item that fit one station share its slot',
+      consumers: [{ machines: 1, rate: 32 }, { machines: 2, rate: 7 }, { machines: 10, rate: 8 }],
+      producers: 29,
+      made: 35,
+      piler: 1,
+      importNets: 8,
+      stationsWithX: 2,
+    },
+  ];
+  it.each(FOUND)('$name', ({ consumers, producers, made, piler, importNets, stationsWithX }) => {
+    const plan = pooledPlan(consumers, producers, made);
+    const fx = { ...allEffects, stationPilerLevel: piler };
+    const nl = buildNetlist(plan, data, fx, { maxMachinesPerNet: 2 });
+    expect(pooledImbalances(nl)).toEqual([]);
+    for (const { imports, sinks } of perStation(nl)) expect(sinks).toBeLessThanOrEqual(imports + 1e-9);
+    expect(netsOf(nl, X).filter((n) => n.source.kind === 'station')).toHaveLength(importNets);
+    expect(nl.stations.filter((st) => st.slots.some((x) => x.itemId === X))).toHaveLength(stationsWithX);
+    // every station that takes the item in also has an import net of it, and the totals are the plan's
+    expect(sum(netsOf(nl, X).filter((n) => n.source.kind === 'station').map((n) => n.rate))).toBeCloseTo(sum(consumers.map((c) => c.rate)), 7);
+    expect(sum(netsOf(nl, X).filter((n) => n.sink.kind === 'station').map((n) => n.rate))).toBeCloseTo(made, 7);
+    expectSound(nl, plan, fx, 2);
+    expect(buildNetlist(plan, data, fx, { maxMachinesPerNet: 2 })).toEqual(nl);
+  });
+
+  it('keeps an imported and made item that fits one station on that station, imports first', () => {
+    const plan = pooledPlan([{ machines: 3, rate: 12 }], 6, 5);
+    const nl = buildNetlist(plan, data, piled);
+    const withX = nl.stations.filter((st) => st.slots.some((x) => x.itemId === X));
+    expect(withX).toHaveLength(1);
+    const [only] = perStation(nl).filter(({ imports, sinks }) => imports + sinks > 0 && sinks > 0);
+    expect(only.sinks).toBeCloseTo(5, 9);
+    expect(only.imports).toBeCloseTo(12, 9);
+  });
+
+  it('holds for random plans: 1 to 3 consumer stages, 5 to 44 producers, 2 to 4 taps per net, belts with and without the piler', () => {
+    const rng = new Rng(7);
+    let multi = 0;
+    for (let t = 0; t < 120; t++) {
+      const consumers = Array.from({ length: 1 + rng.int(3) }, () => ({ machines: 1 + rng.int(10), rate: 2 + rng.int(40) }));
+      const total = consumers.reduce((n, c) => n + c.rate, 0);
+      const made = Math.max(1, Math.floor(total * (0.3 + 0.6 * rng.next())));
+      const plan = pooledPlan(consumers, 5 + rng.int(40), made);
+      const maxTaps = 2 + rng.int(3);
+      const fx = { ...allEffects, stationPilerLevel: rng.int(2) === 0 ? 1 : 4 };
+      const nl = buildNetlist(plan, data, fx, { maxMachinesPerNet: maxTaps });
+      const label = `plan ${t} (${JSON.stringify(consumers)}, made ${made}, ${maxTaps} taps, piler ${fx.stationPilerLevel})`;
+      expect(pooledImbalances(nl), label).toEqual([]);
+      for (const st of nl.stations) {
+        expect(st.portsNeeded, label).toBeLessThanOrEqual(12);
+        expect(new Set(st.slots.map((x) => x.itemId)).size, label).toBe(st.slots.length);
+      }
+      if (nl.stations.filter((s) => s.slots.some((x) => x.itemId === X)).length > 1) multi++;
+      expectSound(nl, plan, fx, maxTaps);
+    }
+    // the sweep reaches the multi-station case, or it proves nothing
+    expect(multi).toBeGreaterThan(20);
+  });
+});

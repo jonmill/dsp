@@ -3,8 +3,8 @@ import { buildingDef, buildingOBBs, LEVEL, pointInOBBs, portInfos, slotInfos, so
 import type { PlacedBuilding, Yaw } from '../geometry';
 import { checkCapacity, sorterRate } from '../validate/capacity';
 import { fixtureData, patchBuilding, planOf, planStage } from '../validate/testkit';
-import { netStack } from './netlist';
-import type { Netlist } from './netlist';
+import { buildNetlist, netStack, pooledImbalances } from './netlist';
+import type { Netlist, StationEnd } from './netlist';
 import { constructivePlacement, placementBuildingIdOf, stationBuildingId } from './placement';
 import type { Placement } from './placement';
 import { defaultRouteParams, routeNets } from './router';
@@ -18,6 +18,7 @@ import {
   layoutOf,
   occupancyOf,
   PLS,
+  pooledPlan,
   processorNetlist,
   spanOnePoints,
   synthNetlist,
@@ -724,5 +725,60 @@ describe('assignTaps: the proliferator net (Task 28)', () => {
     const port = ok(assignTaps(net, placement, occupancyOf(placement.buildings), data, effects)).stationPorts.find((p) => p.netId === feed.id);
     // the machines stand east of the column of stations
     expect(port?.dir).toEqual([1, 0]);
+  });
+});
+
+describe('assignTaps: ports across several stations (Task 29)', () => {
+  /** The station ends the assigned ports give the nets: the port's station building, as the netlist's station index. */
+  const endsOfPorts = (net: Netlist, res: TapAssignment): StationEnd[] =>
+    res.stationPorts.map((p) => ({
+      netId: p.netId,
+      end: p.end,
+      stationIdx: net.stations.findIndex((_, i) => stationBuildingId(i) === p.stationBuildingId),
+    }));
+
+  it('keeps every net end on the station the netlist gave it, one port each, and what a station takes in of an imported and made item it also gives out', () => {
+    // 18 X/s made by 24 producers on 12 sink nets, imports of 2 and 0.1 X/s: 15 nets on 2 stations (see netlist.test.ts)
+    const plan = pooledPlan([{ machines: 2, rate: 2 }, { machines: 1, rate: 0.1 }], 24, 1.8);
+    const net = buildNetlist(plan, data, effects, { maxMachinesPerNet: 2 });
+    expect(net.stations.filter((s) => s.slots.some((x) => x.itemId === 1101)).length).toBeGreaterThanOrEqual(2);
+    const placement = constructivePlacement(net, data, 3);
+    const res = ok(assignTaps(net, placement, occupancyOf(placement.buildings), data, effects));
+
+    const want = net.nets.flatMap((n) => [
+      ...(n.source.kind === 'station' ? [`${n.id}/source/${n.source.stationIdx}`] : []),
+      ...(n.sink.kind === 'station' ? [`${n.id}/sink/${n.sink.stationIdx}`] : []),
+    ]);
+    expect(endsOfPorts(net, res).map((e) => `${e.netId}/${e.end}/${e.stationIdx}`).sort()).toEqual(want.sort());
+    const taken = res.stationPorts.map((p) => `${p.stationBuildingId}:${p.port}`);
+    expect(new Set(taken).size).toBe(taken.length);
+    expect(pooledImbalances(net, endsOfPorts(net, res))).toEqual([]);
+  });
+
+  it('judges the ports it assigned: a netlist that takes in more than it gives out does not get past the port assignment', () => {
+    const plan = pooledPlan([{ machines: 2, rate: 2 }, { machines: 1, rate: 0.1 }], 24, 1.8);
+    const net = buildNetlist(plan, data, effects, { maxMachinesPerNet: 2 });
+    expect(pooledImbalances(net)).toEqual([]);
+    // station 1 takes 6 sinks of 0.15 X/s and gives 1 X/s out: a 7th sink from station 0 is more than it drains
+    const moved = net.nets.find((n) => n.itemId === 1101 && n.source.kind === 'taps' && n.sink.kind === 'station' && n.sink.stationIdx === 0);
+    if (!moved) throw new Error('the netlist has no sink net on station 0');
+    const crowded: Netlist = { ...net, nets: net.nets.map((n) => (n === moved ? { ...n, sink: { kind: 'station', stationIdx: 1 } } : n)) };
+    expect(pooledImbalances(crowded).map((b) => b.stationIdx)).toEqual([1]);
+    const placement = constructivePlacement(crowded, data, 3);
+    expect(() => assignTaps(crowded, placement, occupancyOf(placement.buildings), data, effects)).toThrow(/gives out/);
+  });
+
+  it('the proliferator slot is on one station, which holds the feed\'s port, whatever number of stations there are', async () => {
+    const net = await processorNetlist(1, { tier: 3, mode: 'extra' });
+    expect(net.stations.length).toBeGreaterThanOrEqual(2);
+    const feed = net.nets.find((n) => n.proliferator);
+    if (!feed || feed.source.kind !== 'station') throw new Error('the netlist has no proliferator net');
+    const holders = net.stations.flatMap((s, i) => (s.slots.some((x) => x.itemId === feed.itemId) ? [i] : []));
+    expect(holders).toEqual([feed.source.stationIdx]);
+    const placement = constructivePlacement(net, data, 3);
+    const res = ok(assignTaps(net, placement, occupancyOf(placement.buildings), data, effects));
+    expect(res.stationPorts.filter((p) => p.netId === feed.id).map((p) => p.stationBuildingId)).toEqual([stationBuildingId(holders[0])]);
+    // no other net of that item has a port anywhere else
+    expect(new Set(res.stationPorts.filter((p) => net.nets.find((n) => n.id === p.netId)?.itemId === feed.itemId).map((p) => p.stationBuildingId)).size).toBe(1);
   });
 });

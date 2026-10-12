@@ -7,7 +7,7 @@ import { allTechs, computeTechEffects, GameDataIndex } from '../data';
 import type { TechEffects } from '../data';
 import { buildingDef, slotInfos } from '../geometry';
 import type { Layout, PlacedBuilding } from '../geometry';
-import { planOf } from '../validate/testkit';
+import { planOf, planStage } from '../validate/testkit';
 import { loadFixtureGameData } from '../../../test/fixtures/fixtureGameData';
 import { assembleLayout } from './assemble';
 import { buildNetlist } from './netlist';
@@ -142,6 +142,52 @@ export async function quantumPlan(
 /** The netlist of `quantumPlan`. */
 export async function quantumNetlist(): Promise<Netlist> {
   return buildNetlist(await quantumPlan(), data, effects);
+}
+
+/**
+ * A hand-made plan in which Iron Ingot (the item X) is both imported and made: consumer stages (`machines` machines taking
+ * `rate` X/s in all, Mk.I assemblers) and a stage of `producers` machines that makes `made` X/s, shared out over the
+ * consumers in proportion to their demand; the rest of their demand is imported. Gear, made by the first consumer stage, is
+ * the export. Planetary stations, so a station holds 4 items. Build its netlist with a small `maxMachinesPerNet` to get many
+ * nets, and so several stations.
+ */
+export function pooledPlan(consumers: { machines: number; rate: number }[], producers: number, made: number): ProductionPlan {
+  const X = 1101;
+  const GEAR = 1201;
+  const total = consumers.reduce((n, c) => n + c.rate, 0);
+  const flows: ProductionPlan['flows'] = [];
+  let left = made;
+  consumers.forEach((c, i) => {
+    const take = i === consumers.length - 1 ? left : Math.min(left, (made * c.rate) / total);
+    left -= take;
+    if (take > 1e-9) flows.push({ itemId: X, from: consumers.length, to: i, perSecond: take });
+    if (c.rate - take > 1e-9) flows.push({ itemId: X, from: 'import', to: i, perSecond: c.rate - take });
+  });
+  flows.push({ itemId: GEAR, from: 0, to: 'export', perSecond: 1 });
+  const stages = [
+    ...consumers.map((c, i) =>
+      planStage(5, {
+        buildingItemId: ASSEMBLER,
+        machines: c.machines,
+        exactMachines: c.machines,
+        inputs: [{ itemId: X, perSecond: c.rate }],
+        outputs: i === 0 ? [{ itemId: GEAR, perSecond: 1 }] : [],
+      }),
+    ),
+    planStage(5, { buildingItemId: ASSEMBLER, machines: producers, exactMachines: producers, outputs: [{ itemId: X, perSecond: made }] }),
+  ];
+  const plan = planOf(stages);
+  return {
+    ...plan,
+    request: { ...plan.request, targetItemId: GEAR, stationKind: 'planetary' },
+    flows,
+    imports: [{ itemId: X, perSecond: total - made }],
+    exports: [{ itemId: GEAR, perSecond: 1 }],
+    stationSlots: [
+      { itemId: X, role: 'import' },
+      { itemId: GEAR, role: 'export' },
+    ],
+  };
 }
 
 /** A hand-made netlist of `count` machines of `building` (ids 1..count) and the given nets. */

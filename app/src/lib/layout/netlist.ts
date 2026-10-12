@@ -40,11 +40,15 @@
 // The window ends are floats from running sums, so spans closer than `EPS` count as touching.
 //
 // Stations. Each net that starts or ends at a station uses one port of it. Slots are handed out in the order target,
-// imports by rate, proliferator, by-products; a station is full at `maxItemKinds` slots or 12 ports. An item that is
-// imported and made keeps the nets that end at the station on the same stations as the nets that start there (a
-// station's stock of it only drains through its own output ports): its nets are dealt into groups that each hold at
-// least one import net, and if the sink nets need more stations than there are import nets, the import is cut into
-// more nets (consumers of the import are split between them).
+// imports by rate, proliferator, by-products; a station is full at `maxItemKinds` slots or 12 ports. An item has one slot
+// on a station, whatever number of its nets end there. An item that is imported and made keeps the nets that end at the
+// station on the same stations as the nets that start there (a station's stock of it only drains through its own output
+// ports): its nets are dealt into groups that each hold at least one import net, and the sinks of a group are no more
+// than its imports give out: a station takes in no more of the item than it supplies to consumers, or its slot would fill
+// (the simulator does not model station stock, so this holds by construction, and `pooledImbalances` is the check). If no
+// dealing of the nets balances, or the sink nets need more stations than there are import nets, the import is cut into
+// more nets (consumers of the import are split between them). The groups of one item that land on one station share its
+// slot.
 import type { ItemRate, ProductionPlan, StationSlotDemand } from '../calc';
 import { proliferatorItemId } from '../calc/proliferator';
 import type { GameDataIndex, TechEffects } from '../data';
@@ -116,6 +120,61 @@ export interface Netlist {
   motifs?: NetlistMotifs;
 }
 
+/** A belt end at a station: which net, which end of it, and the index of the station in `Netlist.stations`. */
+export interface StationEnd {
+  netId: number;
+  end: 'source' | 'sink';
+  stationIdx: number;
+}
+/** A station that takes in more of an item than it gives out, in items/s. */
+export interface PooledBalance {
+  stationIdx: number;
+  itemId: number;
+  /** What the nets that end at the station put into the item's slot. */
+  inflow: number;
+  /** What the nets that start at the station take out of it, to their consumers. */
+  outflow: number;
+}
+
+/** The station ends the nets have (`source.stationIdx`, `sink.stationIdx`). */
+export function stationEnds(nets: readonly BeltNet[]): StationEnd[] {
+  const ends: StationEnd[] = [];
+  for (const n of nets) {
+    if (n.source.kind === 'station') ends.push({ netId: n.id, end: 'source', stationIdx: n.source.stationIdx });
+    if (n.sink.kind === 'station') ends.push({ netId: n.id, end: 'sink', stationIdx: n.sink.stationIdx });
+  }
+  return ends;
+}
+
+/**
+ * The stations that take in more of an item than they give out. Only a slot with demand logic (an import: the plan's
+ * stock of it comes from outside and is drawn by consumers) is held to it; an export slot is drained from outside, by
+ * vessels and drones. A station that takes in an item its consumers draw from it at a lower rate fills its slot, and the
+ * producers behind the sink back up; the simulator does not model station stock, so only this check sees it. `ends` are
+ * the belt ends to judge (default: the nets' own), so a port assignment can be judged too.
+ */
+export function pooledImbalances(
+  netlist: Pick<Netlist, 'nets' | 'stations'>,
+  ends: readonly StationEnd[] = stationEnds(netlist.nets),
+): PooledBalance[] {
+  const netById = new Map(netlist.nets.map((n) => [n.id, n]));
+  const flows = new Map<string, PooledBalance>();
+  for (const { netId, end, stationIdx } of ends) {
+    const net = netById.get(netId);
+    if (!net || net.proliferator) continue;
+    const imports = netlist.stations[stationIdx]?.slots.some((s) => s.itemId === net.itemId && s.localLogic === 2);
+    if (!imports) continue;
+    const key = `${stationIdx}/${net.itemId}`;
+    const flow = flows.get(key) ?? { stationIdx, itemId: net.itemId, inflow: 0, outflow: 0 };
+    if (end === 'sink') flow.inflow += net.rate;
+    else flow.outflow += net.rate;
+    flows.set(key, flow);
+  }
+  return [...flows.values()]
+    .filter((f) => f.inflow > EPS && f.inflow > f.outflow * (1 + REL_EPS) + EPS)
+    .sort((a, b) => a.stationIdx - b.stationIdx || a.itemId - b.itemId);
+}
+
 const BELT_TIERS = [2001, 2002, 2003] as const;
 const SORTER_TIERS = [2011, 2012, 2013, 2014] as const;
 const STATION_ITEM = { planetary: 2103, interstellar: 2104 } as const;
@@ -130,6 +189,8 @@ const STATION_PORTS = 12;
 /** Items/s below which a rate counts as zero (float noise from running sums). */
 const EPS = 1e-9;
 const REL_EPS = 1e-9;
+/** The most nets an import is cut into on top of the ones the port count needs, to make its stations balance. */
+const MAX_BALANCE_SPLITS = 64;
 
 /** Cargo stack on a net's belt: the station stack when it starts at a station port, else 1 (as the validator has it). */
 export function netStack(stationSourced: boolean, effects: TechEffects): number {
@@ -347,32 +408,102 @@ function splitWindows(windows: Cut[], consumers: Span[], count: number): void {
   }
 }
 
+/** The nets of an imported and made item that go to each station together, as indices into the rates given. */
+interface PooledDealing {
+  imports: number[][];
+  sinks: number[][];
+}
+
+/** Does every group's import give out at least what its sinks take in, and does every group have an import? */
+function balancedDealing(d: PooledDealing, importRates: number[], sinkRates: number[]): boolean {
+  const total = (rates: number[], idx: number[]): number => idx.reduce((n, i) => n + rates[i], 0);
+  return d.imports.every((list, g) => {
+    if (list.length === 0) return false;
+    const inflow = total(sinkRates, d.sinks[g]);
+    return inflow <= total(importRates, list) * (1 + REL_EPS) + EPS;
+  });
+}
+
+/**
+ * Deals the nets of an item that is imported and made among `groups` stations: import nets in runs of near-equal size,
+ * each sink net (in net order) to the group with the most import rate left over its sink rate that still has a free port.
+ */
+function dealByRuns(importRates: number[], sinkRates: number[], groups: number): PooledDealing | undefined {
+  const imports: number[][] = Array.from({ length: groups }, () => []);
+  const sinks: number[][] = Array.from({ length: groups }, () => []);
+  let next = 0;
+  for (let g = 0; g < groups; g++) {
+    const size = Math.floor(importRates.length / groups) + (g < importRates.length % groups ? 1 : 0);
+    for (let k = 0; k < size; k++) imports[g].push(next++);
+  }
+  const spare = imports.map((list) => list.reduce((n, i) => n + importRates[i], 0));
+  sinkRates.forEach((rate, j) => {
+    let best = -1;
+    for (let g = 0; g < groups; g++) {
+      if (imports[g].length + sinks[g].length >= STATION_PORTS) continue;
+      if (best < 0 || spare[g] > spare[best]) best = g;
+    }
+    if (best < 0) return;
+    sinks[best].push(j);
+    spare[best] -= rate;
+  });
+  return sinks.reduce((n, list) => n + list.length, 0) === sinkRates.length ? { imports, sinks } : undefined;
+}
+
+/**
+ * Deals them by rate: the biggest import net first, each to the group with the least import rate so far (at most
+ * `ceil(imports / groups)` import nets to a group, so that the ports are left for the sinks), then the biggest sink first
+ * to the group with the most import rate left over its sink rate that still has a free port.
+ */
+function dealByRate(importRates: number[], sinkRates: number[], groups: number): PooledDealing | undefined {
+  const imports: number[][] = Array.from({ length: groups }, () => []);
+  const sinks: number[][] = Array.from({ length: groups }, () => []);
+  const spare = new Array<number>(groups).fill(0);
+  const perGroup = Math.ceil(importRates.length / groups);
+  const byRate = (rates: number[]): number[] => rates.map((_, i) => i).sort((a, b) => rates[b] - rates[a] || a - b);
+  for (const i of byRate(importRates)) {
+    let best = -1;
+    for (let g = 0; g < groups; g++) {
+      if (imports[g].length >= perGroup) continue;
+      if (best < 0 || spare[g] < spare[best]) best = g;
+    }
+    imports[best].push(i);
+    spare[best] += importRates[i];
+  }
+  for (const j of byRate(sinkRates)) {
+    let best = -1;
+    for (let g = 0; g < groups; g++) {
+      if (imports[g].length + sinks[g].length >= STATION_PORTS) continue;
+      if (best < 0 || spare[g] > spare[best]) best = g;
+    }
+    if (best < 0) return undefined;
+    sinks[best].push(j);
+    spare[best] -= sinkRates[j];
+  }
+  imports.forEach((list) => list.sort((a, b) => a - b));
+  sinks.forEach((list) => list.sort((a, b) => a - b));
+  return { imports, sinks };
+}
+
 /**
  * Deals the nets of an item that is imported and made among stations. A station that takes the producers' nets ends
  * them in the item's slot, which only drains through an output port of the same station; so each group gets import
- * nets and sink nets together. As few groups as the 12 ports allow, import nets dealt in runs of near-equal size, each
- * sink net to the group with the most import rate left over its sink rate that still has a free port.
+ * nets and sink nets together, and with `balanced` (the item's slot is an import) the sinks of a group take in no more
+ * than its import nets give out. As few groups as the 12 ports allow; of the ways to deal them the first that balances
+ * wins, the dealing in runs of near-equal size before the one by rate, so that a plan that balanced before is dealt as
+ * it was. Without `balanced` (an export slot that is also drawn from: the proliferator that is the target) the first
+ * dealing in runs is the answer. `undefined` when no dealing of these nets balances.
  */
-function groupPooledNets(imports: BeltNet[], sinks: BeltNet[]): BeltNet[][] {
-  const groups = Math.max(1, Math.ceil((imports.length + sinks.length) / STATION_PORTS));
-  const dealt: BeltNet[][] = Array.from({ length: groups }, () => []);
-  let next = 0;
-  for (let g = 0; g < groups; g++) {
-    const size = Math.floor(imports.length / groups) + (g < imports.length % groups ? 1 : 0);
-    dealt[g] = imports.slice(next, next + size);
-    next += size;
-  }
-  const spare = dealt.map((list) => list.reduce((n, net) => n + net.rate, 0));
-  for (const sink of sinks) {
-    let best = -1;
-    for (let g = 0; g < groups; g++) {
-      if (dealt[g].length >= STATION_PORTS) continue;
-      if (best < 0 || spare[g] > spare[best]) best = g;
+function dealPooled(importRates: number[], sinkRates: number[], balanced: boolean): PooledDealing | undefined {
+  const minGroups = Math.max(1, Math.ceil((importRates.length + sinkRates.length) / STATION_PORTS));
+  if (!balanced) return dealByRuns(importRates, sinkRates, minGroups);
+  for (let groups = minGroups; groups <= importRates.length; groups++) {
+    for (const deal of [dealByRuns, dealByRate]) {
+      const dealing = deal(importRates, sinkRates, groups);
+      if (dealing && balancedDealing(dealing, importRates, sinkRates)) return dealing;
     }
-    dealt[best].push(sink);
-    spare[best] -= sink.rate;
   }
-  return dealt;
+  return undefined;
 }
 
 /** Slot demands in the order stations are filled: target, imports by rate, proliferator, by-products. */
@@ -507,12 +638,32 @@ export function buildNetlist(
     return { spec, producers, consumers, stack: netStack(spec.stationSourced, effects), windows };
   });
   // An item that is imported and made: each station that takes the producers' nets also needs an import net of the item
-  // to drain it (see `groupPooledNets`), and a station has 12 ports, so there must be at least one import net per 11
-  // sink nets.
+  // to drain it (see `dealPooled`), and a station has 12 ports, so there must be at least one import net per 11 sink
+  // nets. And when the item's slot is an import, the dealing of its nets among stations has to balance (a station takes
+  // in no more than it gives out); if no dealing of these windows does, the import is cut into one more net, and again.
+  // The dealing that balances the windows is the one the nets get (`pooledDealings`).
+  const roleOf = new Map(plan.stationSlots.map((s) => [s.itemId, s.role]));
+  const pooledDealings = new Map<number, PooledDealing>();
   for (const made of planned) {
     const imported = planned.find((p) => p.spec.stationSourced && p.spec.itemId === made.spec.itemId);
     if (made.spec.stationSourced || !imported) continue;
     splitWindows(imported.windows, imported.consumers, Math.ceil(made.windows.length / (STATION_PORTS - 1)));
+    if (roleOf.get(made.spec.itemId) !== 'import') continue;
+    const widths = (windows: Cut[]): number[] => windows.map((w) => w.to - w.from);
+    for (let splits = 0; ; splits++) {
+      const dealing = dealPooled(widths(imported.windows), widths(made.windows), true);
+      if (dealing) {
+        pooledDealings.set(made.spec.itemId, dealing);
+        break;
+      }
+      if (splits >= MAX_BALANCE_SPLITS) {
+        throw new Error(
+          `netlist: no dealing of the ${imported.windows.length} import and ${made.windows.length} sink nets of ` +
+            `${itemName(data, made.spec.itemId)} among stations lets each give out what it takes in (a split bug)`,
+        );
+      }
+      splitWindows(imported.windows, imported.consumers, imported.windows.length + 1);
+    }
   }
 
   const nets: BeltNet[] = [];
@@ -594,7 +745,6 @@ export function buildNetlist(
     return station;
   };
 
-  const roleOf = new Map(plan.stationSlots.map((s) => [s.itemId, s.role]));
   const netsOfItem = new Map<number, BeltNet[]>();
   for (const net of nets) {
     const imported = net.source.kind === 'station';
@@ -633,24 +783,36 @@ export function buildNetlist(
     // groups of nets that go to one station together: an imported and made item keeps its sinks with its imports
     const groups: BeltNet[][] = [];
     if (imports.length > 0 && sinks.length > 0) {
-      groups.push(...groupPooledNets(imports, sinks));
+      const dealing = pooledDealings.get(itemId) ?? dealPooled(imports.map((n) => n.rate), sinks.map((n) => n.rate), false);
+      if (!dealing) throw new Error(`netlist: the nets of ${itemName(data, itemId)} cannot be dealt among stations (a grouping bug)`);
+      dealing.imports.forEach((list, g) => groups.push([...list.map((i) => imports[i]), ...dealing.sinks[g].map((j) => sinks[j])]));
     } else {
       for (let at = 0; at < itemNets.length; at += STATION_PORTS) groups.push(itemNets.slice(at, at + STATION_PORTS));
       if (groups.length === 0) groups.push([]);
     }
     for (const group of groups) {
-      // a new station when the slot or the ports would overflow
-      if (!current || current.slots.length >= stationSpec.maxItemKinds || current.portsNeeded + group.length > STATION_PORTS) {
+      // a new station when the slot or the ports would overflow; a station that has the item's slot already (a group of
+      // the item went there) takes another group of it without a second slot
+      const holds = current?.slots.some((s) => s.itemId === itemId) ?? false;
+      if (!current || (!holds && current.slots.length >= stationSpec.maxItemKinds) || current.portsNeeded + group.length > STATION_PORTS) {
         current = newStation();
       }
-      current.slots.push({ ...slot });
-      const stationIdx = stations.length - 1;
+      if (!current.slots.some((s) => s.itemId === itemId)) current.slots.push({ ...slot });
+      const stationIdx = stations.indexOf(current);
       for (const net of group) {
         if (net.source.kind === 'station') net.source = { kind: 'station', stationIdx };
         else net.sink = { kind: 'station', stationIdx };
       }
       current.portsNeeded += group.length;
     }
+  }
+  const unbalanced = pooledImbalances({ nets, stations });
+  if (unbalanced.length > 0) {
+    const [first] = unbalanced;
+    throw new Error(
+      `netlist: station ${first.stationIdx} takes in ${+first.inflow.toFixed(3)} ${itemName(data, first.itemId)}/s and gives out ` +
+        `${+first.outflow.toFixed(3)}/s, so its slot would fill (a grouping bug)`,
+    );
   }
   while (stations.length < plan.stationsNeeded) newStation();
   if (stations.length > plan.stationsNeeded) {

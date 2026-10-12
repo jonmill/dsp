@@ -393,3 +393,72 @@ describe('assembleLayout: the proliferator network (Task 28)', () => {
   });
 });
 
+
+describe('assembleLayout: several stations (Task 29)', () => {
+  // 1 Quantum Chip/s from Processors and what a Plane Filter is made of: Titanium Crystal, Graphene and Hydrogen for the
+  // Casimir Crystals, Titanium Glass. Six items on a Planetary Logistics Station, which holds four: two stations.
+  const multiPlan = () => planFor({ targetItemId: 1305, suppliedItemIds: new Set([1303, 1119, 1118, 1123, 1120]) });
+
+  it('gives each station its own config: its slots, a port for every net end on it, the slot of the net\'s item', async () => {
+    const plan = await multiPlan();
+    expect(plan.stationsNeeded).toBe(2);
+    const s = solve(plan);
+    expect(s.net.stations).toHaveLength(2);
+    const stations = s.layout.buildings.filter((b) => b.station);
+    expect(stations.map((b) => b.id)).toEqual([stationBuildingId(0), stationBuildingId(1)]);
+
+    stations.forEach((b, i) => {
+      const cfg = b.station!;
+      expect(cfg.slots).toEqual(s.net.stations[i].slots);
+      expect(new Set(cfg.slots.map((x) => x.itemId)).size).toBe(cfg.slots.length);
+      expect(cfg.ports).toHaveLength(12);
+      const configured = cfg.ports.filter((p) => p.dir !== 0);
+      expect(configured).toHaveLength(s.net.stations[i].portsNeeded);
+      for (const [port, p] of cfg.ports.entries()) {
+        if (p.dir === 0) {
+          expect(p.storageIdx).toBe(0);
+          continue;
+        }
+        // the belt on this port carries the item of the slot the port points at
+        const belt = s.layout.belts.find((x) =>
+          p.dir === 1 ? x.source?.buildingId === b.id && x.source.port === port : x.sink?.kind === 'port' && x.sink.buildingId === b.id && x.sink.port === port,
+        );
+        expect(belt, `station ${i} port ${port}`).toBeDefined();
+        expect(cfg.slots[p.storageIdx - 1].itemId).toBe(belt!.itemId);
+      }
+    });
+    // every item of the plan's station slots sits on exactly one station
+    const placed = stations.flatMap((b) => b.station!.slots.map((x) => x.itemId));
+    expect([...placed].sort()).toEqual(plan.stationSlots.map((x) => x.itemId).sort());
+    // every belt end at a station has its port in that station's config, once
+    const ends = s.layout.belts.reduce((n, b) => n + (b.source ? 1 : 0) + (b.sink?.kind === 'port' ? 1 : 0), 0);
+    expect(stations.reduce((n, b) => n + b.station!.ports.filter((p) => p.dir !== 0).length, 0)).toBe(ends);
+  });
+
+  it('passes the full validator with the simulation, and the export slot is a supply, the imports are demands', async () => {
+    const plan = await multiPlan();
+    const { layout } = solve(plan);
+    const report = validateLayout(layout, plan, data, effects);
+    expect(violationText(report)).toEqual([]);
+    expect(report.pass).toBe(true);
+    const slots = layout.buildings.flatMap((b) => b.station?.slots ?? []);
+    expect(slots.filter((x) => x.localLogic === 1).map((x) => x.itemId)).toEqual([1305]);
+    expect(slots.filter((x) => x.localLogic === 2)).toHaveLength(5);
+  });
+
+  it('rejects a station with two slots of one item, a port that two nets share, and a port whose item has no slot', async () => {
+    const plan = await multiPlan();
+    const s = solve(plan);
+    const call = (net: Netlist, taps: TapAssignment = s.taps) => () => assembleLayout(net, s.placement, taps, s.routes, s.poles, plan, data);
+    const twice = {
+      ...s.net,
+      stations: s.net.stations.map((st, i) => (i === 0 ? { ...st, slots: [...st.slots, { ...st.slots[0] }] } : st)),
+    };
+    expect(call(twice)).toThrow(/station 0 has two slots for item/);
+    const [first, second] = s.taps.stationPorts.filter((p) => p.stationBuildingId === stationBuildingId(0));
+    const shared = { ...s.taps, stationPorts: s.taps.stationPorts.map((p) => (p === second ? { ...p, port: first.port } : p)) };
+    expect(call(s.net, shared)).toThrow(/port \d+ of building 1 is used by nets \d+ and \d+/);
+    const bare = { ...s.net, stations: s.net.stations.map((st, i) => (i === 1 ? { ...st, slots: st.slots.slice(1) } : st)) };
+    expect(call(bare)).toThrow(/which station 1 has no slot for/);
+  });
+});

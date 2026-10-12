@@ -43,13 +43,15 @@
 //
 // Ports. A net that starts or ends at a station takes one of its 12 ports. A station's nets are matched to its ports
 // greedily by cost: the distance from the port's first lattice point outside to the net's tap centroid, plus a
-// penalty when the port faces away from it.
+// penalty when the port faces away from it. A net keeps the station the netlist gave it (several stations are matched one
+// at a time; the proliferator feed has its one station, the one that holds the proliferator's slot), so what a station
+// takes in of an imported and made item stays what the netlist balanced; the assignment checks it (`pooledImbalances`).
 import type { Building, GameDataIndex, TechEffects } from '../data';
 import { buildingDef, pointInOBBs, portInfos, slotInfos, sorterEndsValid, sorterTapEnds, sorterTapPoint } from '../geometry';
 import type { OBB2, PlacedBuilding, SlotInfo } from '../geometry';
 import { sorterRate } from '../validate/capacity';
-import { netStack } from './netlist';
-import type { BeltNet, NetTap, Netlist } from './netlist';
+import { netStack, pooledImbalances } from './netlist';
+import type { BeltNet, NetTap, Netlist, StationEnd } from './netlist';
 import type { Bounds, Occupancy } from './occupancy';
 import { obbsBounds } from './occupancy';
 import { placementBuildingIdOf, stationBuildingId } from './placement';
@@ -373,6 +375,28 @@ class Assigner {
       }
     }
     this.ports.sort((a, b) => a.netId - b.netId || (a.end === b.end ? 0 : a.end === 'source' ? -1 : 1));
+    this.checkPooledBalance();
+  }
+
+  /**
+   * What a station takes in of an item that the plan also imports, it gives out: judged on the ports as assigned, which sit
+   * on the stations the netlist gave the nets (see `pooledImbalances`). A station whose stock fills only blocks the producers
+   * in game; the simulator does not model it, so a violation is a bug of the netlist and throws.
+   */
+  private checkPooledBalance(): void {
+    const stationIdxOf = new Map(this.net.stations.map((_, i) => [stationBuildingId(i), i]));
+    const ends: StationEnd[] = this.ports.map((p) => ({
+      netId: p.netId,
+      end: p.end,
+      stationIdx: stationIdxOf.get(p.stationBuildingId) ?? -1,
+    }));
+    const [first] = pooledImbalances(this.net, ends);
+    if (first) {
+      throw new Error(
+        `assignTaps: station ${first.stationIdx} takes in ${+first.inflow.toFixed(3)} of item ${first.itemId}/s and gives out ` +
+          `${+first.outflow.toFixed(3)}/s, so its slot would fill (a netlist grouping bug)`,
+      );
+    }
   }
 
   // -------------------------------------------------------------------------------------------

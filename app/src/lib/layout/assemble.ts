@@ -6,6 +6,8 @@
 //  - Slots are the netlist's, with the logic and maximum it set. A port is `dir 1` (output) where a net starts at it,
 //    `dir 2` (input) where a net ends at it and `dir 0` otherwise; `storageIdx` is the 1-based position of the net's
 //    item among the slots. `chargePerTick` is the request's, else the data's default for the station kind. No piler.
+//    With several stations each one gets its own config (the building ids follow the netlist's station indices): a
+//    station's slots cover the item of every port on it, an item has one slot on a station, and a port serves one net.
 // Belts. One per net, with the net's id: the route's nodes, the net's item and tier, and the station ports the tap
 //    assignment gave it as `source` / `sink`. `plannedRate` is the net's rate. The proliferator net (Task 28) is routed
 //    after the others, so a call that is given no route for it leaves it out (the layout of the item nets alone).
@@ -48,12 +50,24 @@ function stationConfig(
     pilerCount: 0,
   };
   const id = stationBuildingId(stationIdx);
+  const seen = new Set<number>();
+  for (const { itemId } of config.slots) {
+    if (seen.has(itemId)) throw new Error(`station ${stationIdx} has two slots for item ${itemId}`);
+    seen.add(itemId);
+  }
+  const portNet = new Map<number, number>();
   for (const p of taps.stationPorts) {
     if (p.stationBuildingId !== id) continue;
     const net = netlist.nets.find((n) => n.id === p.netId);
     if (!net) throw new Error(`station port ${p.port} of building ${id} serves net ${p.netId}, which the netlist does not have`);
     const slot = config.slots.findIndex((s) => s.itemId === net.itemId);
     if (slot < 0) throw new Error(`net ${net.id} carries item ${net.itemId}, which station ${stationIdx} has no slot for`);
+    if (!Number.isInteger(p.port) || p.port < 0 || p.port >= STATION_PORTS) {
+      throw new Error(`net ${net.id} is on port ${p.port} of building ${id}, which has ${STATION_PORTS} ports`);
+    }
+    const other = portNet.get(p.port);
+    if (other !== undefined) throw new Error(`port ${p.port} of building ${id} is used by nets ${other} and ${net.id}`);
+    portNet.set(p.port, net.id);
     config.ports[p.port] = { dir: p.end === 'source' ? 1 : 2, storageIdx: slot + 1 };
   }
   return config;
