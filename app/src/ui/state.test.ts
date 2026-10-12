@@ -5,8 +5,9 @@ import type { PlanResult, ProductionPlan } from '../lib/calc';
 import { decodeBlueprint } from '../lib/blueprint';
 import { allTechs, techClosure } from '../lib/data';
 import type { SolveResult } from '../lib/layout/solver';
-import { compositeLayout } from '../lib/validate/testkit';
+import { compositeLayout, stationPairLayout } from '../lib/validate/testkit';
 import type { Violation } from '../lib/validate';
+import { formatPower } from './format';
 import { blueprintFileName, createAppState, PROFILES_KEY, UNLOCK_ALL_PROFILE } from './state.svelte';
 import type { AppDeps, AppState } from './state.svelte';
 
@@ -861,6 +862,22 @@ describe('solve', () => {
     expect(header.desc).toContain('approximate');
     // The same layout gives the same object: reading it again does not rebuild the string.
     expect(app.blueprint).toBe(bp);
+  });
+
+  it('describes the blueprint with the stations and the power of the layout, not the plan\'s lower bound', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    const plan = okPlan(app.plan);
+    expect(plan.stationsNeeded).toBe(1);
+    // two Interstellar stations (60 MW each) where the plan counted one Planetary one (12 MW)
+    const pair = stationPairLayout();
+    for (const b of pair.kit.buildings) if (b.station) b.station.chargePerTick = 1_000_000;
+    runs[0].callbacks.onImproved?.(pair.kit.layout(), passing, 150);
+    const desc = app.blueprint!.desc;
+    expect(app.blueprint!.error).toBeNull();
+    expect(desc).toContain(', 2 stations, 150 tiles.');
+    // no simulation in the report, so the power line is an estimate, and it has the layout's 120 MW of station charge
+    expect(desc).toContain(`Power (estimate): ${formatPower(plan.power.steadyW + 0.1 * 108e6)} steady, ${formatPower(plan.power.peakW + 108e6)} peak.`);
   });
 
   it('does not flag extracted geometry as approximate', async () => {

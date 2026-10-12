@@ -806,6 +806,12 @@ export function buildNetlist(
       current.portsNeeded += group.length;
     }
   }
+  // the proliferator's slot is on one station, the one its feed starts at (a feed is one net: it has one station to start at)
+  const feed = nets.find((n) => n.proliferator);
+  const holders = feed ? stations.filter((st) => st.slots.some((x) => x.itemId === feed.itemId)).length : 1;
+  if (feed && holders !== 1) {
+    throw new Error(`netlist: the proliferator ${itemName(data, feed.itemId)} has a slot on ${holders} stations, not exactly one`);
+  }
   const unbalanced = pooledImbalances({ nets, stations });
   if (unbalanced.length > 0) {
     const [first] = unbalanced;
@@ -814,11 +820,18 @@ export function buildNetlist(
         `${+first.outflow.toFixed(3)}/s, so its slot would fill (a grouping bug)`,
     );
   }
-  while (stations.length < plan.stationsNeeded) newStation();
+  // The plan's `stationsNeeded` is a lower bound from the item slots, which the slots fill station by station, so the netlist
+  // never has fewer for a plan the calculator made. It is not padded to it: a station with no slot and no port has no place in
+  // a layout (and no belt to power, link or paste). A plan that says more is off, and the netlist says so.
   if (stations.length > plan.stationsNeeded) {
     warnings.push(
       `the netlist needs ${stations.length} stations, the plan predicted ${plan.stationsNeeded}: ` +
         `belt ports (${STATION_PORTS} per station) need more than the item slots do`,
+    );
+  } else if (stations.length < plan.stationsNeeded) {
+    warnings.push(
+      `the netlist needs ${stations.length} station${stations.length === 1 ? '' : 's'}, the plan predicted ${plan.stationsNeeded}: ` +
+        `the plan counted more stations than the item slots fill`,
     );
   }
 

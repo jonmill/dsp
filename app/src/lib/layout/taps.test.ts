@@ -755,7 +755,7 @@ describe('assignTaps: ports across several stations (Task 29)', () => {
     expect(pooledImbalances(net, endsOfPorts(net, res))).toEqual([]);
   });
 
-  it('judges the ports it assigned: a netlist that takes in more than it gives out does not get past the port assignment', () => {
+  it('the pooled-balance guard throws on a hand-tampered netlist (it cannot fire on a netlist buildNetlist made): a sink moved to a station that cannot drain it', () => {
     const plan = pooledPlan([{ machines: 2, rate: 2 }, { machines: 1, rate: 0.1 }], 24, 1.8);
     const net = buildNetlist(plan, data, effects, { maxMachinesPerNet: 2 });
     expect(pooledImbalances(net)).toEqual([]);

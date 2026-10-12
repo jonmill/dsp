@@ -2,7 +2,8 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { allTechs, computeTechEffects, GameDataIndex, parseGameData } from '../data';
-import { coaterPowerW, estimatePower, withCoaters } from './power';
+import type { PlacedBuilding, StationConfig } from '../geometry';
+import { coaterPowerW, estimatePower, layoutStations, withLayout } from './power';
 import type { PlanRequest, ProductionPlan, Stage } from './types';
 
 const fixturePath = fileURLToPath(new URL('../../../../data/fixture/dsp-fixture.json', import.meta.url));
@@ -114,7 +115,8 @@ describe('estimatePower', () => {
   it('puts the coaters of a layout in place of the estimate of one per item: an item on several belts has several', () => {
     const p = estimatePower(plan([stage(4, 4, { proliferated: true })]), data, effects);
     expect(p.coatersW).toBe(2 * 90_000);
-    const laid = withCoaters(p, 5, data);
+    const stations = [{ kind: 'planetary' as const }]; // the plan's one station, at the default charge
+    const laid = withLayout(p, { coaters: 5, stations }, data);
     expect(coaterPowerW(5, data)).toBe(5 * 90_000);
     expect(laid.coatersW).toBe(5 * 90_000);
     expect(laid.steadyW).toBeCloseTo(p.steadyW + 3 * 90_000, 6);
@@ -122,8 +124,52 @@ describe('estimatePower', () => {
     // everything else is the estimate's
     expect({ ...laid, coatersW: 0, steadyW: 0, peakW: 0 }).toEqual({ ...p, coatersW: 0, steadyW: 0, peakW: 0 });
     // the same count gives the same figures back, and none is none
-    expect(withCoaters(p, 2, data)).toEqual(p);
-    expect(withCoaters(p, 0, data).coatersW).toBe(0);
+    expect(withLayout(p, { coaters: 2, stations }, data)).toEqual(p);
+    expect(withLayout(p, { coaters: 0, stations }, data).coatersW).toBe(0);
+  });
+
+  it('takes the station charge from the stations of the layout: a tenth of the difference to the steady power, all of it to the peak', () => {
+    // the plan asks for 1 Planetary Logistics Station (12 MW); the layout has 7 of them
+    const p = estimatePower(plan([stage(4, 4)]), data, effects);
+    expect(p.stationChargeW).toBe(12e6);
+    const laid = withLayout(p, { coaters: 0, stations: Array.from({ length: 7 }, () => ({ kind: 'planetary' as const })) }, data);
+    expect(laid.stationChargeW).toBe(84e6);
+    expect(laid.steadyW).toBeCloseTo(p.steadyW + 0.1 * 72e6, 6);
+    expect(laid.peakW).toBeCloseTo(p.peakW + 72e6, 6);
+    // the layout's own charge counts, a station of the other kind and one without a charge of its own use the kind's default
+    const mixed = withLayout(
+      p,
+      { coaters: 0, stations: [{ kind: 'planetary', chargePerTick: 50_000 }, { kind: 'interstellar', chargePerTick: 500_000 }, { kind: 'interstellar' }] },
+      data,
+    );
+    expect(mixed.stationChargeW).toBe(3e6 + 30e6 + 60e6);
+    // fewer stations than the plan estimated lower it again; the coater and station changes add up
+    const fewer = withLayout(p, { coaters: 3, stations: [] }, data);
+    expect(fewer.stationChargeW).toBe(0);
+    expect(fewer.peakW).toBeCloseTo(p.peakW - 12e6 + 3 * 90_000, 6);
+    expect(fewer.steadyW).toBeCloseTo(p.steadyW - 1.2e6 + 3 * 90_000, 6);
+    // the machines and sorters are the estimate's
+    expect({ ...laid, stationChargeW: 0, steadyW: 0, peakW: 0 }).toEqual({ ...p, stationChargeW: 0, steadyW: 0, peakW: 0 });
+  });
+
+  it('lists the stations of a layout with their kind and charge', () => {
+    const building = (id: number, itemId: number, station?: Partial<StationConfig>): PlacedBuilding => ({
+      id,
+      itemId,
+      x: 0,
+      y: 0,
+      z: 0,
+      yaw: 0,
+      ...(station ? { station: { slots: [], ports: [], chargePerTick: 0, pilerCount: 0, ...station } } : {}),
+    });
+    const layout = {
+      buildings: [building(1, 2103, { chargePerTick: 200_000 }), building(2, 2104, { chargePerTick: 1_000_000 }), building(3, 2303), building(4, 2103, { chargePerTick: 123 })],
+    };
+    expect(layoutStations(layout, data)).toEqual([
+      { kind: 'planetary', chargePerTick: 200_000 },
+      { kind: 'interstellar', chargePerTick: 1_000_000 },
+      { kind: 'planetary', chargePerTick: 123 },
+    ]);
   });
 
   it('steady power adds a tenth of the station charge; peak adds all of it and every machine working', () => {

@@ -4,8 +4,9 @@ import { render } from 'svelte/server';
 import { describe, expect, it, vi } from 'vitest';
 import { loadFixtureGameData } from '../../test/fixtures/fixtureGameData';
 import type { SolveResult } from '../lib/layout/solver';
-import { compositeLayout } from '../lib/validate/testkit';
+import { compositeLayout, stationPairLayout } from '../lib/validate/testkit';
 import type { ValidationReport } from '../lib/validate';
+import { formatPower } from './format';
 import BlueprintPanel from './BlueprintPanel.svelte';
 import OptionsPanel from './OptionsPanel.svelte';
 import PlanTable from './PlanTable.svelte';
@@ -113,13 +114,29 @@ describe('ValidationPanel', () => {
     expect(page).toContain('Spray coaters');
     expect(page).toContain('Used (simulated)');
     // the plan estimate counts the 8 coaters of the layout (one per sprayed belt), not the plan's own one per sprayed item
-    expect(page).toContain('Plan estimate (with the 8 spray coaters of this layout)');
+    expect(page).toContain('Plan estimate (with the 8 spray coaters and the 1 station of this layout)');
     const bare = await appWith(undefined, { ...passing, stage: 'simulation', sim: simulated(1) });
     await bare.finish();
     const plain = html(ValidationPanel, bare.app);
     expect(plain).toContain('Capacity (simulated)');
     expect(plain).not.toContain('Spray coaters');
-    expect(plain).not.toContain('of this layout');
+    expect(plain).toContain('Plan estimate (with the 1 station of this layout)');
+  });
+
+  it('puts the stations of the layout into the plan estimate: the plan counts 1 station, the layout has 2 Interstellar ones (60 MW each)', async () => {
+    const pair = stationPairLayout();
+    for (const b of pair.kit.buildings) if (b.station) b.station.chargePerTick = 1_000_000;
+    const report: ValidationReport = { ...passing, stage: 'simulation', sim: simulated(1) };
+    const { app, finish } = await appWith(pair.kit.layout(), report);
+    await finish();
+    const plan = app.solve.plan!;
+    expect(plan.stationsNeeded).toBe(1);
+    const page = html(ValidationPanel, app);
+    expect(page).toContain('Plan estimate (with the 2 stations of this layout)');
+    // 12 MW for the one station the plan counts becomes 120 MW: peak + 108 MW, steady + 10.8 MW
+    expect(page).toContain(formatPower(plan.power.steadyW + 10.8e6));
+    expect(page).toContain(formatPower(plan.power.peakW + 108e6));
+    expect(page).not.toContain(formatPower(plan.power.peakW) + '<');
   });
 
   it('says PASS with the simulated capacity next to the provisioned rate, and the measured power next to the estimate', async () => {
@@ -222,6 +239,33 @@ describe('PlanTable', () => {
     const plan = app.plan?.ok ? app.plan.plan : null;
     expect(plan!.stages[0].machines).toBe(2);
     expect(html(PlanTable, app)).not.toContain('headroom');
+  });
+
+  it('calls the station count a plan estimate before a solve, and shows the layout\'s once there is one', async () => {
+    const flat = (component: typeof PlanTable, app: AppState): string => html(component, app).replace(/\s+/g, ' ');
+    const { app, finish } = await appWith();
+    const before = flat(PlanTable, app);
+    expect(before).toContain('1 station (plan estimate,');
+    expect(before).not.toContain('in the layout');
+    // the layout has 2 Interstellar stations of 60 MW; the plan counted 1 Planetary one of 12 MW
+    const pair = stationPairLayout();
+    for (const b of pair.kit.buildings) if (b.station) b.station.chargePerTick = 1_000_000;
+    await finish({ layout: pair.kit.layout() });
+    const plan = app.plan?.ok ? app.plan.plan : null;
+    expect(plan!.stationsNeeded).toBe(1);
+    const after = flat(PlanTable, app);
+    expect(after).toContain('2 stations in the layout');
+    expect(after).not.toContain('plan estimate');
+    expect(after).toContain('Station charging (full rate, 2 in the layout)');
+    expect(after).toContain(formatPower(plan!.power.peakW + 108e6));
+    expect(after).toContain(formatPower(120e6));
+    // the plan changes: the layout is for an older plan, and the table goes back to what the plan says
+    app.setQuantity({ kind: 'rate', perSecond: 2 });
+    await app.whenSettled();
+    const later = flat(PlanTable, app);
+    expect(later).toContain('station (plan estimate,');
+    expect(later).not.toContain('in the layout');
+    expect(later).toContain('Station charging (full rate, plan estimate)');
   });
 
   it('shows no capacity when the machines make exactly what was requested', async () => {

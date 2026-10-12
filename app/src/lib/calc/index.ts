@@ -9,7 +9,8 @@ export {
   planProduction,
   plannableProducers,
 } from './plan';
-export { coaterPowerW, estimatePower, withCoaters } from './power';
+export { coaterPowerW, estimatePower, layoutStations, withLayout } from './power';
+export type { LayoutStation } from './power';
 export { canUseExtra, effectFor, proliferatorItemId, spraysPerItem } from './proliferator';
 export type { ProliferatorEffect } from './proliferator';
 export type {

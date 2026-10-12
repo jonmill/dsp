@@ -3,10 +3,12 @@
  * (`constants.ticksPerSecond`). Sorters and spray coaters are not placed yet, so they are estimated
  * from the machine count; the layout's own count replaces them later. The coaters are estimated at one per
  * distinct item that goes into a proliferated stage; a layout has one per belt that carries such an item, and
- * an item that needs more than one belt (or is cut across several) has more, so `withCoaters` puts the
- * layout's count in.
+ * an item that needs more than one belt (or is cut across several) has more. The stations are the plan's
+ * `stationsNeeded`, a lower bound from the item slots; a layout also needs stations for its belt ports. So
+ * `withLayout` puts the layout's coaters and stations in.
  */
 import type { Building, GameDataIndex, TechEffects } from '../data';
+import type { Layout } from '../geometry';
 import type { PowerEstimate, ProductionPlan } from './types';
 
 /** Sorter Mk.III, then Mk.II, then Mk.I. */
@@ -73,12 +75,45 @@ export function coaterPowerW(count: number, data: GameDataIndex): number {
   return count * (coater?.power.workPerTick ?? 0) * data.data.constants.ticksPerSecond;
 }
 
+/** A station of a layout, as far as power goes: which kind, and the charge its config sets (the kind's default when it sets none). */
+export interface LayoutStation {
+  kind: 'planetary' | 'interstellar';
+  chargePerTick?: number;
+}
+
+/** The stations of `layout` (the buildings with a station config), in building order. */
+export function layoutStations(layout: Pick<Layout, 'buildings'>, data: GameDataIndex): LayoutStation[] {
+  return layout.buildings.flatMap((b) =>
+    b.station
+      ? [{ kind: data.building(b.itemId)?.station?.isStellar ? ('interstellar' as const) : ('planetary' as const), chargePerTick: b.station.chargePerTick }]
+      : [],
+  );
+}
+
 /**
- * `power` with the coaters of a layout (`coaters` of them, one per sprayed belt) in place of the plan's estimate of one per
- * sprayed item: the same figures for the machines, sorters and stations, and the steady and peak totals that follow from them.
+ * `power` with what a layout has in place of what the plan estimated: its `coaters` (one per sprayed belt, not one per sprayed
+ * item) and its `stations` (a plan counts the stations its item slots need, a layout also the ones its belt ports need: 7
+ * where the plan said 2). The station charge is the sum of the stations' own charges; the steady total follows by the share of
+ * it that is drawn on average and the peak by all of it. The machines and sorters are the estimate's.
  */
-export function withCoaters(power: PowerEstimate, coaters: number, data: GameDataIndex): PowerEstimate {
-  const coatersW = coaterPowerW(coaters, data);
-  const change = coatersW - power.coatersW;
-  return { ...power, coatersW, steadyW: power.steadyW + change, peakW: power.peakW + change };
+export function withLayout(
+  power: PowerEstimate,
+  layout: { coaters: number; stations: readonly LayoutStation[] },
+  data: GameDataIndex,
+): PowerEstimate {
+  const { ticksPerSecond, stationDefaultChargePerTick } = data.data.constants;
+  const coatersW = coaterPowerW(layout.coaters, data);
+  const stationChargeW = layout.stations.reduce(
+    (sum, s) => sum + (s.chargePerTick ?? stationDefaultChargePerTick[s.kind]) * ticksPerSecond,
+    0,
+  );
+  const coaterChange = coatersW - power.coatersW;
+  const stationChange = stationChargeW - power.stationChargeW;
+  return {
+    ...power,
+    coatersW,
+    stationChargeW,
+    steadyW: power.steadyW + coaterChange + STEADY_STATION_SHARE * stationChange,
+    peakW: power.peakW + coaterChange + stationChange,
+  };
 }

@@ -296,6 +296,11 @@ function expectSound(nl: Netlist, plan: ProductionPlan, effects: TechEffects, ma
   }
   expect(nl.stations.map((s) => s.portsNeeded)).toEqual(portsByStation);
   expect(nl.stations.length).toBeGreaterThanOrEqual(plan.stationsNeeded);
+  // every station has something to do: a slot, and a belt port for it (a station with none has no place in a layout)
+  for (const [i, st] of nl.stations.entries()) {
+    expect(st.slots.length, `station ${i} has a slot`).toBeGreaterThan(0);
+    expect(st.portsNeeded, `station ${i} has a port`).toBeGreaterThan(0);
+  }
   // every slot of the plan exists in some station
   const placed = new Set(nl.stations.flatMap((s) => s.slots.map((x) => x.itemId)));
   for (const slot of plan.stationSlots) expect(placed.has(slot.itemId)).toBe(true);
@@ -893,12 +898,16 @@ describe('buildNetlist: stations', () => {
     expectSound(nl, plan, piled, 2);
   });
 
-  it('pads to the stations the plan asked for', () => {
+  it('does not pad to the stations the plan asked for: a station with no slot and no port has no place in a layout, and the netlist says the plan was off', () => {
     const plan = { ...ingotPlan(), stationsNeeded: 3 };
     const nl = buildNetlist(plan, data, MK1);
-    expect(nl.stations).toHaveLength(3);
-    expect(nl.stations.slice(1).every((s) => s.slots.length === 0 && s.portsNeeded === 0)).toBe(true);
-    expect(nl.warnings.filter((w) => /stations/.test(w))).toEqual([]);
+    expect(nl.stations).toHaveLength(1);
+    expect(nl.stations.every((s) => s.slots.length > 0 && s.portsNeeded > 0)).toBe(true);
+    expect(nl.warnings.filter((w) => /stations/.test(w))).toEqual([
+      'the netlist needs 1 station, the plan predicted 3: the plan counted more stations than the item slots fill',
+    ]);
+    // a plan that is right is not warned about
+    expect(buildNetlist(ingotPlan(), data, MK1).warnings.filter((w) => /stations/.test(w))).toEqual([]);
   });
 
   it('puts an item with more nets than one station has ports on several stations', () => {
@@ -1054,6 +1063,37 @@ describe('buildNetlist: the proliferator net (Task 28)', () => {
     }
     expect(nl.stations.map((s) => s.portsNeeded)).toEqual(portsByStation);
     if (feed?.source.kind === 'station') expect(nl.stations[feed.source.stationIdx].slots.map((s) => s.itemId)).toContain(MK3);
+  });
+
+  it('holds the proliferator\'s slot on exactly one station, the one the feed starts at, however many stations there are', async () => {
+    const plan = await planOf(proliferated());
+    const nl = buildNetlist(plan, data, allEffects);
+    expect(nl.stations.length).toBeGreaterThanOrEqual(2);
+    const feed = nl.nets.find((n) => n.proliferator);
+    if (!feed || feed.source.kind !== 'station') throw new Error('the netlist has no proliferator net');
+    const holders = nl.stations.flatMap((st, i) => (st.slots.some((x) => x.itemId === feed.itemId) ? [i] : []));
+    expect(holders).toEqual([feed.source.stationIdx]);
+  });
+
+  it('throws when the proliferator\'s slot would be on two stations (it is also an import of 16 nets): a feed has one station to start at', () => {
+    // 30 consumers of Mk.III itself (a plan can import what it sprays with) at 2 taps a net: 15 import nets and the feed need 2 stations
+    const plan = synthPlan({
+      stages: [{ machines: 30, inputs: [{ itemId: MK3, perSecond: 30 }], outputs: [{ itemId: GEAR, perSecond: 1 }] }],
+      flows: [
+        { itemId: MK3, from: 'import', to: 0, perSecond: 30 },
+        { itemId: GEAR, from: 0, to: 'export', perSecond: 1 },
+      ],
+      imports: [{ itemId: MK3, perSecond: 30.1 }],
+      exports: [{ itemId: GEAR, perSecond: 1 }],
+      slots: [
+        { itemId: MK3, role: 'proliferator' },
+        { itemId: GEAR, role: 'export' },
+      ],
+    });
+    plan.proliferatorPerSecond = 0.1;
+    plan.request.proliferator = { tier: 3, mode: 'extra' };
+    plan.stages[0].proliferated = true;
+    expect(() => buildNetlist(plan, data, allEffects, { maxMachinesPerNet: 2 })).toThrow(/proliferator.*Mk\.III.*2 stations/i);
   });
 
   it('a plan that makes the proliferator it sprays with (it is the target) still gets its net', async () => {

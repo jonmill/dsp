@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { headroomMachines } from '../lib/calc';
+  import { headroomMachines, layoutStations, withLayout } from '../lib/calc';
   import type { PlanError, ProductionPlan } from '../lib/calc';
   import { provisionedRate } from '../lib/validate/sim/run';
   import { buildingName, formatCount, formatPercent, formatPower, formatRate, itemName } from './format';
@@ -15,6 +15,17 @@
   /** What the plan provisions for the target; the machines are rounded up, so they can make more (`actualTargetRate`). */
   const requested = $derived(plan ? provisionedRate(plan) : 0);
   const hasSpareCapacity = $derived(plan !== null && plan.actualTargetRate > requested * (1 + 1e-9));
+  /**
+   * The stations and spray coaters of the solved layout while it is for this plan. A plan counts the stations its item slots
+   * need and one coater per sprayed item; a layout also needs stations for its belt ports and has a coater per sprayed belt.
+   * Until there is a layout, the figures are the plan's estimates.
+   */
+  const laid = $derived(
+    app.solve.layout && !app.solve.stale
+      ? { coaters: app.solve.layout.coaters?.length ?? 0, stations: layoutStations(app.solve.layout, app.index) }
+      : null,
+  );
+  const power = $derived(plan ? (laid ? withLayout(plan.power, laid, app.index) : plan.power) : null);
 
   const ERROR_TITLES: Record<PlanError['kind'], string> = {
     'target-locked': 'Target is locked',
@@ -37,13 +48,16 @@
   }
 
   function powerParts(plan: ProductionPlan): { label: string; watts: number }[] {
-    const p = plan.power;
+    const p = power ?? plan.power;
     return [
       { label: 'Production (working)', watts: p.productionWorkW },
       { label: 'Production (idle)', watts: p.productionIdleW },
       { label: 'Sorters (estimate)', watts: p.sortersW },
-      { label: 'Spray coaters (estimate)', watts: p.coatersW },
-      { label: 'Station charging (full rate)', watts: p.stationChargeW },
+      { label: laid ? `Spray coaters (${laid.coaters} in the layout)` : 'Spray coaters (estimate)', watts: p.coatersW },
+      {
+        label: laid ? `Station charging (full rate, ${laid.stations.length} in the layout)` : 'Station charging (full rate, plan estimate)',
+        watts: p.stationChargeW,
+      },
     ];
   }
 </script>
@@ -71,8 +85,13 @@
         </span>
         <span class="muted">
           {plan.stages.reduce((n, s) => n + s.machines, 0)} machines,
-          {plan.stationsNeeded} station{plan.stationsNeeded === 1 ? '' : 's'}
-          ({plan.stationSlots.length} item slot{plan.stationSlots.length === 1 ? '' : 's'})
+          {#if laid}
+            {laid.stations.length} station{laid.stations.length === 1 ? '' : 's'} in the layout
+            ({plan.stationSlots.length} item slot{plan.stationSlots.length === 1 ? '' : 's'})
+          {:else}
+            {plan.stationsNeeded} station{plan.stationsNeeded === 1 ? '' : 's'}
+            (plan estimate, {plan.stationSlots.length} item slot{plan.stationSlots.length === 1 ? '' : 's'})
+          {/if}
         </span>
       </div>
     {/if}
@@ -194,11 +213,11 @@
       <div class="totals">
         <div>
           <span class="muted">Steady</span>
-          <strong class="num">{formatPower(plan.power.steadyW)}</strong>
+          <strong class="num">{formatPower((power ?? plan.power).steadyW)}</strong>
         </div>
         <div>
           <span class="muted">Peak</span>
-          <strong class="num">{formatPower(plan.power.peakW)}</strong>
+          <strong class="num">{formatPower((power ?? plan.power).peakW)}</strong>
         </div>
       </div>
       <ul class="parts">

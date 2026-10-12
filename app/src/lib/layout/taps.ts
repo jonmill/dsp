@@ -379,9 +379,11 @@ class Assigner {
   }
 
   /**
-   * What a station takes in of an item that the plan also imports, it gives out: judged on the ports as assigned, which sit
-   * on the stations the netlist gave the nets (see `pooledImbalances`). A station whose stock fills only blocks the producers
-   * in game; the simulator does not model it, so a violation is a bug of the netlist and throws.
+   * A contract guard, not a check that can fire on real input: `buildNetlist` already throws on a netlist that breaks the
+   * balance, and a port is always on the station its net was given, so the ports cannot unbalance a station today. It judges
+   * the ports as assigned (the station of each port's building, see `pooledImbalances`) so that a change that moved a net to
+   * another station here, or a netlist from somewhere else, could not leave a station filling up unseen: the simulator does
+   * not model station stock. A violation is a bug upstream and throws. Its test hands it a tampered netlist.
    */
   private checkPooledBalance(): void {
     const stationIdxOf = new Map(this.net.stations.map((_, i) => [stationBuildingId(i), i]));

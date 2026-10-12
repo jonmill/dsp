@@ -16,7 +16,7 @@
 // Every plan is sized with the planner's default machine headroom, as the user gets it. Slow: it logs the numbers the report
 // quotes (stations, slots and ports per station, rates, footprints). Run with `npm run test:e2e`.
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_MACHINE_HEADROOM } from '../src/lib/calc';
+import { DEFAULT_MACHINE_HEADROOM, layoutStations, withLayout } from '../src/lib/calc';
 import type { PlanRequest, ProductionPlan } from '../src/lib/calc';
 import { decodeBlueprint, layoutToBlueprintString } from '../src/lib/blueprint';
 import type { Layout, PlacedBuilding } from '../src/lib/geometry';
@@ -75,8 +75,8 @@ function describeStations(layout: Layout): string {
 /**
  * What every layout with several stations has to be: `count` stations of the plan's kind, each with at most `maxItemKinds`
  * slots, one slot per item, a configured port for every belt end on it (the output ports where a belt starts, the input ports
- * where one ends) whose `storageIdx` points at a slot of the belt's item, and every item of the plan's slots on at least one
- * station. Returns the stations.
+ * where one ends) whose `storageIdx` points at a slot of the belt's item, a port for every slot, a port on every station
+ * (a station with none has no place in a layout), and every item of the plan's slots on at least one station. Returns the stations.
  */
 function expectStationConfigs(layout: Layout, plan: ProductionPlan, count: number): PlacedBuilding[] {
   const kind = plan.request.stationKind === 'interstellar' ? ILS : PLS;
@@ -91,6 +91,10 @@ function expectStationConfigs(layout: Layout, plan: ProductionPlan, count: numbe
     expect(cfg.slots.length, `station ${b.id}: slots`).toBeLessThanOrEqual(maxKinds);
     expect(new Set(cfg.slots.map((s) => s.itemId)).size, `station ${b.id}: an item has one slot`).toBe(cfg.slots.length);
     expect(cfg.ports).toHaveLength(12);
+    expect(cfg.ports.filter((p) => p.dir !== 0).length, `station ${b.id} has a port`).toBeGreaterThan(0);
+    cfg.slots.forEach((slot, i) => {
+      expect(cfg.ports.some((p) => p.dir !== 0 && p.storageIdx === i + 1), `station ${b.id}: ${itemName(slot.itemId)} has a port`).toBe(true);
+    });
     cfg.ports.forEach((p, port) => {
       const starts = layout.belts.filter((x) => x.source?.buildingId === b.id && x.source.port === port);
       const ends = layout.belts.filter((x) => x.sink?.kind === 'port' && x.sink.buildingId === b.id && x.sink.port === port);
@@ -144,6 +148,17 @@ function expectPasses(name: string, plan: ProductionPlan, layout: Layout, second
       `plain validation ${((performance.now() - t0) / 1000).toFixed(1)} s: ${rate.toFixed(3)}/s of ${wantedRate(plan)}/s after a warm-up of ${report.sim!.warmupTicksUsed} ticks`,
   );
   log(`${name}: stations: ${describeStations(layout)}`);
+  // the power estimate with the layout's own stations has the station charge the simulator measured (it sums the layout's stations)
+  // where the plan's estimate has `stationsNeeded` of them
+  const stations = layoutStations(layout, data);
+  const laid = withLayout(plan.power, { coaters: layout.coaters?.length ?? 0, stations }, data);
+  log(
+    `${name}: station charge ${(plan.power.stationChargeW / 1e6).toFixed(0)} MW for the plan's ${plan.stationsNeeded} stations, ` +
+      `${(laid.stationChargeW / 1e6).toFixed(0)} MW for the layout's ${stations.length} (simulated ${(report.sim!.power.stationChargeW / 1e6).toFixed(0)} MW); ` +
+      `peak ${(plan.power.peakW / 1e6).toFixed(1)} -> ${(laid.peakW / 1e6).toFixed(1)} MW, steady ${(plan.power.steadyW / 1e6).toFixed(1)} -> ${(laid.steadyW / 1e6).toFixed(1)} MW`,
+  );
+  expect(stations).toHaveLength(stationsOf(layout).length);
+  expect(laid.stationChargeW).toBeCloseTo(report.sim!.power.stationChargeW, 3);
   expect(messages(report)).toEqual([]);
   expect(report.pass).toBe(true);
   expect(rate).toBeGreaterThanOrEqual((over.rateLow ?? 0.99) * wantedRate(plan));

@@ -18,7 +18,15 @@
  * layout so far (it is replaced as the worker reports better ones); `blueprint` is made from it on demand.
  */
 import { layoutToBlueprintString } from '../lib/blueprint';
-import { compatibleFacilities, DEFAULT_MACHINE_HEADROOM, isPlannableRecipe, planProduction, plannableProducers } from '../lib/calc';
+import {
+  compatibleFacilities,
+  DEFAULT_MACHINE_HEADROOM,
+  isPlannableRecipe,
+  layoutStations,
+  planProduction,
+  plannableProducers,
+  withLayout,
+} from '../lib/calc';
 import type { PlanRequest, PlanResult, ProductionPlan, ProliferatorSetting } from '../lib/calc';
 import { allTechs, computeTechEffects, GameDataIndex, techClosure } from '../lib/data';
 import type { Building, GameData, Item, Recipe, TechEffects } from '../lib/data';
@@ -318,16 +326,19 @@ export function makeBlueprint(
   const rate = provisionedRate(plan);
   const shortDesc = `${target} ${formatCount(rate)}/s`;
   const machines = plan.stages.reduce((n, stage) => n + stage.machines, 0);
-  const stations = `${plan.stationsNeeded} station${plan.stationsNeeded === 1 ? '' : 's'}`;
+  // the layout's stations, not the plan's lower bound from the item slots: a layout also needs stations for its belt ports
+  const laidStations = layoutStations(layout, index);
+  const stations = `${laidStations.length} station${laidStations.length === 1 ? '' : 's'}`;
   const imports = plan.imports.slice(0, MAX_DESC_IMPORTS).map((i) => `${itemName(index, i.itemId)} ${formatCount(i.perSecond)}/s`);
   if (plan.imports.length > MAX_DESC_IMPORTS) imports.push('...');
   const power = report?.sim?.power ?? null;
+  const estimate = withLayout(plan.power, { coaters: layout.coaters?.length ?? 0, stations: laidStations }, index);
   const lines = [
     `${shortDesc}, ${machines} machines, ${stations}${footprint === null ? '' : `, ${Math.round(footprint)} tiles`}.`,
     imports.length > 0 ? `Supplied: ${imports.join(', ')}.` : 'Nothing supplied.',
     power
       ? `Power (simulated): ${formatPower(power.steadyW)} steady, ${formatPower(power.peakW)} peak.`
-      : `Power (estimate): ${formatPower(plan.power.steadyW)} steady, ${formatPower(plan.power.peakW)} peak.`,
+      : `Power (estimate): ${formatPower(estimate.steadyW)} steady, ${formatPower(estimate.peakW)} peak.`,
     'Made with DSP Factory Planner.',
   ];
   const desc = lines.join('\n');
