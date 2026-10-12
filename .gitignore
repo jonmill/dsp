@@ -25,3 +25,6 @@ app/node_modules/
 app/dist/
 tools/extract/.venv/
 .pytest_cache/
+
+# Playwright MCP browser session output (screenshots, console logs)
+.playwright-mcp/
