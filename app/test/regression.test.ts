@@ -14,7 +14,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { buildM0Layout } from '../scripts/emit-test-blueprint';
-import { blueprintToLayout, decodeBlueprint, layoutToBlueprintString, regressionPlanFor } from '../src/lib/blueprint';
+import { BlueprintError, blueprintToLayout, decodeBlueprint, layoutToBlueprintString, regressionPlanFor } from '../src/lib/blueprint';
+import type { Blueprint } from '../src/lib/blueprint';
 import { allTechs, compareGameVersions, computeTechEffects, GameDataIndex, loadDefaultGameData } from '../src/lib/data';
 import { runSimulation } from '../src/lib/validate';
 import type { SimOptions } from '../src/lib/validate';
@@ -82,10 +83,28 @@ interface RateRow {
   countable: boolean;
 }
 
+/**
+ * The blueprint of a fixture, its hash checked. A hash that does not match is not fatal: the game's header v1 hash is not
+ * understood yet (the 0.10.34 sample's does not verify), so the string is decoded again without the check and the note
+ * goes to the warnings. Any other fault (not a blueprint, damaged body) still throws.
+ */
+function decodeFixtureBlueprint(text: string): { bp: Blueprint; notes: string[] } {
+  try {
+    return { bp: decodeBlueprint(text), notes: [] };
+  } catch (e) {
+    if (!(e instanceof BlueprintError) || e.code !== 'HASH') throw e;
+    return {
+      bp: decodeBlueprint(text, { verifyHash: false }),
+      notes: [`${e.message}; decoded without the hash check (the hash of a header v1 blueprint is not verified yet)`],
+    };
+  }
+}
+
 /** Imports and simulates `fixture`; one row per measured item. */
 function simulateFixture(fixture: RegressionFixture, data: GameDataIndex, opts: SimOptions = {}): { rows: RateRow[]; warnings: string[] } {
   const effects = computeTechEffects(data.data, fixture.unlockedTechs ? new Set(fixture.unlockedTechs) : allTechs(data.data));
-  const imported = blueprintToLayout(decodeBlueprint(fixture.blueprint), data);
+  const decoded = decodeFixtureBlueprint(fixture.blueprint);
+  const imported = blueprintToLayout(decoded.bp, data);
   const items = Object.keys(fixture.measuredRates).map(Number);
   const plan = regressionPlanFor(imported.layout, data, effects, { targetItemId: fixture.targetItemId, alsoReport: items });
   const sim = runSimulation(imported.layout, plan, data, effects, opts);
@@ -94,7 +113,14 @@ function simulateFixture(fixture: RegressionFixture, data: GameDataIndex, opts: 
     const simulated = sim.measuredExports.find((e) => e.itemId === itemId)?.perSecond ?? 0;
     return { itemId, measured: fixture.measuredRates[String(itemId)], simulated, countable: slotItems.has(itemId) };
   });
-  return { rows, warnings: [...imported.warnings, ...sim.warnings] };
+  return { rows, warnings: [...decoded.notes, ...imported.warnings, ...sim.warnings] };
+}
+
+/** What a failed fixture says besides the rates: its notes, and the import and simulation warnings (a skipped building explains a miss). */
+function failureMessage(fixture: RegressionFixture, warnings: string[]): string {
+  const lines = [fixture.notes || 'no notes in the fixture'];
+  if (warnings.length > 0) lines.push('import and simulation warnings:', ...warnings.map((w) => `  - ${w}`));
+  return lines.join('\n');
 }
 
 const itemName = (data: GameDataIndex, itemId: number): string => {
@@ -147,7 +173,7 @@ describe('in-game regression fixtures', () => {
       const { rows, warnings } = simulateFixture(fixture, data);
       for (const w of warnings) log(`${file}: ${w}`);
       for (const r of rows) log(`${file}: ${itemName(data, r.itemId)} simulated ${r.simulated.toFixed(3)}/s, measured ${r.measured.toFixed(3)}/s`);
-      expect(mismatches(rows, data), fixture.notes).toEqual([]);
+      expect(mismatches(rows, data), failureMessage(fixture, warnings)).toEqual([]);
     },
     FIXTURE_TIMEOUT_MS,
   );
@@ -226,6 +252,43 @@ describe('regression runner', () => {
   it('the fixture picks the techs: without any, the simulator still runs', () => {
     const { rows } = simulateFixture(fixtureWith({ 1101: simulatedRate() }, { unlockedTechs: [] }), data, SHORT);
     expect(rows[0].simulated).toBeGreaterThan(2.9);
+  });
+
+  describe('the blueprint hash', () => {
+    /** The same blueprint with the last character of its stored MD5F hash changed. */
+    const badHash = m0Blueprint.slice(0, -1) + (m0Blueprint.endsWith('0') ? '1' : '0');
+
+    it('a blueprint with a hash that does not match is simulated anyway, with a note (header v1 hashes are unverified)', () => {
+      const { rows, warnings } = simulateFixture(fixtureWith({ 1101: simulatedRate() }, { blueprint: badHash }), data, SHORT);
+      expect(mismatches(rows, data)).toEqual([]);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(/hash mismatch.*decoded without the hash check/);
+    });
+
+    it('a blueprint with the right hash gets no note', () => {
+      expect(simulateFixture(fixtureWith({ 1101: simulatedRate() }), data, SHORT).warnings).toEqual([]);
+    });
+
+    it('a damaged body is not excused by the retry', () => {
+      const middle = Math.floor(m0Blueprint.length / 2);
+      const damaged = m0Blueprint.slice(0, middle) + (m0Blueprint[middle] === 'A' ? 'B' : 'A') + m0Blueprint.slice(middle + 1);
+      expect(() => simulateFixture(fixtureWith({ 1101: 3 }, { blueprint: damaged }), data, SHORT)).toThrow();
+    });
+  });
+
+  describe('failureMessage', () => {
+    it('carries the notes and every import warning', () => {
+      const message = failureMessage({ ...fixtureWith({ 1101: 3 }), notes: 'my notes' }, ['9 x Splitter skipped', 'belt 4 mixes belt tiers']);
+      expect(message).toContain('my notes');
+      expect(message).toContain('import and simulation warnings');
+      expect(message).toContain('9 x Splitter skipped');
+      expect(message).toContain('belt 4 mixes belt tiers');
+    });
+
+    it('is just the notes without warnings, and never empty', () => {
+      expect(failureMessage({ ...fixtureWith({ 1101: 3 }), notes: 'my notes' }, [])).toBe('my notes');
+      expect(failureMessage({ ...fixtureWith({ 1101: 3 }), notes: '' }, [])).not.toBe('');
+    });
   });
 
   describe('parseFixture', () => {

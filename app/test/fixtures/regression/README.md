@@ -20,12 +20,33 @@ rate to be matched within **2 %** (relative; spec §11). With no fixtures here t
 
 | Field | Meaning |
 |---|---|
-| `blueprint` | The blueprint string (`BLUEPRINT:...`). Both a string the planner generated and one the game exported are fine. |
+| `blueprint` | The blueprint string (`BLUEPRINT:...`), on one line. Both a string the planner generated and one the game exported are fine (see "Getting the blueprint string"). Its hash is checked; a mismatch (header v1 exports are not verified yet) is logged and the string is decoded anyway. |
 | `gameVersion` | The game version the rates were measured on. Informational: when it differs from the loaded GameData, the test logs both. |
 | `targetItemId` | The item the block delivers to its station: the one counted at the station's input port. |
-| `measuredRates` | Items per second measured in game, by item id (a JSON string key). One entry per item you measured, the target included. |
+| `measuredRates` | Items per second measured in game, by item id (a JSON string key; see "Finding item ids"). One entry per item you measured, the target included. |
 | `notes` | Free text: what the block is and how it was measured. It is shown when the fixture fails. |
 | `unlockedTechs` | Optional. Tech ids researched when you measured. Default: all published techs. Sorter stacking and station piling follow from the techs, so set this if the save did not have them all. |
+
+### Finding item ids
+
+The app does not show item ids. They are the `id` of each entry of `items` in the GameData file: `data/dsp-<gameVersion>.json`
+(the extraction of your game), or `data/fixture/dsp-fixture.json` for the committed fixture. From the repository root:
+
+```
+node -e "const d=require('./data/dsp-0.10.33.27026.json'); for (const i of d.items) if (/ingot/i.test(i.name)) console.log(i.id, i.name)"
+```
+
+A few common ones: 1001 Iron Ore, 1002 Copper Ore, 1101 Iron Ingot, 1102 Magnet, 1301 Circuit Board, 1303 Processor,
+6001 Electromagnetic Matrix. The test log and a failure message print the item's name next to the id, so a wrong id is
+easy to spot.
+
+### Getting the blueprint string
+
+- **From the planner:** after Solve, the Blueprint panel shows the string in a text box. Press **Copy** (or
+  **Download .txt** and open the file), and paste it into the `blueprint` field between the quotes. It is one line;
+  keep it on one line.
+- **From the game:** select the block, create a blueprint, and use the copy-to-clipboard button; the clipboard then holds
+  the same kind of string.
 
 The test counts an item where it **arrives at a station input port** (the station's input count). So every item in
 `measuredRates` must have a storage slot on a station in the blueprint, and the blueprint must contain the station: a
@@ -63,8 +84,10 @@ rate for an item no station stocks fails, with a message that says why.
 6. **Write the fixture**: save the JSON above as `app/test/fixtures/regression/<short-name>.json` with a name that says what
    the block is (`iron-ingot-3-per-s.json`). Put the game version (shown at the bottom of the main menu), the save's tech
    state and anything unusual into `notes`.
-7. Run `npm test`. If a rate is off by more than 2 %, the failure message gives both rates. The difference is a finding
-   about the simulator (or the importer), not a reason to edit the measurement.
+7. Run `npm test`. If a rate is off by more than 2 %, the failure message gives both rates, your `notes`, and every
+   import and simulation warning (a building the importer skipped, a belt that mixes tiers, merging belts the importer
+   could not tell apart). Read the warnings first: they often explain a miss. What remains is a finding about the simulator
+   (or the importer), not a reason to edit the measurement.
 
 Keep one fixture per distinct block and per distinct behaviour you want pinned down (a belt tier, sorter tiers and
 spans, a long chain, a station fed by several belts). Do not commit game files or screenshots here, only the JSON.

@@ -9,12 +9,14 @@
  * in the blueprint. Belt and sorter planned rates are unknown and read 0. A belt's carried item is not stored in a
  * blueprint; it is inferred from the station port it leaves, else from a sorter filter on it, else 0.
  *
- * Belts. Belt records are chained through `outputObjIdx` into `BeltPath`s. Where two records feed one (a merge) the
- * record before it in the file, if it is one of them, is the continuation (the builder writes a belt's records in a row);
- * otherwise the one that arrives straight in the direction the belt leaves. The others end in a `sink: belt`. A chain
- * that leaves a station (`inputObjIdx` names a station) starts with the two port-stub records `layoutToBlueprint` writes
- * (the game does the same, BF §3.3); they fold back into `source`, and a chain that enters a station folds its last two
- * records into `sink`.
+ * Belts. Belt records are chained through `outputObjIdx` into `BeltPath`s. Where several records feed one (a merge), the
+ * one that continues the belt is chosen by, in order: the target slot of the link (`outputToSlot`: 1 is the straight run,
+ * 2 a side merge; the game and `layoutToBlueprint` write them so), the direction (the feeder that arrives straight in the
+ * direction the belt leaves), and the record just before the target in the file. The first signal that singles one out
+ * wins; a warning says when the slot and the direction disagree. The others end in a `sink: belt`. A belt chain is one
+ * `BeltPath` with one tier: when its records mix tiers the slowest is kept, with a warning. A chain that leaves a station
+ * (`inputObjIdx` names a station) starts with the two port-stub records `layoutToBlueprint` writes (the game does the
+ * same, BF §3.3); they fold back into `source`, and a chain that enters a station folds its last two records into `sink`.
  *
  * Sorters. A sorter end on a building is that building and the slot field of the record (`inputFromSlot` on the pick
  * side, `outputToSlot` on the drop side); an end on a belt is the node of the folded path that the record it links to
@@ -53,6 +55,10 @@ const PORT_STUB_RECORDS = 2;
 const YAW_SNAP_WARN_DEG = 1;
 /** Segments shorter than this (in tiles) have no heading. */
 const MIN_SEGMENT = 1e-9;
+/** `outputToSlot` of a belt record that feeds a belt record from behind; a side merge writes 2 (BF §3.3). */
+const STRAIGHT_SLOT = 1;
+/** Two feeders whose headings into a merge differ by less than this many degrees arrive alike. */
+const SAME_TURN_DEG = 0.5;
 /** At most this many record numbers are listed in a warning. */
 const LISTED_RECORDS = 6;
 
@@ -193,7 +199,7 @@ export function blueprintToLayout(bp: Blueprint, data: GameDataIndex): ImportRes
     }
   }
   const nextInChain = new Map<number, number>();
-  for (const [to, from] of feeders) nextInChain.set(continuationOf(to, from, recs), to);
+  for (const [to, from] of feeders) nextInChain.set(continuationOf(to, from, recs, (m) => warnings.push(m)), to);
 
   const visited = new Set<number>();
   const walk = (start: number): number[] => {
@@ -268,11 +274,22 @@ export function blueprintToLayout(bp: Blueprint, data: GameDataIndex): ImportRes
     chain.recs.forEach((pos, i) => nodeOf.set(pos, { belt: index, node: Math.min(Math.max(i - chain.head, 0), nodeCount - 1) }));
   });
 
+  /** The tier of a chain: the slowest of its records' (conservative), with a warning when they differ. */
+  const tierOf = (list: number[]): BeltPath['tierItemId'] => {
+    const tiers = [...new Set(list.map((pos) => recs[pos].itemId))];
+    if (tiers.length === 1) return tiers[0] as BeltPath['tierItemId'];
+    const speed = (itemId: number): number => data.building(itemId)?.belt?.speed ?? Infinity;
+    const slowest = tiers.reduce((best, t) => (speed(t) < speed(best) ? t : best));
+    const name = (itemId: number): string => data.building(itemId)?.name ?? `item ${itemId}`;
+    warnings.push(`belt ${list[0]} mixes belt tiers (${tiers.map(name).join(', ')}); kept the slowest, ${name(slowest)}`);
+    return slowest as BeltPath['tierItemId'];
+  };
+
   const belts: BeltPath[] = folded.map(({ chain, source, sinkPort }) => {
     const list = chain.recs;
     const path: BeltPath = {
       id: list[0],
-      tierItemId: recs[list[0]].itemId as BeltPath['tierItemId'],
+      tierItemId: tierOf(list),
       itemId: 0,
       nodes: list.slice(chain.head, list.length - chain.tail).map((pos) => point(recs[pos])),
       plannedRate: 0,
@@ -373,13 +390,24 @@ export function blueprintToLayout(bp: Blueprint, data: GameDataIndex): ImportRes
 }
 
 /**
- * Of the belt records `from` that feed record `to`, the one the chain continues from; the others merge into it.
- * The record just before `to` in the file if it is one of them (the builder writes a belt's records in a row), else
- * the one that arrives in the direction the belt leaves `to` (a straight run), the lowest record index on a tie.
+ * Of the belt records `from` that feed record `to`, the one the chain continues from; the others merge into it. The
+ * first signal that settles it wins:
+ *
+ * 1. The slot: a feeder with `outputToSlot` 1 (the straight run) when it is the only one. A game export writes a side
+ *    merge with 2 (the 0.10.34 sample: record 15 continues record 16 with 1, record 23 joins it with 2).
+ * 2. The direction: the feeder that arrives in the direction the belt leaves `to` (the turn from the heading into `to` to
+ *    the heading out of it is smallest), among the ones the slot left. A feeder on top of `to` arrives from nowhere.
+ * 3. The record just before `to` in the file, among the ones left. A game export is not ordered like that (1 of 237 links
+ *    in the capsule sample), so this only breaks a tie.
+ * 4. The lowest record index.
+ *
+ * `warn` hears when the slot and the direction both settle it and disagree; the slot wins.
  */
-function continuationOf(to: number, from: number[], recs: BlueprintBuilding[]): number {
+function continuationOf(to: number, from: number[], recs: BlueprintBuilding[], warn: (message: string) => void): number {
   if (from.length === 1) return from[0];
-  if (from.includes(to - 1)) return to - 1;
+  const straight = from.filter((pos) => recs[pos].outputToSlot === STRAIGHT_SLOT);
+  const bySlot = straight.length === 1 ? straight[0] : undefined;
+
   const at = recs[to];
   const next = at.outputObjIdx >= 0 ? recs[at.outputObjIdx] : undefined;
   const leaving =
@@ -389,10 +417,27 @@ function continuationOf(to: number, from: number[], recs: BlueprintBuilding[]): 
   const turnOf = (pos: number): number => {
     const dx = at.localOffset[0] - recs[pos].localOffset[0];
     const dy = at.localOffset[1] - recs[pos].localOffset[1];
-    // A record on top of the target arrives from no direction: a side merge.
     return Math.hypot(dx, dy) > MIN_SEGMENT ? headingGap(headingDeg(dx, dy), leaving) : 180;
   };
-  return [...from].sort((a, b) => turnOf(a) - turnOf(b) || a - b)[0];
+  const straightest = (candidates: number[]): number[] => {
+    const best = Math.min(...candidates.map(turnOf));
+    return candidates.filter((pos) => turnOf(pos) - best < SAME_TURN_DEG);
+  };
+  const byDirection = straightest(from);
+  if (bySlot !== undefined) {
+    if (byDirection.length === 1 && byDirection[0] !== bySlot) {
+      warn(
+        `belts merging at record ${to}: the slot fields make record ${bySlot} the straight run, but record ${byDirection[0]} ` +
+          `arrives in the direction the belt leaves; went by the slot fields`,
+      );
+    }
+    return bySlot;
+  }
+
+  // The slot did not single one out: narrow to the ones it left (all of them, if none reads 1), then by direction.
+  const left = straightest(straight.length > 1 ? straight : from);
+  if (left.length === 1) return left[0];
+  return left.includes(to - 1) ? to - 1 : Math.min(...left);
 }
 
 /** The station parameters of `r` (BF §4.1) as a `StationConfig`. A missing parameter reads 0. */

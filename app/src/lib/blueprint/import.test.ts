@@ -149,6 +149,8 @@ function richLayout(): Layout {
   });
 }
 
+const layoutBelt = (l: Layout, id: number): BeltPath => l.belts.find((b) => b.id === id) as BeltPath;
+
 /**
  * Belt 1 merges into the middle of belt 2 from the west; belt 2 runs north past it. `onTarget`: belt 1's last node is on
  * the node it merges into instead of beside it (both pass the geometry check).
@@ -296,23 +298,125 @@ describe('blueprintToLayout: round trip of layoutToBlueprint', () => {
     expect(layout.belts[0].sink).toEqual({ kind: 'belt', beltId: layout.belts[1].id, node: 1 });
   });
 
-  // Records 0, 1 are the joiner, 2, 3, 4 the belt it merges into at record 3. In neither order does the record before the
-  // merge target feed it, so the straight run is found by direction. Scrambled puts the joiner's last record first.
-  test.each([
+  // Records 0, 1 are the joiner, 2, 3, 4 the belt it merges into at record 3. The builder writes the joiner's link with
+  // slot 2 and the straight run's with slot 1, and the game does the same. In none of these orders does the record just
+  // before the merge target belong to the straight run, so adjacency would pick the wrong belt.
+  const mergeOrders = [
     { name: 'reversed', order: [4, 3, 2, 1, 0], onTarget: false },
     { name: 'scrambled', order: [1, 0, 4, 3, 2], onTarget: false },
     // The joiner's last node (record 2 of 6) sits on the target; it arrives from no direction.
     { name: 'scrambled, ending on the target', order: [2, 1, 0, 5, 4, 3], onTarget: true },
-  ])('the merge does not depend on the record order ($name)', ({ order, onTarget }) => {
-    const { bp } = roundTrip(mergeLayout(onTarget));
-    const { layout, warnings } = blueprintToLayout(reorder(bp, order), data);
-    expect(warnings).toEqual([]);
+    // The side joiner's last record right before the target: the swapped-record repro (1 of 237 links is adjacent in a real export).
+    { name: 'the joiner just before the target', order: [2, 0, 1, 3, 4], onTarget: false },
+  ];
+  /** The straight belt of a merge layout, the belt that joins it, and what each should look like. */
+  function expectMerge(layout: Layout): void {
     expect(layout.belts).toHaveLength(2);
     const through = layout.belts.find((b) => b.nodes.every((n) => n.x === b.nodes[0].x)) as BeltPath;
     const joiner = layout.belts.find((b) => b !== through) as BeltPath;
     expect(through.nodes.map((n) => [n.x - through.nodes[0].x, n.y - through.nodes[0].y])).toEqual([[0, 0], [0, 1], [0, 2]]);
     expect(joiner.sink).toEqual({ kind: 'belt', beltId: through.id, node: 1 });
     expect(through.sink).toBeUndefined();
+  }
+  /** Every belt-to-belt link of `bp` reads `slot`, as in older exports whose slots do not tell a merge from a run. */
+  function withBeltSlots(bp: Blueprint, slot: number): Blueprint {
+    const copy = structuredClone(bp);
+    const recs = copy.body.buildings;
+    for (const r of recs) {
+      const to = recs[r.outputObjIdx];
+      if (r.itemId === 2001 && to?.itemId === 2001) r.outputToSlot = slot;
+    }
+    return copy;
+  }
+
+  test.each(mergeOrders)('the merge does not depend on the record order, by the slot fields ($name)', ({ order, onTarget }) => {
+    const { bp } = roundTrip(mergeLayout(onTarget));
+    const { layout, warnings } = blueprintToLayout(reorder(bp, order), data);
+    expect(warnings).toEqual([]);
+    expectMerge(layout);
+  });
+
+  test.each(mergeOrders.filter((o) => o.name !== 'the joiner just before the target'))(
+    'nor by the direction of the run when every slot reads 1 ($name)',
+    ({ order, onTarget }) => {
+      const { bp } = roundTrip(mergeLayout(onTarget));
+      const { layout, warnings } = blueprintToLayout(withBeltSlots(reorder(bp, order), 1), data);
+      expect(warnings).toEqual([]);
+      expectMerge(layout);
+    },
+  );
+
+  test('slots that do not tell the feeders apart and a tie in direction leave it to the record before the target', () => {
+    // Belts 1 and 2 join the start of belt 3 from the west and from the east. Records: 0,1 | 2,3 | 4,5 (target 4).
+    const original = layoutOf({
+      belts: [
+        beltOf(1, [[0, 0], [1, 0]], { sink: { kind: 'belt', beltId: 3, node: 0 } }),
+        beltOf(2, [[4, 0], [3, 0]], { sink: { kind: 'belt', beltId: 3, node: 0 } }),
+        beltOf(3, [[2, 0], [2, 1]]),
+      ],
+    });
+    const { layout, warnings } = roundTrip(original);
+    expect(warnings).toEqual([]);
+    // Record 3 (belt 2's last) is just before the target, so belt 2 continues into belt 3 and belt 1 joins it at node 2.
+    expect(layout.belts.map((b) => b.nodes.length)).toEqual([2, 4]);
+    expect(layout.belts[0].sink).toEqual({ kind: 'belt', beltId: layout.belts[1].id, node: 2 });
+    expect(layout.belts[1].nodes.map((n) => n.x - layout.belts[1].nodes[0].x)).toEqual([0, -1, -2, -2]);
+  });
+
+  test('a merge at a corner: the slot fields beat the direction, and the import says they differ', () => {
+    // Belt 2 runs east and turns north at (2, 0); belt 1 comes up from the south and joins it there. Belt 1 arrives in
+    // the direction belt 2 leaves, belt 2's own previous record does not, yet it is belt 2 that goes on.
+    const original = layoutOf({
+      belts: [
+        beltOf(1, [[2, -2], [2, -1]], { sink: { kind: 'belt', beltId: 2, node: 2 } }),
+        beltOf(2, [[0, 0], [1, 0], [2, 0], [2, 1], [2, 2]]),
+      ],
+    });
+    const { bp } = roundTrip(original);
+    const { layout, warnings } = blueprintToLayout(reorder(bp, [6, 5, 4, 3, 1, 0, 2]), data);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/merging at record 2.*the slot fields/);
+    expect(layout.belts).toHaveLength(2);
+    const long = layout.belts.find((b) => b.nodes.length === 5) as BeltPath;
+    const short = layout.belts.find((b) => b.nodes.length === 2) as BeltPath;
+    expect(short.sink).toEqual({ kind: 'belt', beltId: long.id, node: 2 });
+    expect(long.sink).toBeUndefined();
+  });
+
+  test('slot fields and geometry that disagree: the slot fields win and the import warns', () => {
+    const { bp } = roundTrip(mergeLayout());
+    // The joiner (record 1) claims the straight run, the belt that really runs on (record 2) claims the side.
+    bp.body.buildings[1].outputToSlot = 1;
+    bp.body.buildings[2].outputToSlot = 2;
+    const { layout, warnings } = blueprintToLayout(bp, data);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/merging at record 3.*record 1.*record 2/);
+    // Record 1 continues into the target: one belt of 4 nodes (0,0) (1,0) (2,0) (2,1); record 2 joins it at node 2.
+    expect(layout.belts.map((b) => b.nodes.length)).toEqual([4, 1]);
+    expect(layout.belts[1].sink).toEqual({ kind: 'belt', beltId: layout.belts[0].id, node: 2 });
+  });
+
+  test('the 0.10.34 sample: its one side merge (slot 2) joins the straight run (slot 1) at record 16', () => {
+    // The stored hash of this sample is not verified (docs/research/blueprint-samples/README.md).
+    const bp = loadBlueprintSample('belts-header-v1-marker-102-0.10.34.txt', { verifyHash: false });
+    const { layout, warnings } = blueprintToLayout(bp, data);
+    expect(warnings).toEqual([]);
+    expect(layout.belts.reduce((sum, b) => sum + b.nodes.length, 0)).toBe(37);
+    const joiners = layout.belts.filter((b) => b.sink?.kind === 'belt');
+    expect(joiners).toHaveLength(1);
+    const joiner = joiners[0];
+    // Positions are float32 on the wire.
+    const at = (p: GridPoint, x: number, y: number) => {
+      near(p.x, x, 'x');
+      near(p.y, y, 'y');
+    };
+    at(joiner.nodes[joiner.nodes.length - 1], 6, 5); // record 23
+    const sink = joiner.sink as Extract<NonNullable<BeltPath['sink']>, { kind: 'belt' }>;
+    const target = layoutBelt(layout, sink.beltId);
+    // The straight run goes north through record 16 at (5, 5): from (5, 4) to (5, 6).
+    at(target.nodes[sink.node - 1], 5, 4);
+    at(target.nodes[sink.node], 5, 5);
+    at(target.nodes[sink.node + 1], 5, 6);
   });
 
   test('a belt with a vertical lift and corners keeps its nodes and heights', () => {
@@ -324,7 +428,7 @@ describe('blueprintToLayout: round trip of layoutToBlueprint', () => {
     expectSameLayout(original, layout);
   });
 
-  test('building yaws, a lab, a station without configuration and prolifMode survive', () => {
+  test('building yaws, a recipe-less assembler, a station without configuration and prolifMode survive', () => {
     const original = layoutOf({
       buildings: [
         smelter({ id: 1, yaw: 270, prolifMode: 1 }),
@@ -586,6 +690,86 @@ describe('blueprintToLayout: records it cannot place', () => {
     const { layout, warnings } = blueprintToLayout(bp, data);
     expect(layout.belts[0].source).toBeUndefined();
     expect(warnings.join('\n')).toMatch(/port 14/);
+  });
+});
+
+describe('blueprintToLayout: belt tiers', () => {
+  const rich = () => roundTrip(richLayout()).bp;
+
+  test('a chain that mixes belt tiers keeps the slowest and warns', () => {
+    const bp = rich();
+    bp.body.buildings[6].itemId = 2003; // a Mk.III record in the Mk.I ore belt (records 3..10)
+    const { layout, warnings } = blueprintToLayout(bp, data);
+    expect(layout.belts[0].tierItemId).toBe(2001);
+    expect(layout.belts[1].tierItemId).toBe(2001);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/belt 3.*mixes belt tiers.*Conveyor Belt MK\.I.*Conveyor Belt MK\.III.*slowest.*Conveyor Belt MK\.I\b/);
+  });
+
+  test('Mk.II and Mk.III records give Mk.II, whatever order they come in', () => {
+    const bp = rich();
+    for (let i = 3; i <= 10; i++) bp.body.buildings[i].itemId = 2003;
+    bp.body.buildings[9].itemId = 2002;
+    const { layout, warnings } = blueprintToLayout(bp, data);
+    expect(layout.belts[0].tierItemId).toBe(2002);
+    expect(warnings).toHaveLength(1);
+  });
+
+  test('a chain of one tier does not warn', () => {
+    const { layout, warnings } = blueprintToLayout(rich(), data);
+    expect(warnings).toEqual([]);
+    expect(layout.belts.map((b) => b.tierItemId)).toEqual([2001, 2001]);
+  });
+});
+
+describe('blueprintToLayout: labs', () => {
+  const MATRIX_LAB = 2901;
+  /** Electromagnetic Matrix, 180 ticks. */
+  const RECIPE = 9;
+  const labLayout = () =>
+    layoutOf({
+      buildings: [{ id: 1, itemId: MATRIX_LAB, x: 0, y: 0, z: 0, yaw: 0, recipeId: RECIPE }, tower(2, 4, 0)],
+    });
+  /** The lab layout as a blueprint whose lab record carries `parameters` ([research mode, proliferator mode] in the game). */
+  const labBlueprint = (parameters: number[]) => {
+    const { bp } = roundTrip(labLayout());
+    expect(bp.body.buildings[0].itemId).toBe(MATRIX_LAB);
+    bp.body.buildings[0].parameters = Int32Array.from(parameters);
+    return bp;
+  };
+
+  test.each([
+    { name: 'matrix synthesis, speed-up', params: [1, 1], prolifMode: 1 },
+    { name: 'matrix synthesis, extra products', params: [1, 0], prolifMode: 0 },
+    { name: 'research mode with the speed-up', params: [2, 1], prolifMode: 1 },
+  ])('a Matrix Lab with parameters [$params] ($name)', ({ params, prolifMode }) => {
+    const { layout, warnings } = blueprintToLayout(labBlueprint(params), data);
+    expect(warnings).toEqual([]);
+    expect(layout.buildings[0]).toMatchObject({ itemId: MATRIX_LAB, recipeId: RECIPE, prolifMode });
+  });
+
+  test('a lab without parameters has no proliferator mode (the builder writes none)', () => {
+    const { layout } = blueprintToLayout(labBlueprint([]), data);
+    expect(layout.buildings[0].recipeId).toBe(RECIPE);
+    expect(layout.buildings[0].prolifMode).toBeUndefined();
+    // One parameter is not enough to hold the second.
+    expect(blueprintToLayout(labBlueprint([1]), data).layout.buildings[0].prolifMode).toBeUndefined();
+  });
+
+  test('a lab record with no recipe (research mode) imports without one', () => {
+    const bp = labBlueprint([2, 0]);
+    bp.body.buildings[0].recipeId = 0;
+    expect(blueprintToLayout(bp, data).layout.buildings[0].recipeId).toBeUndefined();
+  });
+
+  test('the regression plan gives a lab a stage at its assemble speed', () => {
+    const { layout } = blueprintToLayout(labBlueprint([1, 1]), data);
+    const plan = regressionPlanFor(layout, data, kitEffects, { targetItemId: 6001 });
+    const speed = (data.building(MATRIX_LAB)?.lab?.assembleSpeed ?? 0) / 10000;
+    expect(plan.stages).toHaveLength(1);
+    expect(plan.stages[0]).toMatchObject({ recipeId: RECIPE, buildingItemId: MATRIX_LAB, machines: 1 });
+    expect(plan.stages[0].craftsPerSecond).toBeCloseTo((data.data.constants.ticksPerSecond * speed) / 180, 9);
+    expect(plan.stages[0].outputs).toEqual([{ itemId: 6001, perSecond: expect.closeTo(plan.stages[0].craftsPerSecond, 9) }]);
   });
 });
 

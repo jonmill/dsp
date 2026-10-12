@@ -386,9 +386,27 @@ describe('layoutToBlueprint', () => {
     const recs = records(l);
     expect(recs).toHaveLength(5);
     expect(recs[1].outputObjIdx).toBe(3); // belt 2, node 1
-    expect(recs[1].outputToSlot).toBe(1);
+    // A side merge enters the target's input slot 2; the straight run of belt 2 enters slot 1. The 0.10.34 sample has the
+    // same pair (record 23 joins record 16 with slot 2, record 15 continues it with slot 1).
+    expect(recs[1].outputToSlot).toBe(2);
+    expect(recs[2].outputObjIdx).toBe(3);
+    expect(recs[2].outputToSlot).toBe(1);
     expect(recs[1].yaw).toBeCloseTo(90, 4); // the last node keeps the direction of the one before
     expect(recs[4].outputObjIdx).toBe(-1);
+  });
+
+  test('(f3b) a belt that ends on the node it merges into is still a side merge', () => {
+    const l = layoutOf({
+      belts: [
+        beltOf(1, [[0, 0], [1, 0], [2, 0]], { sink: { kind: 'belt', beltId: 2, node: 1 } }),
+        beltOf(2, [[2, -1], [2, 0], [2, 1]]),
+      ],
+    });
+    const recs = records(l);
+    expect(recs[2].outputObjIdx).toBe(4); // belt 2, node 1
+    expect(recs[2].outputToSlot).toBe(2);
+    expect(recs[1].outputToSlot).toBe(1); // inside belt 1
+    expect(recs[3].outputToSlot).toBe(1); // belt 2 continues into its own node 1
   });
 
   test('(g) the translation is an integer: a layout with minimum x -3.6 shifts every record by +4', () => {

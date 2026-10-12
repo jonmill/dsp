@@ -212,7 +212,9 @@ function beltRecords(
     beltNodeAt(target, sink.node, `${what} sink`);
     const t = layouts.get(target.id)!;
     last.outputObjIdx = t.base + t.pre + sink.node;
-    last.outputToSlot = 1;
+    // A belt that joins another belt's middle node is a side merge, which the game writes as input slot 2 of the target;
+    // slot 1 is the straight run (the 0.10.34 sample: record 23 joins record 16 with 2, record 15 continues it with 1).
+    last.outputToSlot = 2;
   }
   return recs;
 }

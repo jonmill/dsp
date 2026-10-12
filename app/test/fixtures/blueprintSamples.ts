@@ -1,12 +1,13 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { decodeBlueprint } from '../../src/lib/blueprint/codec';
+import type { DecodeOptions } from '../../src/lib/blueprint/codec';
 import type { Blueprint, BlueprintBuilding } from '../../src/lib/blueprint/model';
 
-/** A real game export from `test/fixtures/blueprints/`, decoded. */
-export function loadBlueprintSample(file: string): Blueprint {
+/** A real game export from `test/fixtures/blueprints/`, decoded. `options.verifyHash: false` for the header-v1 sample. */
+export function loadBlueprintSample(file: string, options?: DecodeOptions): Blueprint {
   const path = fileURLToPath(new URL(`./blueprints/${file}`, import.meta.url));
-  return decodeBlueprint(readFileSync(path, 'utf8'));
+  return decodeBlueprint(readFileSync(path, 'utf8'), options);
 }
 
 /** Belt Mk.III or Mk.II chain records etc. are told apart by item id; sorters are the 2011..2014 range. */
