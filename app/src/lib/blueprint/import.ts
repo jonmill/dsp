@@ -23,7 +23,7 @@
  * became.
  *
  * Stacks. A blueprint stores no link between stacked buildings, only their heights. A multiLevel building (a lab) standing
- * on another of the same building (item), on the same x, y and yaw and one lapJoint higher, gets that building as its `stackParentId`.
+ * on another of the same kind (a Self-evolution Lab on a Matrix Lab), on the same x, y and yaw and one lapJoint higher, gets that building as its `stackParentId`.
  *
  * What is not imported. Only the kinds the planner models: production buildings, labs, stations, power nodes, belts and
  * sorters. Every other record (splitters, depots, spray coaters, unknown item ids...) is skipped and named in one
@@ -109,7 +109,7 @@ const STACK_XY_TOL = 0.05;
 const STACK_Z_TOL_M = 0.05;
 
 /**
- * Sets `stackParentId` on every multiLevel building that stands directly on another of the same building: the same x, y
+ * Sets `stackParentId` on every multiLevel building that stands directly on another of the same kind: the same x, y
  * and yaw, and its z one `lapJoint` of the lower building above the lower one's (a blueprint stores no link, the
  * stack is only a matter of position). The first such building in record order is the parent.
  */
@@ -120,7 +120,8 @@ function linkStacks(buildings: PlacedBuilding[], defOf: (b: PlacedBuilding) => B
     const parent = buildings.find((q) => {
       if (q === b || q.yaw !== b.yaw || Math.abs(q.x - b.x) > STACK_XY_TOL || Math.abs(q.y - b.y) > STACK_XY_TOL) return false;
       const lower = defOf(q);
-      if (q.itemId !== b.itemId || !lower?.geometry.multiLevel || !(lower.geometry.lapJoint[1] > 0)) return false;
+      // the kind, not the item: Matrix and Self-evolution Labs mix in one stack (mechanics.md §8, "mixable")
+      if (!lower?.geometry.multiLevel || lower.kind !== def.kind || !(lower.geometry.lapJoint[1] > 0)) return false;
       return Math.abs((b.z - q.z) * LEVEL - lower.geometry.lapJoint[1]) <= STACK_Z_TOL_M;
     });
     if (parent) b.stackParentId = parent.id;

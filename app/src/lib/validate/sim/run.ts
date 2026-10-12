@@ -355,14 +355,9 @@ function addMachines(
  */
 function addLabStacks(world: World, layout: Layout, machines: Map<number, MachineSim>, warnings: string[]): void {
   const above = new Map<number, PlacedBuilding>();
-  const byId = new Map(layout.buildings.map((b) => [b.id, b] as const));
   for (const b of layout.buildings) {
     const below = b.stackParentId;
     if (below === undefined || !machines.has(b.id) || !machines.has(below)) continue;
-    if (byId.get(below)?.itemId !== b.itemId) {
-      warnings.push(`building ${b.id} is stacked on building ${below}, which is a different building: only the same building stacks, so they are not linked`);
-      continue;
-    }
     const taken = above.get(below);
     if (taken) {
       warnings.push(`buildings ${taken.id} and ${b.id} are both stacked on building ${below}; only ${taken.id} is linked`);

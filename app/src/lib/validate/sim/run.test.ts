@@ -515,14 +515,14 @@ describe('runSimulation: lab stacks', () => {
     expect(Math.abs(six.measuredTargetRate - 2)).toBeLessThan(0.04);
   });
 
-  it('does not link a lab to a different building under it: the upper lab starves and the layout says why', () => {
+  it('links a Self-evolution Lab to the Matrix Lab under it: the labs mix in one stack (mechanics.md §8)', () => {
     const rig = labs(1, 2);
     const layout = rig.kit.layout();
     layout.buildings = layout.buildings.map((b) => (b.stackParentId === undefined ? b : { ...b, itemId: 2902 }));
     const sim = runSimulation(layout, rig.plan, fixtureData, fixtureEffects, { warmupTicks: 3600, measureTicks: 18000 });
-    expect(sim.warnings.join('\n')).toMatch(/stacked on building \d+, which is a different building/);
-    // only the bottom lab is fed (the Self-evolution lab up top gets nothing)
-    expect(sim.machineStats[1].crafts).toBe(0);
+    expect(sim.warnings).toEqual([]);
+    // the upper lab is fed through the bottom one and works
+    expect(sim.machineStats[1].crafts).toBeGreaterThan(0);
   });
 
   it('without the links the upper labs would starve: that is what the stackParentId buys', () => {

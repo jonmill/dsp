@@ -339,9 +339,9 @@ class GeometryChecker {
   }
 
   /**
-   * Stacking (MX §4.4, §8). A building that carries a `stackParentId` stands on that building: the same multiLevel
-   * building (the same item, not just the same kind: MX §8 calls the labs mixable, which is not relied on here), on the
-   * same x, y and yaw, one `lapJoint` of the lower one higher. A stack of labs is at most `effects.labLevel` high (other
+   * Stacking (MX §4.4, §8). A building that carries a `stackParentId` stands on that building: the same kind of
+   * multiLevel building (Matrix and Self-evolution Labs mix), on the same x, y and yaw, one `lapJoint` of the lower
+   * one higher. A stack of labs is at most `effects.labLevel` high (other
    * kinds are not limited here: their limits are not modelled). `stackedOk` holds the buildings whose link to the
    * building below is right; `stackProblems` the rest, and the stacks that are too tall.
    *
@@ -352,11 +352,9 @@ class GeometryChecker {
   private analyzeStacks(): void {
     const linkProblem = (e: BuildingEntry, parent: BuildingEntry): string | undefined => {
       const geo = (x: BuildingEntry) => x.bd.geometry;
+      // the kind, not the item: Matrix and Self-evolution Labs mix in one stack (mechanics.md §8, "mixable")
       if (e.bd.kind !== parent.bd.kind) {
         return `${label(e)} is stacked on ${label(parent)}, but they are different kinds of building (${e.bd.kind} and ${parent.bd.kind})`;
-      }
-      if (e.b.itemId !== parent.b.itemId) {
-        return `${label(e)} is stacked on ${label(parent)}, but they are different buildings: only the same building stacks`;
       }
       if (!geo(e).multiLevel || !geo(parent).multiLevel) {
         const flat = geo(e).multiLevel ? parent : e;
