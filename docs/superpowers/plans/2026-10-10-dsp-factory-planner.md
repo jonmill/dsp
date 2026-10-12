@@ -1426,7 +1426,7 @@ export const VERIFIED_MOTIFS: Set<MotifInstance['kind']>;   // spec §6.4: enabl
 ### Task 29: Multiple stations and by-product exports
 
 **Files:**
-- Modify: `placement.ts` (several stations: placed in a row at the origin with spacing from a non-collision search), `taps.ts` (port assignment across stations), `assemble.ts` (one StationConfig per station)
+- Modify: `placement.ts` (several stations: placed in a column at the origin (ports facing east, machines east of the column) with computed non-colliding spacing — amended in execution), `taps.ts` (port assignment across stations), `assemble.ts` (one StationConfig per station)
 - Test: `app/test/multistation-e2e.test.ts`
 
 - [ ] **Step 1:** E2E tests:
