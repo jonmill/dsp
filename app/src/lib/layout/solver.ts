@@ -26,7 +26,7 @@
 // Simulation. Left to the validator's defaults (adaptive warm-up, 18000 measured ticks) unless `simWarmupTicks` /
 // `simMeasureTicks` say otherwise. A warm-up derived from the layout (belt length, chain depth) was not used: a
 // six-stage Processor chain needs 10 game minutes to fill though its belts are short, so any such estimate can be
-// too short, where the adaptive one only errs by stopping early; `validateWithRetry` covers that with one more run.
+// too short; the adaptive warm-up keeps going until the target reaches its rate (or its 72000-tick cap).
 //
 // Time. `opts.now` is the clock (milliseconds); the default is `performance.now`. The result depends only on the
 // inputs, `opts.seed` and the clock readings, so a test with a fake clock is deterministic.
@@ -166,19 +166,13 @@ export interface SimSettings {
 /** A target output short of the provisioned rate by less than this share is a near miss (see `validateWithRetry`). */
 const NEAR_MISS = 0.02;
 const TICKS_PER_SECOND = 60;
-/** The longest warm-up the validator's adaptive warm-up runs (20 game minutes). */
-const LONG_WARMUP_TICKS = 72_000;
 
 /**
- * The full validator on `layout`, with one more try for a candidate the simulation rejects for a reason that may be
- * the length of the run rather than the layout (the verdict of the second run stands):
- *  - Long chains (Quantum Chips) oscillate around their rate by about 2 % from one 60 s window to the next, so a
- *    candidate whose only violation is SIM_OUTPUT_LOW, and short by under 2 %, is measured again over a window
- *    twice as long (an average over more cycles).
- *  - The adaptive warm-up ends once two windows agree, which a block still filling its belts can do on the way up
- *    (a six-stage Processor chain settles after 10 game minutes, the adaptive warm-up stopped at 2 to 4). When the
- *    caller left the warm-up to it and it ended before its 72000-tick cap, the second run warms up for the whole cap.
- * Nothing is retried after a deadlock, or when the caller fixed the warm-up and the shortfall is not a near miss.
+ * The full validator on `layout`. Plans of long chains (Quantum Chips) oscillate around their rate by about 2 % from
+ * one 60 s window to the next, so a candidate whose only violation is SIM_OUTPUT_LOW, and short by under 2 %, is
+ * validated once more with a measure window twice as long (an average over more cycles) before it is rejected. The
+ * verdict of the longer window stands. (The warm-up is the caller's or the validator's business: a layout this accepts
+ * is one that `validateLayout` accepts with the same options, up to the longer window.)
  */
 export function validateWithRetry(
   layout: Layout,
@@ -190,18 +184,12 @@ export function validateWithRetry(
 ): ValidationReport {
   const opts: ValidateOptions = { simulate: sim.simulate, warmupTicks: sim.warmupTicks, measureTicks: sim.measureTicks };
   const first = validate(layout, plan, data, effects, opts);
-  if (first.pass || !first.sim || first.sim.deadlocked) return first;
-
+  if (first.pass || !first.sim) return first;
+  if (first.violations.length !== 1 || first.violations[0].code !== 'SIM_OUTPUT_LOW') return first;
   const wanted = layout.meta.planTargetRate;
-  const onlyLow = first.violations.length === 1 && first.violations[0].code === 'SIM_OUTPUT_LOW';
-  const nearMiss = onlyLow && wanted > 0 && first.sim.measuredTargetRate >= (1 - NEAR_MISS) * wanted;
-  const unsettled = sim.warmupTicks === undefined && first.sim.warmupTicksUsed < LONG_WARMUP_TICKS;
-  if (!nearMiss && !unsettled) return first;
-
-  const second: ValidateOptions = { ...opts };
-  if (nearMiss) second.measureTicks = 2 * Math.round(first.sim.measureSeconds * TICKS_PER_SECOND);
-  if (unsettled) second.warmupTicks = LONG_WARMUP_TICKS;
-  return validate(layout, plan, data, effects, second);
+  if (!(wanted > 0) || first.sim.measuredTargetRate < (1 - NEAR_MISS) * wanted) return first;
+  const window = Math.round(first.sim.measureSeconds * TICKS_PER_SECOND);
+  return validate(layout, plan, data, effects, { ...opts, measureTicks: 2 * window });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -236,7 +224,7 @@ interface Best extends MarginPlacement {
   footprint: number;
 }
 
-type Built = { layout: Layout } | { failures: string[] } | { stopped: true };
+type Built = { layout: Layout; footprint: number } | { failures: string[] } | { stopped: true };
 
 /** The violations of a report as messages. */
 const violationMessages = (report: ValidationReport): string[] => report.violations.map((v) => `${v.code}: ${v.message}`);
@@ -247,6 +235,7 @@ const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.m
  * `solve` as a generator: it yields between candidates and returns the result. See the file comment.
  * `onProgress` is called once at the start, once after every candidate and once at the end (phase `'done'`);
  * `onImproved` for every layout that passes the full validator and has a smaller footprint than the one before.
+ * `validate` is the full validator (`validateLayout`; a parameter for tests).
  */
 export function* solveSteps(
   plan: ProductionPlan,
@@ -256,6 +245,7 @@ export function* solveSteps(
   onProgress: (p: SolveProgress) => void,
   onImproved: (layout: Layout, report: ValidationReport, footprint: number) => void,
   shouldStop: () => boolean,
+  validate: typeof validateLayout = validateLayout,
 ): Generator<void, SolveResult, void> {
   const now = opts.now ?? ((): number => performance.now());
   const startedAt = now();
@@ -281,9 +271,9 @@ export function* solveSteps(
   let lastFailure: string | undefined;
   const failures: string[] = [];
 
-  /** An internal error of the improvement loop goes into `failures` once, however often it repeats. */
-  const noteInternalError = (message: string): void => {
-    if (!failures.includes(message)) failures.push(message);
+  /** An internal error of the improvement loop goes into `failures` once, however often it repeats (or at which margin). */
+  const noteInternalError = (margin: number, text: string): void => {
+    if (!failures.some((f) => f.endsWith(text))) failures.push(`margin ${margin}: ${text}`);
   };
 
   const progress = (phase: string): void =>
@@ -319,7 +309,7 @@ export function* solveSteps(
     const layout = assembleLayout(net, placement, taps, routed.routes, poles, plan, data);
     const checked = validateLayout(layout, plan, data, effects, { simulate: false });
     if (!checked.pass) return { failures: violationMessages(checked) };
-    return { layout };
+    return { layout, footprint: footprintOf(layout, data) };
   };
 
   /** Builds a candidate, turning a crash into a failure so one bad candidate never costs the best layout so far. */
@@ -331,14 +321,21 @@ export function* solveSteps(
     }
   };
 
-  /** Runs the full validator on a candidate; a pass is the new best, and is emitted. */
-  const accept = (layout: Layout, placed: MarginPlacement): Best | ValidationReport => {
-    const report = validateWithRetry(layout, plan, data, effects, sim);
-    if (!report.pass) return report;
-    const footprint = footprintOf(layout, data);
+  /**
+   * Runs the full validator on a candidate; a pass is the new best, and is emitted. A throw of the validator or the
+   * simulator is a failure of this candidate like any other.
+   */
+  const accept = (built: { layout: Layout; footprint: number }, placed: MarginPlacement): { best: Best } | { failures: string[] } => {
+    let report: ValidationReport;
+    try {
+      report = validateWithRetry(built.layout, plan, data, effects, sim, validate);
+    } catch (err) {
+      return { failures: [`internal error: ${err instanceof Error ? err.message : String(err)}`] };
+    }
+    if (!report.pass) return { failures: violationMessages(report) };
     lastImprovedAt = elapsed();
-    onImproved(layout, report, footprint);
-    return { ...placed, layout, report, footprint };
+    onImproved(built.layout, report, built.footprint);
+    return { best: { ...placed, layout: built.layout, report, footprint: built.footprint } };
   };
 
   // --- fallback ladder
@@ -358,13 +355,13 @@ export function* solveSteps(
       continue;
     }
     validated++;
-    const accepted = accept(built.layout, placed);
-    if ('layout' in accepted) {
-      best = accepted;
+    const accepted = accept(built, placed);
+    if ('best' in accepted) {
+      best = accepted.best;
       progress(`ladder: margin ${margin}`);
       break;
     }
-    const tagged = violationMessages(accepted).map((f) => `margin ${margin}: ${f}`);
+    const tagged = accepted.failures.map((f) => `margin ${margin}: ${f}`);
     failures.push(...tagged);
     lastFailure = tagged[0];
     progress(`ladder: margin ${margin} rejected`);
@@ -409,7 +406,7 @@ export function* solveSteps(
     } catch (err) {
       attempts++;
       lastFailure = `internal error: ${err instanceof Error ? err.message : String(err)}`;
-      noteInternalError(`margin ${margin}: ${lastFailure}`);
+      noteInternalError(margin, lastFailure);
       progress(`improve: margin ${margin} errored`);
       continue;
     }
@@ -432,24 +429,24 @@ export function* solveSteps(
     }
     if ('failures' in built) {
       lastFailure = `margin ${margin}: ${built.failures[0]}`;
-      if (built.failures[0].startsWith('internal error')) noteInternalError(lastFailure);
+      if (built.failures[0].startsWith('internal error')) noteInternalError(margin, built.failures[0]);
       progress(`improve: margin ${margin} failed`);
       continue;
     }
     validated++;
-    const footprint = footprintOf(built.layout, data);
-    if (footprint >= current.footprint - FOOTPRINT_EPS) {
+    if (built.footprint >= current.footprint - FOOTPRINT_EPS) {
       lastFailure = undefined;
-      progress(`improve: margin ${margin}, no smaller (${footprint.toFixed(0)} against ${current.footprint.toFixed(0)})`);
+      progress(`improve: margin ${margin}, no smaller (${built.footprint.toFixed(0)} against ${current.footprint.toFixed(0)})`);
       continue;
     }
-    const accepted = accept(built.layout, placed);
-    if ('layout' in accepted) {
-      best = accepted;
+    const accepted = accept(built, placed);
+    if ('best' in accepted) {
+      best = accepted.best;
       lastFailure = undefined;
-      progress(`improve: margin ${margin}, footprint ${footprint.toFixed(0)}`);
+      progress(`improve: margin ${margin}, footprint ${built.footprint.toFixed(0)}`);
     } else {
-      lastFailure = `margin ${margin}: ${violationMessages(accepted)[0]}`;
+      lastFailure = `margin ${margin}: ${accepted.failures[0]}`;
+      if (accepted.failures[0].startsWith('internal error')) noteInternalError(margin, accepted.failures[0]);
       progress(`improve: margin ${margin} rejected by the simulation`);
     }
   }
@@ -467,8 +464,9 @@ export function solve(
   onProgress: (p: SolveProgress) => void,
   onImproved: (layout: Layout, report: ValidationReport, footprint: number) => void,
   shouldStop: () => boolean,
+  validate: typeof validateLayout = validateLayout,
 ): SolveResult {
-  const steps = solveSteps(plan, data, effects, opts, onProgress, onImproved, shouldStop);
+  const steps = solveSteps(plan, data, effects, opts, onProgress, onImproved, shouldStop, validate);
   for (;;) {
     const next = steps.next();
     if (next.done) return next.value;

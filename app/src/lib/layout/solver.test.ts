@@ -2,12 +2,12 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ProductionPlan } from '../calc';
 import type { Layout, PlacedBuilding } from '../geometry';
 import { LayoutKit, compositeLayout } from '../validate/testkit';
-import { validateLayout } from '../validate';
+import { MAX_WARMUP_TICKS, validateLayout } from '../validate';
 import type { ValidateOptions, ValidationReport } from '../validate';
 import type { SimResult } from '../validate/sim/run';
 import { annealStart, DEFAULT_SOLVE_OPTIONS, footprintOf, solve, solveSteps, validateWithRetry } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
-import { data, effects, occupancyOf, planFor, SMELTER } from './testkit';
+import { ASSEMBLER, data, effects, occupancyOf, planFor, SMELTER } from './testkit';
 
 /** 3 Iron Ingots/s on three smelters from supplied Iron Ore: three machines, one station. Small and quick to solve. */
 const ingotPlan = (): Promise<ProductionPlan> =>
@@ -124,10 +124,10 @@ describe('annealStart (carry: annealPlacement throws on an initial placement tha
   });
 });
 
-describe('validateWithRetry (a second, more patient run for a rejection that may be the run)', () => {
+describe('validateWithRetry (a longer measure window for a near miss)', () => {
   const layout: Layout = { ...compositeLayout().kit.layout(), meta: { ...compositeLayout().kit.layout().meta, planTargetRate: 2 } };
   const plan = {} as ProductionPlan;
-  const CAP = 72_000;
+  const CAP = MAX_WARMUP_TICKS;
   /** A simulation result; the warm-up it used defaults to the adaptive cap. */
   const sim = (rate: number, seconds = 60, warmupTicksUsed = CAP, deadlocked = false): SimResult =>
     ({ measuredTargetRate: rate, measureSeconds: seconds, warmupTicksUsed, deadlocked }) as SimResult;
@@ -163,7 +163,7 @@ describe('validateWithRetry (a second, more patient run for a rejection that may
       ]);
     });
 
-    it('doubles the window the first run measured when none was given, and keeps the adaptive warm-up that reached its cap', () => {
+    it('doubles the window the first run measured when none was given, and leaves the warm-up adaptive', () => {
       const v = validator(report([low], sim(1.97, 300)), report([], sim(2, 600)));
       retry(v);
       expect(v.calls[1].measureTicks).toBe(36000);
@@ -186,43 +186,19 @@ describe('validateWithRetry (a second, more patient run for a rejection that may
     });
   });
 
-  describe('the adaptive warm-up can end while the block is still filling', () => {
-    it('warms up for the whole 72000-tick cap in the second run when the adaptive warm-up ended before it', () => {
-      const second = report([], sim(2, 300));
-      const v = validator(report([low, stalled], sim(1.5, 300, 10_800)), second);
-      expect(retry(v, { simulate: true, measureTicks: 18000 })).toBe(second);
-      expect(v.calls).toEqual([
-        { simulate: true, measureTicks: 18000 },
-        { simulate: true, warmupTicks: CAP, measureTicks: 18000 },
-      ]);
-    });
+  it('leaves the warm-up as it was in the second run, adaptive or fixed, and never retries a shortfall of 2 % or more', () => {
+    // an adaptive warm-up that ended before its cap is the validator's business now (it stops only on the provisioned rate)
+    const first = report([low, stalled], sim(1.5, 300, 10_800));
+    const v = validator(first);
+    expect(retry(v)).toBe(first);
+    expect(v.calls).toHaveLength(1);
+  });
 
-    it('does both when the first run was also a near miss', () => {
-      const v = validator(report([low], sim(1.97, 60, 7_200)), report([], sim(2, 120)));
-      retry(v);
-      expect(v.calls[1]).toEqual({ simulate: true, warmupTicks: CAP, measureTicks: 7200, });
-    });
-
-    it('does not retry when the adaptive warm-up already ran to its cap', () => {
-      const first = report([low, stalled], sim(1.5, 300, CAP));
-      const v = validator(first);
-      expect(retry(v)).toBe(first);
-      expect(v.calls).toHaveLength(1);
-    });
-
-    it('leaves a warm-up the caller fixed alone', () => {
-      const first = report([low, stalled], sim(1.5, 300, 1800));
-      const v = validator(first);
-      expect(retry(v, { simulate: true, warmupTicks: 1800, measureTicks: 3600 })).toBe(first);
-      expect(v.calls).toHaveLength(1);
-    });
-
-    it('does not retry a deadlock', () => {
-      const first = report([{ code: 'SIM_DEADLOCK', entities: [], message: 'stuck' }, low], sim(0, 300, 7_200, true));
-      const v = validator(first);
-      expect(retry(v)).toBe(first);
-      expect(v.calls).toHaveLength(1);
-    });
+  it('does not retry a deadlock', () => {
+    const first = report([{ code: 'SIM_DEADLOCK', entities: [], message: 'stuck' }, low], sim(0, 300, 7_200, true));
+    const v = validator(first);
+    expect(retry(v)).toBe(first);
+    expect(v.calls).toHaveLength(1);
   });
 
   it('does not retry a pass, a static failure or a run without a simulation', () => {
@@ -335,6 +311,92 @@ describe('solve', () => {
     expect(result.attempts).toBe(3);
     expect(improved).not.toHaveBeenCalled();
     for (const margin of [3, 4, 6]) expect(result.failures.some((f) => f.startsWith(`margin ${margin}: `) && /power/.test(f))).toBe(true);
+  }, 120_000);
+
+  /** A validator that answers `verdicts[n]` to the n-th full validation (the real one when that is undefined). */
+  function scripted(verdicts: (ValidationReport | Error | undefined)[]) {
+    let calls = 0;
+    const fn = ((layout, plan, d, fx, o) => {
+      const verdict = verdicts[calls++];
+      if (verdict instanceof Error) throw verdict;
+      return verdict ?? validateLayout(layout, plan, d, fx, o);
+    }) as typeof validateLayout;
+    return { fn, calls: () => calls };
+  }
+  const rejection: ValidationReport = {
+    pass: false,
+    violations: [{ code: 'SIM_STALLED', entities: [], message: 'made up' }],
+    checkedAt: '',
+    stage: 'simulation',
+  };
+
+  it('runs the fallback ladder across its rungs whatever the budget: rung 1 fails, rung 2 is still built and simulated', async () => {
+    const v = scripted([rejection]);
+    const fake = fakeClock(60_000);
+    const improved = vi.fn();
+    const result = solve(
+      await ingotPlan(), data, effects,
+      { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, minRunMs: 1e9, now: fake.now },
+      (p) => fake.onProgress(p), improved, () => false, v.fn,
+    );
+    expect(result.stoppedBy).toBe('budget');
+    expect(result.attempts).toBe(2);
+    expect(result.layout).not.toBeNull();
+    expect(result.report!.pass).toBe(true);
+    expect(result.failures).toEqual(['margin 3: SIM_STALLED: made up']);
+    expect(improved).toHaveBeenCalledTimes(1);
+    expect(v.calls()).toBe(2);
+  }, 120_000);
+
+  it('records a validator that throws as a failure of that candidate: in the ladder the next rung goes on', async () => {
+    const v = scripted([new Error('boom')]);
+    const fake = fakeClock(60_000);
+    const result = solve(
+      await ingotPlan(), data, effects,
+      { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, minRunMs: 1e9, now: fake.now },
+      (p) => fake.onProgress(p), () => {}, () => false, v.fn,
+    );
+    expect(result.layout).not.toBeNull();
+    expect(result.attempts).toBe(2);
+    expect(result.failures).toEqual(['margin 3: internal error: boom']);
+  }, 120_000);
+
+  it('records a validator that throws in the improvement loop once, keeps the best so far and goes on', async () => {
+    // the first full validation passes (the ladder's); every later one throws
+    const v = scripted([undefined, ...Array.from({ length: 200 }, () => new Error('simulator blew up'))]);
+    const fake = fakeClock(1_000);
+    const improved: number[] = [];
+    const result = solve(
+      await ingotPlan(), data, effects,
+      { ...DEFAULT_SOLVE_OPTIONS, ...SIM, seed: 7, timeBudgetMs: 12_000, minRunMs: 1e9, now: fake.now },
+      (p) => fake.onProgress(p), (_l, _r, f) => improved.push(f), () => false, v.fn,
+    );
+    expect(result.stoppedBy).toBe('budget');
+    expect(improved).toHaveLength(1); // the ladder's layout
+    expect(result.layout).not.toBeNull();
+    expect(result.footprint).toBe(improved[0]);
+    expect(result.failures).toHaveLength(1); // once, though several candidates reached the validator
+    expect(result.failures[0]).toMatch(/^margin [12]: internal error: simulator blew up$/);
+    expect(v.calls()).toBeGreaterThan(2);
+  }, 120_000);
+
+  it('a plain Processor/s plan on default facilities (a slow chain) is accepted only if plain validateLayout accepts it', async () => {
+    // Mk.I assemblers, Re-composing Assemblers and Negentropy Smelters: the chain fills over 10 game minutes. The
+    // adaptive warm-up used to stop on a plateau at 0.86 of the rate, and a longer warm-up in the solver accepted what
+    // validateLayout rejected.
+    const plan = await planFor({
+      targetItemId: 1303,
+      finalFacilityItemId: ASSEMBLER,
+      suppliedItemIds: new Set([1001, 1002, 1003]),
+    });
+    const result = solve(plan, data, effects, { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: 1 }, () => {}, () => {}, () => false);
+    expect(result.failures).toEqual([]);
+    expect(result.layout).not.toBeNull();
+    const plain = validateLayout(result.layout!, plan, data, effects);
+    expect(messages(plain)).toEqual([]);
+    expect(plain.pass).toBe(true);
+    expect(plain.sim!.measuredTargetRate).toBeGreaterThanOrEqual(0.99);
+    expect(result.report!.sim!.warmupTicksUsed).toBeGreaterThan(14_400); // the ramp took more than the plateau at 0.86
   }, 120_000);
 
   it('does not simulate when simulate is false', async () => {

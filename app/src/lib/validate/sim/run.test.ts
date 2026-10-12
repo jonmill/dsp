@@ -3,7 +3,7 @@ import { GameDataIndex } from '../../data';
 import type { Layout } from '../../geometry';
 import { checkSimulation } from '../report';
 import { codesOf, fixtureData, fixtureEffects, ITEM, LayoutKit, line, only, onNode, onSlot, planOf, refineryLayout, smelterRowLayout, stationConfig, stationPairLayout } from '../testkit';
-import { runSimulation } from './run';
+import { MAX_WARMUP_TICKS, runSimulation } from './run';
 import type { SimResult } from './run';
 
 const TPS = 60;
@@ -166,20 +166,19 @@ describe('runSimulation: the warm-up', () => {
     expect(run(20).warmupTicksUsed).toBe(10800);
   });
 
-  it('stops once two consecutive windows agree within 1 %, though the provisioned rate is never reached', () => {
+  it('does not stop on a plateau below the provisioned rate: a block that cannot reach it keeps warming up to the cap', () => {
     const row = smelterRowLayout(3);
-    row.plan.exports = [{ itemId: 1101, perSecond: 5 }]; // the row makes 3/s
+    row.plan.exports = [{ itemId: 1101, perSecond: 5 }]; // the row makes 3/s; steady from the second window on
     const sim = simulate(row, { measureTicks: 3600 });
-    expect(sim.warmupTicksUsed).toBeGreaterThanOrEqual(7200);
-    expect(sim.warmupTicksUsed).toBeLessThan(18000);
+    expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
     expect(Math.abs(sim.measuredTargetRate - 3)).toBeLessThan(0.05);
   });
 
-  it('does not take two windows without any output as agreeing: a block that makes nothing runs to the 72000-tick cap', () => {
+  it('a block that makes nothing runs to the 72000-tick cap', () => {
     const row = smelterRowLayout(3);
     row.ore.source = undefined; // no ore ever enters
     const sim = simulate(row, { measureTicks: 600 });
-    expect(sim.warmupTicksUsed).toBe(72000);
+    expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
     expect(sim.measuredTargetRate).toBe(0);
     expect(sim.deadlocked).toBe(true);
   });

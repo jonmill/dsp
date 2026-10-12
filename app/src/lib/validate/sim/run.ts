@@ -22,10 +22,11 @@ import type { SimEntity } from './world';
 export interface SimOptions {
   /**
    * Ticks to run before measuring, used exactly. Omitted: adaptive. The warm-up then runs in windows of 3600 ticks and
-   * stops after the first of two consecutive windows that both reach 99.9 % of the provisioned rate, or agree within
-   * 1 % (both above zero): so at least two windows, and never after 72000 ticks (20 game minutes). Two, so that one
-   * window that overshoots while the block is still filling does not end it. `SimResult.warmupTicksUsed` says how long
-   * it ran.
+   * stops only after two consecutive windows that both reach 99.9 % of the provisioned rate (so at least two windows,
+   * and one window that overshoots while the block is still filling does not end it), and never after
+   * `MAX_WARMUP_TICKS` (20 game minutes). A block that settles below the provisioned rate runs to the cap: a plateau is
+   * no proof of a steady state (a long chain fills in steps), and the measurement then judges it. `SimResult.warmupTicksUsed`
+   * says how long it ran.
    */
   warmupTicks?: number;
   /** Ticks measured. Default 18000 (5 game minutes). */
@@ -87,9 +88,7 @@ export interface SimResult {
 /** The adaptive warm-up runs in windows of this many ticks (1 game minute), at least two of them. */
 const WARMUP_WINDOW_TICKS = 3600;
 /** The adaptive warm-up gives up on a steady state after this many ticks (20 game minutes). */
-const MAX_WARMUP_TICKS = 72000;
-/** Two consecutive warm-up windows agree when their rates differ by at most this share of the larger one. */
-const WARMUP_AGREEMENT = 0.01;
+export const MAX_WARMUP_TICKS = 72000;
 /** Two consecutive warm-up windows that each make this share of the provisioned rate end the adaptive warm-up. */
 const WARMUP_REACHED = 0.999;
 const DEFAULT_MEASURE_TICKS = 18000;
@@ -220,7 +219,8 @@ export function runSimulation(
   if (opts.warmupTicks !== undefined) {
     for (; warmupTicksUsed < opts.warmupTicks; warmupTicksUsed++) world.tick();
   } else {
-    // Adaptive: windows of the target's rate until two in a row are steady (or as good as provisioned), at most 72000 ticks.
+    // Adaptive: windows of the target's rate until two in a row reach the provisioned rate, at most MAX_WARMUP_TICKS.
+    // Two windows that merely agree do not end it: a deep chain fills in steps, with plateaus between them.
     const wanted = provisionedRate(plan);
     const reached = (rate: number): boolean => wanted > 0 && rate >= WARMUP_REACHED * wanted;
     let previous = 0;
@@ -230,8 +230,6 @@ export function runSimulation(
       warmupTicksUsed += WARMUP_WINDOW_TICKS;
       const windowRate = (received(targetItem) - before) / (WARMUP_WINDOW_TICKS / tps);
       if (reached(previous) && reached(windowRate)) break;
-      // a rate of zero twice is not steady: a long belt or a deep chain has not delivered yet
-      if (previous > 0 && windowRate > 0 && Math.abs(windowRate - previous) <= WARMUP_AGREEMENT * Math.max(windowRate, previous)) break;
       previous = windowRate;
     }
   }

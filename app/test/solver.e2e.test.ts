@@ -5,7 +5,8 @@
 // (1800 warm-up, 3600 measured) buy nothing, and they cost correctness: a 60 s window can read one item short of the
 // rate (0.983 of 1/s) which the validator tolerates but the 0.99 assertion here does not, and the Processor on Mk.II
 // belts has not filled its chain after 1800 ticks (0.63 of 1/s; at 7200 ticks it reaches the full rate). Slow: it
-// logs its runtimes. The property test checks every layout the solver emits for random plans.
+// logs its runtimes. The property test checks every layout the solver emits for random plans. Run with
+// `npm run test:e2e` (about 2 minutes); `npm test` leaves it out.
 import { describe, expect, it } from 'vitest';
 import type { PlanRequest, ProductionPlan } from '../src/lib/calc';
 import { planProduction } from '../src/lib/calc';
