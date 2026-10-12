@@ -44,6 +44,21 @@ async function appWith(layout = compositeLayout().kit.layout(), report: Validati
 
 const html = (component: typeof BlueprintPanel, app: AppState): string => render(component, { props: { app } }).body;
 
+/** The text of a rendered fragment: comments and tags gone, white space collapsed. */
+const textOf = (fragment: string): string =>
+  fragment.replace(/<!--[\s\S]*?-->/g, '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim();
+
+/** The table row whose header cell starts with `label`, as text: its header and its value cells, with no markup in them. */
+function tableRow(page: string, label: string): { header: string; cells: string[] } {
+  for (const [, row] of page.matchAll(/<tr\b[^>]*>([\s\S]*?)<\/tr>/g)) {
+    const header = /<th\b[^>]*>([\s\S]*?)<\/th>/.exec(row);
+    if (header && textOf(header[1]).startsWith(label)) {
+      return { header: textOf(header[1]), cells: [...row.matchAll(/<td\b[^>]*>([\s\S]*?)<\/td>/g)].map((m) => textOf(m[1])) };
+    }
+  }
+  throw new Error(`no table row labelled "${label}"`);
+}
+
 describe('BlueprintPanel', () => {
   it('always carries the equatorial band note, even before there is a blueprint', async () => {
     const { app } = await appWith();
@@ -133,10 +148,13 @@ describe('ValidationPanel', () => {
     expect(plan.stationsNeeded).toBe(1);
     const page = html(ValidationPanel, app);
     expect(page).toContain('Plan estimate (with the 2 stations of this layout)');
-    // 12 MW for the one station the plan counts becomes 120 MW: peak + 108 MW, steady + 10.8 MW
-    expect(page).toContain(formatPower(plan.power.steadyW + 10.8e6));
-    expect(page).toContain(formatPower(plan.power.peakW + 108e6));
-    expect(page).not.toContain(formatPower(plan.power.peakW) + '<');
+    // 12 MW for the one station the plan counts becomes 120 MW: peak + 108 MW, steady + 10.8 MW. The row of the estimate holds exactly
+    // those two values (the plan's own peak is not among them), and the measured row beside it is the simulation's.
+    const estimate = tableRow(page, 'Plan estimate');
+    expect(estimate.header).toBe('Plan estimate (with the 2 stations of this layout)');
+    expect(estimate.cells).toEqual([formatPower(plan.power.steadyW + 10.8e6), formatPower(plan.power.peakW + 108e6)]);
+    expect(estimate.cells).not.toContain(formatPower(plan.power.peakW));
+    expect(tableRow(page, 'Measured').cells).toEqual([formatPower(1_500_000), formatPower(4_000_000)]);
   });
 
   it('says PASS with the simulated capacity next to the provisioned rate, and the measured power next to the estimate', async () => {
