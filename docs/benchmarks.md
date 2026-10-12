@@ -71,9 +71,11 @@ reachable when headings and phases are ignored).
 * A candidate's simulation waits for twice the best layout's warm-up (at least four windows) instead of 72000 ticks, but only
   when that is at most half the limit (a Quantum Chip layout settles after 32400 ticks in one run and never in the next), and
   it ends when the budget does.
-* The ladder keeps a layout that passed only over the doubled measure window of a near miss for the end of its three rungs, prefers a
-  rung that passes the plain window (Hydrogen Fuel Rod: its second rung; it needed the doubled window before), and has three more
-  rungs with the exact router when the first three fail (Conveyor Belt MK.II fails all three).
+* The ladder keeps a layout that passed only over the doubled measure window of a near miss until its three rungs end (or the user
+  stops it, which returns that layout), prefers a rung that passes the plain window (Hydrogen Fuel Rod: its second rung; it needed
+  the doubled window before), and has three more rungs with the exact router when the first three fail (Conveyor Belt MK.II fails
+  all three). The improvement loop never replaces a best that passes the plain window with a candidate that passes only over the
+  doubled one.
 
 ### Multi-lane taps (taps.ts)
 

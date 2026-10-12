@@ -10,9 +10,10 @@
 // ladder is not cut short by the time budget or the early stop (only by the user, who also ends a simulation under way);
 // when every rung fails the result has no layout, `stoppedBy: 'exhausted'` and every violation message in `failures`.
 // Task 27 added two things. A layout that passes only over the doubled measure window of a near miss (`validateGated`)
-// is kept for the end of the three rungs and a rung that passes the plain window is preferred to it, though it is no
-// smaller: the first three rungs end the ladder with the first such layout if none passes the plain window (Hydrogen Fuel
-// Rod needed the doubled window; its second rung passes the plain one). And when all three fail, the same margins are
+// is kept until the three rungs end and a rung that passes the plain window is preferred to it, though it is no smaller:
+// the first three rungs end the ladder with the first such layout if none passes the plain window (Hydrogen Fuel Rod
+// needed the doubled window; its second rung passes the plain one). A stop by the user, between rungs or inside one, also
+// ends the ladder with that layout, and emits it: a stop returns the best layout found. And when all three fail, the same margins are
 // tried again with the exact router (`ladderRungs`): the simulated output of a plan with no slack swings by up to 10 %
 // between two routings of one placement, and three layouts of one kind can fail together (Conveyor Belt MK.II).
 //
@@ -20,7 +21,10 @@
 // (or, if that was made at a smaller margin than this one, the constructive placement at this margin: an annealed
 // placement is only collision free at the margin it was annealed at) with a new seed, then build a candidate from it.
 // Margins 0-2 often leave nets unrouted; a failed candidate is normal, is counted and the loop goes on. A candidate
-// whose footprint is smaller than the best's goes to the full validator, and is emitted if it passes.
+// whose footprint is smaller than the best's goes to the full validator, and is emitted if it passes. A candidate that
+// passes only over the doubled window of a near miss never replaces a best that passes the plain window: it may be adopted
+// only while the best is itself such a pass, or when there is no best yet (`mayReplaceBest`; the ordinary chain's best and
+// the overall best both count). It is turned down like a failed simulation.
 // Adaptive effort (Task 27). The margin is picked by the record of the margins so far (`MarginPicker`): margin 1 is
 // often unroutable on large plans (a Quantum Chip candidate costs 25 s to fail), so its share shrinks, to 15 % at least,
 // while it fails. A candidate gives up its routing when the negotiation stalls or is far from converging
@@ -251,7 +255,10 @@ const MIN_WARMUP_SAVING = 0.5;
  * How long the improvement loop waits for a candidate to reach its rate: twice the warm-up the best layout needed, at least
  * 14400 ticks, and only when that is at most half of `MAX_WARMUP_TICKS`. The candidates of one plan fill alike, and a failing
  * one would otherwise run to the 72000-tick limit and measure 18000 more before it is turned down. A candidate that settles
- * within the cap warms up exactly as it would without it, so what passes is accepted by plain `validateLayout` too. A plan
+ * within the cap warms up and measures exactly as plain `validateLayout` would, so one that passes the plain window is
+ * accepted by plain `validateLayout` too. One that fails the plain window by under 2 % and passes only over the doubled
+ * window (`validateGated`) is not: the improvement loop adopts it only while the best is itself such a pass, never in place
+ * of a best that passes the plain window (`mayReplaceBest`). A plan
  * whose best layout needed more than a quarter of the limit (the Quantum Chip's oscillating output settles at 32400 ticks in
  * one layout and not at all in the next) gets no cap: a candidate that has not settled by twice that can still pass at the
  * limit, and a cap of 90 % of it would turn such candidates down for a tenth of the time. `undefined`: no cap.
@@ -469,6 +476,16 @@ export class BestKeeper<T extends { footprint: number }> {
   }
 }
 
+/**
+ * May `candidate`, which passed the full validator, replace `current` as the best layout? A layout that passes only over the
+ * doubled measure window of a near miss (`longerWindow`, see `validateGated`) never replaces one that passes the plain
+ * window: it may be adopted only while the best is itself such a pass, or when there is no best yet. A plain pass replaces
+ * anything (when it is smaller; the footprint is the caller's business).
+ */
+export function mayReplaceBest(current: { longerWindow: boolean } | null, candidate: { longerWindow: boolean }): boolean {
+  return !candidate.longerWindow || current === null || current.longerWindow;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The search
 
@@ -476,6 +493,8 @@ interface Best extends MarginPlacement {
   layout: Layout;
   report: ValidationReport;
   footprint: number;
+  /** It passed only over the doubled measure window of a near miss (see `validateGated`). */
+  longerWindow: boolean;
 }
 
 type Built = { layout: Layout; footprint: number } | { failures: string[] } | { stopped: true };
@@ -596,7 +615,7 @@ export function* solveSteps(
     placed: MarginPlacement,
     abort: () => boolean,
     warmupCap?: number,
-  ): { best: Best; longerWindow: boolean } | { failures: string[] } | { stopped: true } => {
+  ): { best: Best } | { failures: string[] } | { stopped: true } => {
     let report: ValidationReport;
     let longerWindow: boolean;
     try {
@@ -607,8 +626,15 @@ export function* solveSteps(
       return { failures: [`internal error: ${err instanceof Error ? err.message : String(err)}`] };
     }
     if (!report.pass) return { failures: violationMessages(report) };
-    return { best: { ...placed, layout: built.layout, report, footprint: built.footprint }, longerWindow };
+    return { best: { ...placed, layout: built.layout, report, footprint: built.footprint, longerWindow } };
   };
+
+  /**
+   * May a layout that passed the full validator become the best of its chain (`chainBest`; null: the motif chains, whose
+   * bests are placements only) and the overall best? Not if it passes only over the doubled window and either best passes the
+   * plain one (`mayReplaceBest`).
+   */
+  const mayTake = (chainBest: Best | null, candidate: Best): boolean => mayReplaceBest(chainBest, candidate) && mayReplaceBest(keeper.best, candidate);
 
   /** Makes a layout that passed the full validator the overall best if it is smaller, and reports it. */
   const adopt = (candidate: Best): void => {
@@ -618,19 +644,32 @@ export function* solveSteps(
   // --- fallback ladder
   progress('start');
   const rungs = ladderRungs();
-  /** The first layout that passed only over the doubled window; kept for the end of the ladder (see `validateGated`). */
+  /** The first layout that passed only over the doubled window; kept until the rungs end or the user stops (see `validateGated`). */
   let provisional: { best: Best; tag: string } | null = null;
+  /** Takes the parked layout, if the ladder found no plain pass: it is the layout the ladder found, whichever way it ends. */
+  const takeProvisional = (): void => {
+    if (baseBest || !provisional) return;
+    baseBest = provisional.best;
+    adopt(provisional.best);
+    progress(`ladder: ${provisional.tag}, over the longer window`);
+  };
   for (const [i, rung] of rungs.entries()) {
     // the exact rungs are a second chance for a ladder that found nothing: a layout over the doubled window is enough
     if (provisional && i === LADDER_MARGINS.length) break;
     const { margin } = rung;
     const tag = rung.exact ? `margin ${margin} (exact routes)` : `margin ${margin}`;
     yield;
-    if (shouldStop()) return result('user');
+    if (shouldStop()) {
+      takeProvisional();
+      return result('user');
+    }
     const placed: MarginPlacement = { placement: constructive(margin), margin };
     const built = tryBuild(net, placed.placement, shouldStop, rung.exact ? EXACT_ROUTE : {}, rung.exact);
     attempts++;
-    if ('stopped' in built) return result('user');
+    if ('stopped' in built) {
+      takeProvisional();
+      return result('user');
+    }
     if ('failures' in built) {
       const tagged = built.failures.map((f) => `${tag}: ${f}`);
       failures.push(...tagged);
@@ -641,9 +680,12 @@ export function* solveSteps(
     validated++;
     // the ladder is the guarantee: no warm-up cap, and only the user stops it (the budget does not)
     const accepted = accept(built, placed, shouldStop);
-    if ('stopped' in accepted) return result('user');
+    if ('stopped' in accepted) {
+      takeProvisional();
+      return result('user');
+    }
     if ('best' in accepted) {
-      if (accepted.longerWindow) {
+      if (accepted.best.longerWindow) {
         provisional ??= { best: accepted.best, tag };
         progress(`ladder: ${tag} passes over the longer window only`);
         continue;
@@ -658,11 +700,7 @@ export function* solveSteps(
     lastFailure = tagged[0];
     progress(`ladder: ${tag} rejected`);
   }
-  if (!baseBest && provisional) {
-    baseBest = provisional.best;
-    adopt(provisional.best);
-    progress(`ladder: ${provisional.tag}, over the longer window`);
-  }
+  takeProvisional();
   if (!keeper.best || !baseBest) return result(shouldStop() ? 'user' : 'exhausted');
 
   // --- improvement loop
@@ -764,6 +802,9 @@ export function* solveSteps(
     const accepted = accept(built, placed, improveStop, warmupCapFor(current.report));
     if ('stopped' in accepted) {
       progress(`improve: margin ${margin} stopped`);
+    } else if ('best' in accepted && !mayTake(current, accepted.best)) {
+      lastFailure = `margin ${margin}: passes only over the longer window, and the best passes the plain one`;
+      progress(`improve: margin ${margin}, over the longer window only, the best passes the plain one`);
     } else if ('best' in accepted) {
       baseBest = accepted.best;
       reheat.improved();
@@ -886,6 +927,10 @@ export function* solveSteps(
     const accepted = accept(built, placed, improveStop, warmupCapFor((keeper.best as Best).report));
     if ('stopped' in accepted) {
       progress(`motif ${name}: margin ${margin} stopped`);
+    } else if ('best' in accepted && !mayTake(null, accepted.best)) {
+      // like a layout the simulation turned down, it is no floor for the variant: later candidates of its size are still validated
+      lastFailure = `motif ${name}, margin ${margin}: passes only over the longer window, and the best passes the plain one`;
+      progress(`motif ${name}: margin ${margin}, over the longer window only, the best passes the plain one`);
     } else if ('best' in accepted) {
       variant.best = { ...placed, footprint: built.footprint };
       motifReheat.improved();

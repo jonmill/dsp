@@ -5,7 +5,7 @@ import { LayoutKit, compositeLayout } from '../validate/testkit';
 import { MAX_WARMUP_TICKS, SimulationAborted, validateLayout, WarmupNotSettled } from '../validate';
 import type { ValidateOptions, ValidationReport } from '../validate';
 import type { SimResult } from '../validate/sim/run';
-import { annealHeat, annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, Reheat, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
+import { annealHeat, annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, mayReplaceBest, Reheat, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
 import { VERIFIED_MOTIFS } from './motifs';
 import { ASSEMBLER, data, effects, matrixPlan, occupancyOf, planFor, SMELTER } from './testkit';
@@ -59,6 +59,23 @@ function run(plan: ProductionPlan, over: Partial<SolveOptions>, step: number, sh
 }
 
 const messages = (r: ValidationReport): string[] => r.violations.map((v) => `${v.code}: ${v.message}`);
+
+/** A report whose only violation is SIM_OUTPUT_LOW, short by under 2 % of the 3/s of the ingot plan: a near miss. */
+const nearMiss = (rate = 2.95): ValidationReport => ({
+  pass: false,
+  violations: [{ code: 'SIM_OUTPUT_LOW', entities: [], message: 'low' }],
+  sim: { measuredTargetRate: rate, measureSeconds: 300, warmupTicksUsed: 7200, deadlocked: false } as SimResult,
+  checkedAt: '',
+  stage: 'simulation',
+});
+/** What the doubled measure window of a near miss answers when it passes. */
+const longerWindowPass: ValidationReport = {
+  pass: true,
+  violations: [],
+  sim: { measuredTargetRate: 3, measureSeconds: 600, warmupTicksUsed: 7200, deadlocked: false } as SimResult,
+  checkedAt: '',
+  stage: 'simulation',
+};
 
 describe('footprintOf', () => {
   it('is 0 for an empty layout', () => {
@@ -236,6 +253,23 @@ describe('annealHeat (only an anneal that could use more moves than it gets in t
   it('is 1 when the time allows fewer moves than the cap: such an anneal needs all its moves to cool down', () => {
     expect(annealHeat(stale(8), 2_000_000, 4_620_000)).toBe(1);
     expect(annealHeat(stale(40), 379_999, 380_000)).toBe(1);
+  });
+});
+
+describe('mayReplaceBest (a layout that passes only over the doubled window never replaces one that passes the plain window)', () => {
+  const plain = { longerWindow: false };
+  const doubled = { longerWindow: true };
+
+  it('lets a plain pass replace anything, and anything fill an empty place', () => {
+    expect(mayReplaceBest(plain, plain)).toBe(true);
+    expect(mayReplaceBest(doubled, plain)).toBe(true);
+    expect(mayReplaceBest(null, plain)).toBe(true);
+    expect(mayReplaceBest(null, doubled)).toBe(true);
+  });
+
+  it('lets a doubled-window pass replace only a doubled-window pass', () => {
+    expect(mayReplaceBest(doubled, doubled)).toBe(true);
+    expect(mayReplaceBest(plain, doubled)).toBe(false);
   });
 });
 
@@ -697,20 +731,6 @@ describe('solve', () => {
   });
 
   describe('the fallback ladder (Task 27)', () => {
-    const nearMiss = (rate = 2.95): ValidationReport => ({
-      pass: false,
-      violations: [{ code: 'SIM_OUTPUT_LOW', entities: [], message: 'low' }],
-      sim: { measuredTargetRate: rate, measureSeconds: 300, warmupTicksUsed: 7200, deadlocked: false } as SimResult,
-      checkedAt: '',
-      stage: 'simulation',
-    });
-    const longerWindowPass: ValidationReport = {
-      pass: true,
-      violations: [],
-      sim: { measuredTargetRate: 3, measureSeconds: 600, warmupTicksUsed: 7200, deadlocked: false } as SimResult,
-      checkedAt: '',
-      stage: 'simulation',
-    };
     const go = async (verdicts: (ValidationReport | Error | undefined)[]) => {
       const v = scripted(verdicts);
       const fake = fakeClock(60_000);
@@ -764,6 +784,100 @@ describe('solve', () => {
       expect(phases).toContain('ladder: margin 3, over the longer window');
       expect(result.failures).toEqual([]);
     }, 120_000);
+
+    describe('the improvement loop does not trade a plain pass for a doubled-window pass', () => {
+      /** The ladder's verdicts, then pairs of (near miss, doubled window passes) for as many candidates as the budget allows. */
+      const nearMisses = (count: number): ValidationReport[] => Array.from({ length: count }, () => [nearMiss(), longerWindowPass]).flat();
+      const loop = async (verdicts: (ValidationReport | Error | undefined)[]) => {
+        const v = scripted(verdicts);
+        const improved: ValidationReport[] = [];
+        const phases: string[] = [];
+        const fake = fakeClock(1_000);
+        const result = solve(
+          await ingotPlan(), data, effects,
+          { ...DEFAULT_SOLVE_OPTIONS, ...SIM, seed: 7, timeBudgetMs: 20_000, minRunMs: 1e9, now: fake.now },
+          (p) => fake.onProgress(p, (q) => phases.push(q.phase)), (_l, r) => improved.push(r), () => false, v.fn,
+        );
+        return { result, improved, phases, calls: v.calls };
+      };
+
+      it('keeps a plain best when every candidate passes only over the doubled window', async () => {
+        const { result, improved, phases, calls } = await loop([undefined, ...nearMisses(80)]);
+        expect(calls()).toBeGreaterThanOrEqual(3); // a candidate reached the validator: the ladder's one call and its two (near miss, doubled window)
+        expect(improved).toHaveLength(1); // the ladder's
+        expect(result.report).toBe(improved[0]);
+        expect(result.report!.sim!.measureSeconds).toBe(SIM.simMeasureTicks / 60); // a plain window, not the scripted 600 s
+        expect(phases.some((p) => /^improve: margin \d, over the longer window only, the best passes the plain one$/.test(p))).toBe(true);
+        expect(result.failures).toEqual([]);
+      }, 120_000);
+
+      it('takes candidates that pass only over the doubled window while the best is itself such a pass', async () => {
+        const { result, improved, calls } = await loop([...nearMisses(3), ...nearMisses(80)]);
+        expect(calls()).toBeGreaterThanOrEqual(8); // six for the ladder, two for a candidate
+        expect(improved.length).toBeGreaterThan(1);
+        expect(improved.every((r) => r === longerWindowPass)).toBe(true);
+        expect(result.report).toBe(longerWindowPass);
+      }, 120_000);
+
+      it('lets a plain pass replace a doubled-window best, and then keeps it against doubled-window candidates', async () => {
+        // ladder: doubled-window passes on all three fast rungs; first candidate: the real validator (a plain pass); then near misses
+        const { result, improved } = await loop([...nearMisses(3), undefined, ...nearMisses(80)]);
+        expect(improved.length).toBeGreaterThanOrEqual(2);
+        expect(improved[0]).toBe(longerWindowPass);
+        expect(improved[1]).not.toBe(longerWindowPass);
+        expect(improved[1].sim!.measureSeconds).toBe(SIM.simMeasureTicks / 60);
+        expect(improved.slice(1).every((r) => r !== longerWindowPass)).toBe(true);
+        expect(result.report).toBe(improved[improved.length - 1]);
+      }, 120_000);
+    });
+
+    describe('a user stop keeps the layout that passed over the doubled window (it is parked until the rungs end)', () => {
+      /** Three fast rungs of near misses that the doubled window passes, with a stop that `stopWhen` decides. */
+      const stoppedRun = async (verdicts: (ValidationReport | Error | undefined)[], stopWhen: (calls: () => number) => () => boolean) => {
+        const v = scripted(verdicts);
+        const improved: ValidationReport[] = [];
+        const fake = fakeClock(60_000);
+        const result = solve(
+          await ingotPlan(), data, effects,
+          { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, minRunMs: 1e9, now: fake.now },
+          (p) => fake.onProgress(p), (_l, r) => improved.push(r), stopWhen(v.calls), v.fn,
+        );
+        return { result, improved };
+      };
+      const keptIt = (r: Awaited<ReturnType<typeof stoppedRun>>): void => {
+        expect(r.result.stoppedBy).toBe('user');
+        expect(r.result.layout).not.toBeNull();
+        expect(r.result.report).toBe(longerWindowPass);
+        expect(r.result.footprint).toBeGreaterThan(0);
+        expect(r.improved).toEqual([longerWindowPass]);
+        expect(r.result.failures).toEqual([]);
+      };
+
+      it('between rungs', async () => {
+        keptIt(await stoppedRun([nearMiss(), longerWindowPass], (calls) => () => calls() >= 2));
+      }, 120_000);
+
+      it('while the next rung is routed', async () => {
+        // the check at the top of rung 2 says no, the router's check inside it says yes
+        keptIt(await stoppedRun([nearMiss(), longerWindowPass], (calls) => {
+          let asks = 0;
+          return () => calls() >= 2 && ++asks > 1;
+        }));
+      }, 120_000);
+
+      it('while the next rung is simulated', async () => {
+        keptIt(await stoppedRun([nearMiss(), longerWindowPass, new SimulationAborted()], (calls) => () => calls() >= 3));
+      }, 120_000);
+
+      it('with nothing parked, a stop still returns no layout', async () => {
+        const control = await stoppedRun([], () => () => false);
+        expect(control.result.layout).not.toBeNull();
+        const stopped = await stoppedRun([], () => () => true);
+        expect(stopped.result.stoppedBy).toBe('user');
+        expect(stopped.result.layout).toBeNull();
+        expect(stopped.improved).toEqual([]);
+      }, 120_000);
+    });
 
     it('emits that layout once, at the end of the ladder', async () => {
       const improved: number[] = [];
@@ -973,6 +1087,46 @@ describe('solve with dense motifs', () => {
     // a candidate as large as one the simulation turned down was still validated: the rejected one is no floor
     expect(judged.length).toBeGreaterThanOrEqual(2);
     expect(judged.some((f, i) => i > 0 && f >= Math.min(...judged.slice(0, i)) - 1e-9)).toBe(true);
+    expect(result.layout!.sorters.every((x) => x.pick.kind !== 'building' || x.drop.kind !== 'building')).toBe(true);
+    expect(result.failures).toEqual([]);
+  }, 120_000);
+
+  it('a motif layout that passes only over the doubled window does not replace a best that passes the plain one', async () => {
+    const plan = await coilPlan();
+    // every layout with a sorter between two buildings is a near miss that the doubled window passes; the others get the real validator
+    const judged: number[] = [];
+    const validator = ((layout, p, d, fx, o) => {
+      if (!layout.sorters.some((x) => x.pick.kind === 'building' && x.drop.kind === 'building')) return validateLayout(layout, p, d, fx, o);
+      const wanted = layout.meta.planTargetRate;
+      if (o?.measureTicks === SIM.simMeasureTicks) {
+        judged.push(footprintOf(layout, d));
+        return {
+          ...nearMiss(),
+          sim: { measuredTargetRate: 0.985 * wanted, measureSeconds: SIM.simMeasureTicks / 60, warmupTicksUsed: 1200, deadlocked: false } as SimResult,
+        };
+      }
+      return { ...longerWindowPass, sim: { ...longerWindowPass.sim!, measuredTargetRate: wanted, measureSeconds: (2 * SIM.simMeasureTicks) / 60 } as SimResult };
+    }) as typeof validateLayout;
+    const clock = { t: 0 };
+    const emitted: Layout[] = [];
+    VERIFIED_MOTIFS.add('direct');
+    let result: SolveResult;
+    try {
+      result = solve(
+        plan, data, effects,
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, seed: 1, minRunMs: 1e9, timeBudgetMs: 10_000, now: () => clock.t },
+        (p) => {
+          if (p.phase !== 'done' && !p.phase.startsWith('motif')) clock.t += 1_000;
+        },
+        (layout) => emitted.push(layout),
+        () => false,
+        validator,
+      );
+    } finally {
+      VERIFIED_MOTIFS.delete('direct');
+    }
+    expect(judged.length).toBeGreaterThanOrEqual(1); // motif layouts were smaller than the best and reached the validator
+    expect(emitted.every((l) => l.sorters.every((x) => x.pick.kind !== 'building' || x.drop.kind !== 'building'))).toBe(true);
     expect(result.layout!.sorters.every((x) => x.pick.kind !== 'building' || x.drop.kind !== 'building')).toBe(true);
     expect(result.failures).toEqual([]);
   }, 120_000);
