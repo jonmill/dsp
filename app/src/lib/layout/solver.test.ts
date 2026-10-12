@@ -243,9 +243,9 @@ describe('warmupCapFor (how long the improvement loop waits for a candidate to r
   const reportWith = (warmupTicksUsed: number | undefined): ValidationReport =>
     ({ pass: true, violations: [], checkedAt: '', stage: 'simulation', sim: warmupTicksUsed === undefined ? undefined : ({ warmupTicksUsed } as SimResult) }) as ValidationReport;
 
-  it('is twice the warm-up of the best layout, within four windows and the adaptive cap', () => {
-    expect(warmupCapFor(reportWith(25_200))).toBe(50_400);
+  it('is twice the warm-up of the best layout when that is a saving of at least half the adaptive limit', () => {
     expect(warmupCapFor(reportWith(10_800))).toBe(21_600);
+    expect(warmupCapFor(reportWith(18_000))).toBe(36_000);
   });
 
   it('leaves a quick layout four windows to fill', () => {
@@ -253,9 +253,12 @@ describe('warmupCapFor (how long the improvement loop waits for a candidate to r
     expect(warmupCapFor(reportWith(7_200))).toBe(14_400);
   });
 
-  it('is the adaptive cap itself, which is no cap, for a layout that ran to the cap', () => {
-    expect(warmupCapFor(reportWith(MAX_WARMUP_TICKS))).toBe(MAX_WARMUP_TICKS);
-    expect(warmupCapFor(reportWith(50_000))).toBe(MAX_WARMUP_TICKS);
+  it('is no cap for a layout that needed more than a quarter of the limit: twice that saves too little and turns away candidates that pass at the limit', () => {
+    expect(warmupCapFor(reportWith(18_001))).toBeUndefined();
+    expect(warmupCapFor(reportWith(25_200))).toBeUndefined();
+    expect(warmupCapFor(reportWith(32_400))).toBeUndefined();
+    expect(warmupCapFor(reportWith(50_000))).toBeUndefined();
+    expect(warmupCapFor(reportWith(MAX_WARMUP_TICKS))).toBeUndefined();
   });
 
   it('is none when the best layout was not simulated', () => {

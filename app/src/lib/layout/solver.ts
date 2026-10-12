@@ -25,8 +25,8 @@
 // often unroutable on large plans (a Quantum Chip candidate costs 25 s to fail), so its share shrinks, to 15 % at least,
 // while it fails. A candidate gives up its routing when the negotiation stalls or is far from converging
 // (`IMPROVE_STALL_ROUNDS`, `IMPROVE_HOPELESS`). Its simulation waits for the target to reach its rate for twice the
-// warm-up of the best layout at most (`warmupCapFor`), not for the 72000 ticks of the adaptive limit: a candidate that
-// settles within the cap warms up and measures exactly as plain `validateLayout` would, so what passes passes it too;
+// warm-up of the best layout at most, if that is at most half the 72000 ticks of the adaptive limit (`warmupCapFor`): a
+// candidate that settles within the cap warms up and measures exactly as plain `validateLayout` would, so what passes passes it too;
 // and the simulation ends as soon as the budget is used up (`SimOptions.shouldAbort`), so a 60 s budget is not overrun by a
 // 20 s simulation. The anneals of a chain start hotter the longer its best layout has stood (`Reheat`, for the anneals
 // that have all the moves they can use): at the base temperature the chain finds nothing better round after round once it
@@ -242,20 +242,25 @@ export interface SimSettings {
 
 /** The adaptive warm-up of a candidate is given up on after this many times the best layout's warm-up... */
 const WARMUP_CAP_FACTOR = 2;
-/** ...but not before this many ticks (four of its 3600-tick windows), so a quick layout has room to fill. */
+/** ...but not before this many ticks (four of its 3600-tick windows), so a quick layout has room to fill... */
 const MIN_WARMUP_CAP_TICKS = 14_400;
+/** ...and only if that saves at least this share of the 72000 ticks the adaptive warm-up may take. */
+const MIN_WARMUP_SAVING = 0.5;
 
 /**
- * How long the improvement loop waits for a candidate to reach its rate: twice the warm-up the best layout needed, within
- * [`MIN_WARMUP_CAP_TICKS`, `MAX_WARMUP_TICKS`]. The candidates of one plan fill alike, and a failing one would otherwise
- * run to the 72000-tick cap and measure 18000 more before it is turned down. A candidate that settles within the cap warms
- * up exactly as it would without it, so what passes is accepted by plain `validateLayout` too. `undefined`: no cap (the
- * best layout's warm-up is not known).
+ * How long the improvement loop waits for a candidate to reach its rate: twice the warm-up the best layout needed, at least
+ * 14400 ticks, and only when that is at most half of `MAX_WARMUP_TICKS`. The candidates of one plan fill alike, and a failing
+ * one would otherwise run to the 72000-tick limit and measure 18000 more before it is turned down. A candidate that settles
+ * within the cap warms up exactly as it would without it, so what passes is accepted by plain `validateLayout` too. A plan
+ * whose best layout needed more than a quarter of the limit (the Quantum Chip's oscillating output settles at 32400 ticks in
+ * one layout and not at all in the next) gets no cap: a candidate that has not settled by twice that can still pass at the
+ * limit, and a cap of 90 % of it would turn such candidates down for a tenth of the time. `undefined`: no cap.
  */
 export function warmupCapFor(best: ValidationReport | null | undefined): number | undefined {
   const used = best?.sim?.warmupTicksUsed;
   if (used === undefined) return undefined;
-  return Math.min(MAX_WARMUP_TICKS, Math.max(MIN_WARMUP_CAP_TICKS, WARMUP_CAP_FACTOR * used));
+  const cap = Math.max(MIN_WARMUP_CAP_TICKS, WARMUP_CAP_FACTOR * used);
+  return cap <= (1 - MIN_WARMUP_SAVING) * MAX_WARMUP_TICKS ? cap : undefined;
 }
 
 /** A target output short of the provisioned rate by less than this share is a near miss (see `validateWithRetry`). */
