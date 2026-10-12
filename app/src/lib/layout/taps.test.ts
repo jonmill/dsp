@@ -558,7 +558,7 @@ describe('assignTaps multi-lane taps (MX §9 M2)', () => {
     return checkCapacity(layout, plan, data, effects);
   }
 
-  it('when the span-1 tap point of one net lies on the ground of another, that net takes span 2 on a slot facing the same way', () => {
+  it('regression, true before Task 27 too: when the span-1 tap point of one net lies on the ground of another, that net takes span 2 on a slot facing the same way', () => {
     const { placement, occ } = eastFaceOnly();
     // Mk.I sorters from a belt: 1.5/s at span 1, 0.75/s at span 2. Net 1 fills a span-1 lane; net 2 needs 0.5/s.
     const net = inputNets([1.0, 0.5]);
@@ -577,6 +577,8 @@ describe('assignTaps multi-lane taps (MX §9 M2)', () => {
     // the sorter rate covers the tap rate
     expect(sum(second)).toBeCloseTo(0.5, 9);
     expect(second[0].rate).toBeLessThanOrEqual(sorterRate(2011, 2, 1, effects, data) * (1 + 1e-9));
+    // it is the slot-by-slot span fallback, not the demand repass: the same without it
+    expect(assignTaps(net, placement, occ, data, effects, { repass: false })).toEqual(res);
   });
 
   it('adds sorters when one span-2 sorter cannot carry the rate of the net on the farther lane, and the layout passes checkCapacity', () => {
@@ -606,6 +608,32 @@ describe('assignTaps multi-lane taps (MX §9 M2)', () => {
     expect(light.map((t) => t.span)).toEqual([2]);
     expect(light[0].point.x).toBe(heavy[0].point.x + 1);
     expect(capacityOf(net, placement, res, occ, [0.2, 3.0], [MAGNET, COPPER])).toEqual([]);
+    // the repass is what does it: in netlist order the trickle takes a span-1 slot and the heavy net runs out of slots
+    const inOrder = assignTaps(net, placement, occ, data, effects, { repass: false });
+    expect(inOrder).toHaveProperty('failed');
+    expect((inOrder as { failed: string }).failed).toMatch(/net 2: machine 1 .* no usable sorter slot/);
+  });
+
+  it('assigns again in order of demand when that needs fewer sorters, though the netlist order succeeds too', () => {
+    const { placement, occ } = eastFaceOnly();
+    // net 1 is a 0.2/s trickle listed first, net 2 needs 1.5/s: exactly one span-1 sorter
+    const net = inputNets([0.2, 1.5]);
+    // netlist order: the trickle takes a span-1 lane and net 2 gets two span-2 sorters (0.75/s each): three sorters
+    const inOrder = ok(assignTaps(net, placement, occ, data, effects, { repass: false }));
+    expect(inOrder.taps.map((t) => [t.netId, t.span])).toEqual([[1, 1], [2, 2], [2, 2]]);
+    // demand order: net 2 takes the nearest lane with one sorter and the trickle goes one lane out: two sorters
+    const res = ok(assignTaps(net, placement, occ, data, effects));
+    expect(res.taps.map((t) => [t.netId, t.span])).toEqual([[1, 2], [2, 1]]); // still in net order
+    expect(res.taps.length).toBeLessThan(inOrder.taps.length);
+    expect(sum(tapsOf(res, 1))).toBeCloseTo(0.2, 9);
+    expect(sum(tapsOf(res, 2))).toBeCloseTo(1.5, 9);
+    expect(capacityOf(net, placement, res, occ, [0.2, 1.5], [MAGNET, COPPER])).toEqual([]);
+  });
+
+  it('keeps the netlist order when it already needs the fewest sorters and the least span (no change from the repass)', () => {
+    const { placement, occ } = eastFaceOnly();
+    const net = inputNets([1.5, 0.2]);
+    expect(ok(assignTaps(net, placement, occ, data, effects))).toEqual(ok(assignTaps(net, placement, occ, data, effects, { repass: false })));
   });
 
   it('keeps the netlist order when the demand order does not need fewer sorters or less span', () => {

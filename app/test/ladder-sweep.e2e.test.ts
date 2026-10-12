@@ -8,19 +8,17 @@
 // listed in `EXPECTED_SKIPPED` and the test fails when the list or the number of items swept changes, so a shrinking
 // sweep cannot go unnoticed.
 //
-// One allowance, and only for the items in `NEEDS_LONGER_WINDOW`: the solver's own (`validateWithRetry`), where a layout
-// whose only violation is SIM_OUTPUT_LOW, less than 2 % short, is measured once more over twice the window and that
-// verdict stands. Hydrogen Fuel Rod used to need it: its four final-stage machines work in step, so its 60 s windows
-// alternate between 0.933 and 1.067 of the rate and a 300 s window reads 0.987 or 1.000 depending on where it starts (the
-// average is 1.000). Since Task 27 the ladder keeps a layout that passes only over the doubled window for the end and takes
-// the first rung that passes the plain window instead, and Hydrogen Fuel Rod has one, so the list is empty. An item in the
-// list that passes the plain validation fails the test, so the list stays honest. The threshold (99 % of the rate) is the
-// validator's, unchanged.
+// No allowance: every layout has to pass the plain window. The solver's own near-miss rule (`validateGated`: a layout whose
+// only violation is SIM_OUTPUT_LOW, less than 2 % short, is measured once more over twice the window and that verdict stands)
+// does not count here. Hydrogen Fuel Rod used to pass only that way (its four final-stage machines work in step, so its 60 s
+// windows alternate between 0.933 and 1.067 of the rate and a 300 s window reads 0.987 or 1.000 depending on where it starts);
+// since Task 27 the ladder keeps such a layout for the end of its rungs and takes the first rung that passes the plain window,
+// and Hydrogen Fuel Rod has one. The threshold (99 % of the rate) is the validator's, unchanged.
 // Slow: about 2 minutes, logging the runtime of every item. Run with `npm run test:e2e`; `npm test` leaves it out.
 import { afterAll, describe, expect, it } from 'vitest';
 import type { PlanRequest, ProductionPlan } from '../src/lib/calc';
 import { compatibleFacilities, planProduction, plannableProducers } from '../src/lib/calc';
-import { DEFAULT_SOLVE_OPTIONS, solve, validateWithRetry } from '../src/lib/layout/solver';
+import { DEFAULT_SOLVE_OPTIONS, solve } from '../src/lib/layout/solver';
 import { data, effects, everything } from '../src/lib/layout/testkit';
 import { validateLayout } from '../src/lib/validate';
 
@@ -87,9 +85,6 @@ const EXPECTED_SKIPPED: Record<string, string> = {
   ),
 };
 
-/** Layouts that pass `validateLayout` only over twice the measure window (see the file comment). */
-const NEEDS_LONGER_WINDOW: readonly string[] = [];
-
 const log = (line: string): void => void process.stdout.write(`${line}\n`);
 
 interface Plannable {
@@ -142,14 +137,12 @@ const { items, skipped } = await plannableItems();
 describe('fallback ladder sweep [slow]', () => {
   let passed = 0;
   let seconds = 0;
-  const retriedItems: string[] = [];
 
   it('sweeps the expected items', () => {
     const left = Object.entries(skipped).map(([name, why]) => `${name} (${why})`);
     log(`ladder sweep: ${items.length} plannable items; skipped ${left.length}: ${left.join('; ') || 'none'}`);
     expect(skipped).toEqual(EXPECTED_SKIPPED);
     expect(items).toHaveLength(EXPECTED_PLANNABLE);
-    for (const name of NEEDS_LONGER_WINDOW) expect(items.map((i) => i.name), `${name} is in the sweep`).toContain(name);
   });
 
   for (const { name, plan } of items) {
@@ -169,20 +162,12 @@ describe('fallback ladder sweep [slow]', () => {
         );
         const solved = (performance.now() - t0) / 1000;
         expect(result.layout, `${name}: no layout; ${result.failures.join(' || ')}`).not.toBeNull();
-        let report = validateLayout(result.layout!, plan, data, effects);
-        let retried = '';
-        if (NEEDS_LONGER_WINDOW.includes(name)) {
-          // see the file comment
-          expect(report.pass, `${name} passes the plain validation now: take it out of NEEDS_LONGER_WINDOW`).toBe(false);
-          report = validateWithRetry(result.layout!, plan, data, effects, { simulate: true });
-          retried = `; the plain window failed, the 2x window ${report.pass ? 'passed' : 'failed too'}`;
-          if (report.pass) retriedItems.push(name);
-        }
+        const report = validateLayout(result.layout!, plan, data, effects);
         const total = (performance.now() - t0) / 1000;
         seconds += total;
         log(
           `${report.pass ? 'ok  ' : 'FAIL'} ${name}: ${plan.stages.length} stages, ${machines} machines, ladder ${solved.toFixed(1)} s, ` +
-            `with the validation ${total.toFixed(1)} s${retried}`,
+            `with the validation ${total.toFixed(1)} s`,
         );
         expect(report.violations.map((v) => `${v.code}: ${v.message}`), name).toEqual([]);
         expect(report.pass, name).toBe(true);
@@ -194,8 +179,7 @@ describe('fallback ladder sweep [slow]', () => {
 
   afterAll(() => {
     log(
-      `ladder sweep: ${passed} of ${items.length} plannable items passed, ${seconds.toFixed(0)} s in all; ` +
-        `plain validation failed but the 2x window passed for: ${retriedItems.join(', ') || 'none'}`,
+      `ladder sweep: ${passed} of ${items.length} plannable items passed the plain validation, ${seconds.toFixed(0)} s in all`,
     );
   });
 });
