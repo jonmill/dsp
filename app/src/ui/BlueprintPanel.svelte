@@ -1,12 +1,22 @@
 <script lang="ts">
   import type { AppState } from './state.svelte';
 
+  /** How long a download's blob URL lives. */
+  const REVOKE_AFTER_MS = 10_000;
+
   let { app }: { app: AppState } = $props();
 
   const blueprint = $derived(app.blueprint);
 
   let area = $state<HTMLTextAreaElement>();
-  let notice = $state('');
+  /** What the last copy or download said, and which blueprint string it was about. */
+  let last = $state.raw({ text: '', about: '' });
+  /** A notice about an older string is not shown: a new layout has a new blueprint. */
+  const notice = $derived(blueprint && last.about === blueprint.text ? last.text : '');
+
+  function say(text: string, about: string): void {
+    last = { text, about };
+  }
 
   /** Selects the text, so Ctrl/Cmd+C works when the clipboard API does not. */
   function selectAll(): void {
@@ -15,10 +25,11 @@
   }
 
   async function copy(): Promise<void> {
-    if (!blueprint?.text) return;
+    const text = blueprint?.text;
+    if (!text) return;
     try {
-      await navigator.clipboard.writeText(blueprint.text);
-      notice = 'Copied to the clipboard.';
+      await navigator.clipboard.writeText(text);
+      say('Copied to the clipboard.', text);
       return;
     } catch {
       // No clipboard API here (an insecure page, or permission denied): fall back to selecting and copying.
@@ -30,7 +41,7 @@
     } catch {
       copied = false;
     }
-    notice = copied ? 'Copied to the clipboard.' : 'Could not copy. The text is selected: press Ctrl+C (Cmd+C on a Mac).';
+    say(copied ? 'Copied to the clipboard.' : 'Could not copy. The text is selected: press Ctrl+C (Cmd+C on a Mac).', text);
   }
 
   function download(): void {
@@ -42,8 +53,9 @@
     document.body.append(link);
     link.click();
     link.remove();
-    URL.revokeObjectURL(url);
-    notice = `Saved as ${blueprint.fileName}.`;
+    // Not at once: some browsers start the save after the click has returned.
+    setTimeout(() => URL.revokeObjectURL(url), REVOKE_AFTER_MS);
+    say(`Saved as ${blueprint.fileName}.`, blueprint.text);
   }
 </script>
 

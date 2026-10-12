@@ -28,6 +28,7 @@ import type { SolveHandle } from '../lib/layout/client';
 import { DEFAULT_SOLVE_OPTIONS } from '../lib/layout/solver';
 import type { SolveProgress, SolveResult } from '../lib/layout/solver';
 import type { ValidationReport, Violation } from '../lib/validate';
+import { provisionedRate } from '../lib/validate/sim/run';
 import { formatCount, formatPower, geometryBadge, itemName } from './format';
 import { buildTree, treeLeaves } from './tree';
 import type { TreeRow } from './tree';
@@ -121,7 +122,7 @@ export interface AppState {
   readonly profiles: Readonly<Record<string, number[]>>;
   /** How rates are displayed; the request always holds items per second. */
   readonly rateUnit: 's' | 'min';
-  /** How long the layout solver may keep improving a layout it already has, in minutes. */
+  /** The time budget of a solve, in minutes from its start; the first valid layout is always completed. */
   readonly solverBudgetMinutes: number;
   /** "Geometry: approximate ..." while GameData geometry is approximate, else null. */
   readonly geometryBadge: string | null;
@@ -284,11 +285,6 @@ function planSignature(plan: ProductionPlan): string {
   );
 }
 
-/** The rate the plan provisions for its target: what the layout is built and judged for. */
-export function plannedRate(plan: ProductionPlan): number {
-  return plan.exports.find((e) => e.itemId === plan.request.targetItemId)?.perSecond ?? plan.actualTargetRate;
-}
-
 /** `<target-name>-<rate>.txt`, lower case with dashes: "circuit-board-1.txt". */
 export function blueprintFileName(targetName: string, perSecond: number): string {
   const slug = targetName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
@@ -309,7 +305,7 @@ export function makeBlueprint(
   report: ValidationReport | null,
 ): BlueprintExport {
   const target = itemName(index, plan.request.targetItemId);
-  const rate = plannedRate(plan);
+  const rate = provisionedRate(plan);
   const shortDesc = `${target} ${formatCount(rate)}/s`;
   const machines = plan.stages.reduce((n, stage) => n + stage.machines, 0);
   const stations = `${plan.stationsNeeded} station${plan.stationsNeeded === 1 ? '' : 's'}`;
@@ -465,6 +461,14 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
   let solveRuns = 0;
   let solveWaiters: (() => void)[] = [];
 
+  /** A new best layout and its report. The violation picked in the old report is gone with it. */
+  function setBest(layout: Layout, report: ValidationReport | null, footprint: number | null): void {
+    bestLayout = layout;
+    bestReport = report;
+    bestFootprint = footprint;
+    selectedViolation = null;
+  }
+
   function endSolve(): void {
     solveStopping = false;
     handle = undefined;
@@ -510,10 +514,7 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
             if (mine === solveToken) solveProgress = progress;
           },
           onImproved: (layout, report, footprint) => {
-            if (mine !== solveToken) return;
-            bestLayout = layout;
-            bestReport = report;
-            bestFootprint = footprint;
+            if (mine === solveToken) setBest(layout, report, footprint);
           },
         },
       );
@@ -527,10 +528,10 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
       (result) => {
         if (mine !== solveToken) return;
         solveResult = result;
-        if (result.layout) {
-          bestLayout = result.layout;
-          bestReport = result.report;
-          bestFootprint = result.footprint;
+        // The result's best is the last one reported, as a copy from the worker: keep the objects (and the picked
+        // violation) unless it is a different layout.
+        if (result.layout && (bestLayout === null || result.footprint !== bestFootprint)) {
+          setBest(result.layout, result.report, result.footprint);
         }
         solveStatus = 'done';
         endSolve();

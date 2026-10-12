@@ -180,7 +180,8 @@
         <span class="muted">minutes</span>
       </label>
       <p class="hint">
-        How long the solver may keep shrinking a layout once it has a valid one. It may stop sooner when nothing
+        The budget counts from the moment you press Solve. The first valid layout is always completed, even if that
+        takes longer; after that the solver keeps shrinking it until the budget runs out, or earlier when nothing
         improves. It does not change the plan.
       </p>
     </fieldset>

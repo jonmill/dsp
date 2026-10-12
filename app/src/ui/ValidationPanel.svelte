@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { Violation } from '../lib/validate';
+  import { provisionedRate } from '../lib/validate/sim/run';
   import { formatPercent, formatPower, formatRate } from './format';
-  import { plannedRate } from './state.svelte';
   import type { AppState } from './state.svelte';
 
   let { app }: { app: AppState } = $props();
@@ -9,10 +9,10 @@
   const report = $derived(app.solve.report);
   const plan = $derived(app.solve.plan);
   const sim = $derived(report?.sim ?? null);
-  const planned = $derived(plan ? plannedRate(plan) : 0);
-  const measured = $derived(sim?.measuredTargetRate ?? 0);
-  /** The validator passes a layout at 99 % of the plan rate. */
-  const rateOk = $derived(planned > 0 && measured >= planned * 0.99);
+  const provisioned = $derived(plan ? provisionedRate(plan) : 0);
+  const capacity = $derived(sim?.measuredTargetRate ?? 0);
+  /** Only the validator's own verdict makes the figure a problem; more than the provisioned rate is normal. */
+  const rateLow = $derived(report?.violations.some((v) => v.code === 'SIM_OUTPUT_LOW') ?? false);
 
   const STAGES = { geometry: 'geometry rules', capacity: 'belt and sorter capacity', simulation: 'tick simulation' } as const;
 
@@ -46,18 +46,23 @@
         <h3>Target rate</h3>
         <div class="figures">
           <div>
-            <span class="muted">Simulated</span>
-            <strong class="num" class:bad={!rateOk}>{formatRate(measured, 's')}</strong>
+            <span class="muted">Capacity (simulated)</span>
+            <strong class="num" class:bad={rateLow}>{formatRate(capacity, 's')}</strong>
           </div>
           <div>
-            <span class="muted">Planned</span>
-            <strong class="num">{formatRate(planned, 's')}</strong>
+            <span class="muted">Provisioned</span>
+            <strong class="num">{formatRate(provisioned, 's')}</strong>
           </div>
           <div>
-            <span class="muted">Of plan</span>
-            <strong class="num" class:bad={!rateOk}>{planned > 0 ? formatPercent(measured / planned) : '-'}</strong>
+            <span class="muted">Capacity / provisioned</span>
+            <strong class="num" class:bad={rateLow}>{provisioned > 0 ? formatPercent(capacity / provisioned) : '-'}</strong>
           </div>
         </div>
+        <p class="hint">
+          The simulation runs every machine flat out against unlimited station supply, so the capacity is what this
+          layout can deliver, not what the plan asks for. The check is that it reaches the provisioned rate (within the
+          validator's tolerance, about 1 %); more is normal.
+        </p>
         <p class="hint">
           Measured over {sim.measureSeconds} s after a {Math.round(sim.warmupTicksUsed / 60)} s warm-up (game time).
         </p>

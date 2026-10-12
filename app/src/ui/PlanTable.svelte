@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { PlanError, ProductionPlan } from '../lib/calc';
+  import { provisionedRate } from '../lib/validate/sim/run';
   import { buildingName, formatCount, formatPercent, formatPower, formatRate, itemName } from './format';
   import ItemIcon from './ItemIcon.svelte';
   import type { AppState } from './state.svelte';
@@ -10,6 +11,9 @@
   const plan = $derived(result?.ok ? result.plan : null);
   const failure = $derived(result && !result.ok ? result.error : null);
   const unit = $derived(app.rateUnit);
+  /** What the plan provisions for the target; the machines are rounded up, so they can make more (`actualTargetRate`). */
+  const requested = $derived(plan ? provisionedRate(plan) : 0);
+  const hasSpareCapacity = $derived(plan !== null && plan.actualTargetRate > requested * (1 + 1e-9));
 
   const ERROR_TITLES: Record<PlanError['kind'], string> = {
     'target-locked': 'Target is locked',
@@ -58,8 +62,11 @@
     {:else if plan}
       <div class="summary">
         <span>
-          <strong>{formatRate(plan.actualTargetRate, unit)}</strong>
-          {itemName(app.index, plan.request.targetItemId)}
+          <strong>{formatRate(requested, unit)}</strong>
+          {itemName(app.index, plan.request.targetItemId)} requested
+          {#if hasSpareCapacity}
+            <span class="muted">&middot; up to {formatRate(plan.actualTargetRate, unit)} capacity</span>
+          {/if}
         </span>
         <span class="muted">
           {plan.stages.reduce((n, s) => n + s.machines, 0)} machines,

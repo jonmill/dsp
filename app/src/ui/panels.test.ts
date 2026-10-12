@@ -7,6 +7,7 @@ import type { SolveResult } from '../lib/layout/solver';
 import { compositeLayout } from '../lib/validate/testkit';
 import type { ValidationReport } from '../lib/validate';
 import BlueprintPanel from './BlueprintPanel.svelte';
+import PlanTable from './PlanTable.svelte';
 import SolvePanel from './SolvePanel.svelte';
 import { createAppState } from './state.svelte';
 import type { AppDeps, AppState } from './state.svelte';
@@ -14,6 +15,7 @@ import ValidationPanel from './ValidationPanel.svelte';
 
 const data = loadFixtureGameData();
 const IRON_INGOT = 1101;
+const CIRCUIT_BOARD = 1301;
 const EQUATOR_NOTE = 'Paste within the equatorial band (±28° latitude); pasting near the poles may fail';
 
 const passing: ValidationReport = { pass: true, violations: [], checkedAt: '2026-01-01T00:00:00Z', stage: 'capacity' };
@@ -87,33 +89,55 @@ describe('BlueprintPanel', () => {
 });
 
 describe('ValidationPanel', () => {
-  it('says PASS with the simulated and planned rate and the measured power next to the estimate', async () => {
-    const report: ValidationReport = {
-      ...passing,
-      stage: 'simulation',
-      sim: {
-        measuredTargetRate: 1,
-        measuredExports: [],
-        machineStats: [],
-        stageStats: [],
-        deadlocked: false,
-        power: { steadyW: 1_500_000, idleW: 0, peakW: 4_000_000, stationChargeW: 2_000_000 },
-        measureSeconds: 300,
-        warmupTicksUsed: 7200,
-        warnings: [],
-      },
-    };
+  const simulated = (measuredTargetRate: number): ValidationReport['sim'] => ({
+    measuredTargetRate,
+    measuredExports: [],
+    machineStats: [],
+    stageStats: [],
+    deadlocked: false,
+    power: { steadyW: 1_500_000, idleW: 0, peakW: 4_000_000, stationChargeW: 2_000_000 },
+    measureSeconds: 300,
+    warmupTicksUsed: 7200,
+    warnings: [],
+  });
+
+  it('says PASS with the simulated capacity next to the provisioned rate, and the measured power next to the estimate', async () => {
+    const report: ValidationReport = { ...passing, stage: 'simulation', sim: simulated(1) };
     const { app, finish } = await appWith(undefined, report);
     await finish();
     const page = html(ValidationPanel, app);
     expect(page).toContain('PASS');
-    expect(page).toContain('Simulated');
-    expect(page).toContain('Planned');
+    expect(page).toContain('Capacity (simulated)');
+    expect(page).toContain('Provisioned');
     expect(page).toContain('1/s');
     expect(page).toContain('1.50 MW');
     expect(page).toContain('4.00 MW');
     expect(page).toContain('Plan estimate');
     expect(page).toContain('No violations');
+  });
+
+  it('explains that the simulation runs flat out on unlimited supply, and does not flag more than the provisioned rate', async () => {
+    // 3/s simulated against 1/s provisioned: the layout has spare capacity, which is normal.
+    const report: ValidationReport = { ...passing, stage: 'simulation', sim: simulated(3) };
+    const { app, finish } = await appWith(undefined, report);
+    await finish();
+    const page = html(ValidationPanel, app);
+    expect(page).toContain('flat out against unlimited station supply');
+    expect(page).toContain('300%');
+    expect(page).not.toContain('bad');
+  });
+
+  it('flags the capacity only when the validator found it too low', async () => {
+    const report: ValidationReport = {
+      pass: false,
+      violations: [{ code: 'SIM_OUTPUT_LOW', entities: [], message: 'Iron Ingot reached the stations at 0.5/s' }],
+      checkedAt: '2026-01-01T00:00:00Z',
+      stage: 'simulation',
+      sim: simulated(0.5),
+    };
+    const { app, finish } = await appWith(undefined, report);
+    await finish();
+    expect(html(ValidationPanel, app)).toContain('bad');
   });
 
   it('says FAIL and lists the violations', async () => {
@@ -135,6 +159,29 @@ describe('ValidationPanel', () => {
   it('asks for a solve before there is a report', async () => {
     const app = createAppState(data);
     expect(html(ValidationPanel, app)).toContain('Solve a plan');
+  });
+});
+
+describe('PlanTable', () => {
+  it('says what was requested and, apart from it, the capacity the rounded-up machines have', async () => {
+    const app = createAppState(data);
+    app.setTarget(CIRCUIT_BOARD);
+    await app.whenSettled();
+    const plan = app.plan?.ok ? app.plan.plan : null;
+    expect(plan!.actualTargetRate).toBeGreaterThan(1.5); // a Re-composing Assembler makes far more than 1/s
+    const page = html(PlanTable, app);
+    expect(page).toMatch(/<strong>1\/s<\/strong>\s*Circuit Board requested/);
+    expect(page).toContain(`up to ${+plan!.actualTargetRate.toFixed(3)}/s capacity`);
+  });
+
+  it('shows no capacity when the machines make exactly what was requested', async () => {
+    const app = createAppState(data);
+    app.setTarget(IRON_INGOT);
+    app.setQuantity({ kind: 'buildings', count: 1 });
+    await app.whenSettled();
+    const plan = app.plan?.ok ? app.plan.plan : null;
+    expect(plan!.actualTargetRate).toBeCloseTo(plan!.exports[0].perSecond, 9);
+    expect(html(PlanTable, app)).not.toContain('capacity');
   });
 });
 

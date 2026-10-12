@@ -965,6 +965,35 @@ describe('solve', () => {
     expect(app.canSolve).toBe(true);
   });
 
+  it('forgets the picked violation when a new report replaces the old one, but not when the final answer repeats it', async () => {
+    const { app, runs } = await solvingApp();
+    const violation: Violation = { code: 'BELT_OVERLAP', entities: [{ kind: 'belt', id: 1 }], message: 'm' };
+    app.startSolve();
+    runs[0].callbacks.onImproved?.(solved, passing, 150);
+    app.selectViolation(violation);
+    runs[0].callbacks.onImproved?.(solved, { ...passing }, 120);
+    expect(app.selectedViolation).toBeNull();
+
+    // The worker's answer carries its best again, as a copy: the same layout, so the pick stays.
+    app.selectViolation(violation);
+    const copy = { ...solved };
+    runs[0].finish(resultOf({ layout: copy, report: { ...passing }, footprint: 120 }));
+    await app.whenSolved();
+    expect(app.selectedViolation).toBe(violation);
+    expect(app.solve.layout).not.toBe(copy);
+  });
+
+  it('takes the final answer when it is a better layout than the last one reported', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    runs[0].callbacks.onImproved?.(solved, passing, 150);
+    const better = { ...solved };
+    runs[0].finish(resultOf({ layout: better, footprint: 100 }));
+    await app.whenSolved();
+    expect(app.solve.layout).toBe(better);
+    expect(app.solve.footprint).toBe(100);
+  });
+
   it('forgets the picked violation when a new solve starts', async () => {
     const { app } = await solvingApp();
     const violation: Violation = { code: 'BELT_OVERLAP', entities: [{ kind: 'belt', id: 1 }], message: 'm' };

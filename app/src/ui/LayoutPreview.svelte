@@ -79,7 +79,9 @@
     renderLayout(ctx, l, app.index, { level, scale: view.scale, origin: view.origin, highlight });
   });
 
-  // The wheel zooms about the cursor. A listener of its own, because it has to cancel the page scroll.
+  // The wheel zooms about the cursor, but only on purpose: with Ctrl or Cmd held (a trackpad pinch arrives that way)
+  // or once the canvas has focus (click it). Otherwise the wheel scrolls the page past the preview, which a canvas
+  // that took every wheel turn would make impossible. A listener of its own, because zooming has to cancel the scroll.
   $effect(() => {
     const target = canvas;
     if (!target) return;
@@ -87,6 +89,7 @@
       target,
       'wheel',
       (event) => {
+        if (!event.ctrlKey && !event.metaKey && document.activeElement !== target) return;
         event.preventDefault();
         touched = true;
         view = zoomAt(view, event.offsetX, event.offsetY, Math.exp(-event.deltaY * 0.0015));
@@ -98,6 +101,45 @@
   function zoom(factor: number): void {
     touched = true;
     view = zoomAt(view, width / 2, height / 2, factor);
+  }
+
+  const PAN_STEP = 40;
+
+  /** With the canvas focused: arrows pan, + and - zoom, 0 fits. */
+  function onKeyDown(event: KeyboardEvent): void {
+    const pan = (dx: number, dy: number): void => {
+      touched = true;
+      view = { scale: view.scale, origin: { x: view.origin.x + dx, y: view.origin.y + dy } };
+    };
+    switch (event.key) {
+      case 'ArrowLeft':
+        pan(PAN_STEP, 0);
+        break;
+      case 'ArrowRight':
+        pan(-PAN_STEP, 0);
+        break;
+      case 'ArrowUp':
+        pan(0, PAN_STEP);
+        break;
+      case 'ArrowDown':
+        pan(0, -PAN_STEP);
+        break;
+      case '+':
+      case '=':
+        zoom(1.4);
+        break;
+      case '-':
+      case '_':
+        zoom(1 / 1.4);
+        break;
+      case '0':
+        touched = false;
+        fit();
+        break;
+      default:
+        return;
+    }
+    event.preventDefault();
   }
 
   function onPointerDown(event: PointerEvent): void {
@@ -172,10 +214,15 @@
     </div>
 
     <div class="stage" bind:clientWidth={width} bind:clientHeight={height}>
+      <!-- A canvas is a picture here that can also be panned and zoomed: the roles are meant, and the keys are on it. -->
+      <!-- svelte-ignore a11y_no_interactive_element_to_noninteractive_role -->
       <canvas
         bind:this={canvas}
         class:dragging
-        aria-label="Plan view of the layout: {counts}. North is up."
+        role="img"
+        tabindex="0"
+        aria-label="Plan view of the layout: {counts}. North is up. Arrow keys pan, plus and minus zoom, 0 fits."
+        onkeydown={onKeyDown}
         onpointerdown={onPointerDown}
         onpointermove={onPointerMove}
         onpointerup={onPointerUp}
@@ -194,7 +241,8 @@
       {/if}
     </div>
     <p class="hint legend">
-      Drag to pan, wheel to zoom, north is up. Boxes are buildings, lines are belts coloured by item, arrows are sorters,
+      Drag to pan. To zoom with the wheel, click the preview first or hold Ctrl or Cmd (otherwise the wheel scrolls the
+      page); the + and - buttons and the keys work too (arrows pan, + and - zoom, 0 fits). North is up. Boxes are buildings, lines are belts coloured by item, arrows are sorters,
       the pale circles are power cover. A violation you pick in the report is drawn in red.
     </p>
   {/if}
@@ -266,6 +314,11 @@
 
   canvas.dragging {
     cursor: grabbing;
+  }
+
+  canvas:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
   }
 
   .tip {
