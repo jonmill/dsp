@@ -61,11 +61,12 @@ describe('mirrors markers', () => {
   const keys = new Set(mirroredKeys(readFileSync(mirroredMethods, 'utf8')));
   const markers = markersIn(appSrc);
 
+  // Floors that only prove the patterns find something (a regex that rotted finds nothing). They are far below today's counts, so
+  // consolidating markers or dropping a mirrored method does not trip them; the second test is the one that judges the markers.
   it('finds the list of mirrored methods and the markers in the source (the patterns have not rotted)', () => {
-    expect(keys.size).toBeGreaterThanOrEqual(15);
-    expect(keys.has('CargoPath.Update')).toBe(true);
-    expect(markers.length).toBeGreaterThanOrEqual(30);
-    expect(new Set(markers.map((m) => m.method)).size).toBeGreaterThanOrEqual(10);
+    expect(keys.size).toBeGreaterThanOrEqual(5);
+    expect(markers.length).toBeGreaterThanOrEqual(10);
+    expect(new Set(markers.map((m) => m.method)).size).toBeGreaterThanOrEqual(5);
   });
 
   it('every method named by a `mirrors` marker in app/src is listed in mirrored_methods.py', () => {
