@@ -282,6 +282,15 @@ describe('options', () => {
     expect(app.solverBudgetMinutes).toBe(25);
   });
 
+  it('uses unverified motifs only when asked: off by default, switched by setUseUnverifiedMotifs', () => {
+    const app = createApp();
+    expect(app.useUnverifiedMotifs).toBe(false);
+    app.setUseUnverifiedMotifs(true);
+    expect(app.useUnverifiedMotifs).toBe(true);
+    app.setUseUnverifiedMotifs(false);
+    expect(app.useUnverifiedMotifs).toBe(false);
+  });
+
   it('switches the display rate unit without touching the request', () => {
     const app = createApp();
     app.setQuantity({ kind: 'rate', perSecond: 2 });
@@ -786,6 +795,16 @@ describe('solve', () => {
     expect(app.solve.footprint).toBe(120);
     expect(app.solve.report).toBe(passing);
     expect(app.solve.result?.stoppedBy).toBe('budget');
+  });
+
+  it('hands the worker the motif option as it stands when the solve starts', async () => {
+    const { app, runs } = await solvingApp();
+    app.startSolve();
+    expect(runs[0].opts.useUnverifiedMotifs).toBe(false);
+    app.setUseUnverifiedMotifs(true);
+    app.startSolve();
+    expect(runs[1].opts.useUnverifiedMotifs).toBe(true);
+    expect(runs[0].opts.useUnverifiedMotifs).toBe(false); // the run in flight keeps what it was given
   });
 
   it('uses a new seed for each run', async () => {

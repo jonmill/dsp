@@ -12,6 +12,9 @@
 //    point and drops into the machine slot; an `out` tap does the reverse. Every sorter is filtered to its net's item,
 //    whichever way it runs (an unfiltered output sorter on a machine with several products would put the wrong one
 //    on the belt). The tier is the netlist's, the span and rate those of the tap.
+//    The internal sorters of the netlist's motifs come after them: building to building, filtered to the item, at the
+//    netlist's tier with the motif's span and planned rate.
+// Stacks. A stacked building (`z`, `stackParentId`) is the placement's, as it is.
 // Meta. The geometry is `'approximate'` as soon as one building, belt or sorter the layout uses is.
 import type { ProductionPlan } from '../calc';
 import type { GameDataIndex } from '../data';
@@ -136,6 +139,18 @@ export function assembleLayout(
       pick: t.dir === 'out' ? onMachine : onBelt,
       drop: t.dir === 'out' ? onBelt : onMachine,
       plannedRate: t.rate,
+    });
+  }
+
+  for (const s of netlist.motifs?.sorters ?? []) {
+    sorters.push({
+      id: sorters.length + 1,
+      tierItemId: netlist.sorterTierItemId,
+      filterItemId: s.itemId,
+      span: s.span,
+      pick: { kind: 'building', buildingId: placementBuildingIdOf(s.fromMachine), slot: s.fromSlot },
+      drop: { kind: 'building', buildingId: placementBuildingIdOf(s.toMachine), slot: s.toSlot },
+      plannedRate: s.plannedRate,
     });
   }
 

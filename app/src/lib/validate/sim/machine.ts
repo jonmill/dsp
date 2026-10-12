@@ -17,7 +17,11 @@
 //    For stacks sprayed at one tier (every item the same) this is exactly that tier's level.
 //  - Extra products and the speed-up are chosen per craft from the lowest level over the ingredients. A recipe that
 //    cannot take extra products (`canUseExtra`) gets the speed-up in either mode, as the planner assumes.
-//  - Labs have no stacking here: each lab is its own machine (MX §4.4's pass-up and pass-down is not simulated).
+//  - Labs stack (`LabStack`, labstack.ts): `passIngredientsUp` and `pullProductsDown` are the two moves between a lab
+//    and the one above it. MX §4.4 gives the rules but not the order of the game's loops, so: a lab keeps
+//    `requireCount + 1 + floor(speed / 20000)` of an ingredient, passes the rest up at most 5 an item a tick and only
+//    while the lab above wants it (below its own input threshold); products come down in one move, up to the room the
+//    lower lab has below `10 · ceil(speed / 10000) - 2`. The proliferator points of passed items move with them.
 import { canUseExtra } from '../../calc/proliferator';
 import type { Building, GameDataIndex, ItemCount, Recipe, RecipeType } from '../../data';
 import type { InsertTarget, PickSource } from './sorter';
@@ -35,6 +39,12 @@ const LAB_OUTPUT_PER_SPEED = 10;
 /** A lab recipe longer than this many ticks only ever wants 6 of each ingredient (MX §4.4). */
 const LAB_LONG_RECIPE_TICKS = 540;
 const LAB_LONG_RECIPE_LIMIT = 6;
+/** A stacked lab passes at most this many items of an ingredient up per tick (MX §4.4). */
+const LAB_PASS_UP_PER_TICK = 5;
+/** A lab keeps `requireCount + 1 + floor(speed / this)` of an ingredient when it passes the rest up (MX §4.4). */
+const LAB_KEEP_SPEED_DIVISOR = 20000;
+/** The lower lab of a stack pulls products down until it holds the output cap less this many (MX §4.4). */
+const LAB_PULL_MARGIN = 2;
 
 export type MachineState = 'busy' | 'blocked' | 'starved' | 'unpowered';
 
@@ -178,6 +188,12 @@ export class MachineSim implements InsertTarget, PickSource {
     return i < 0 ? 0 : this.servedCount[i];
   }
 
+  /** Proliferator points held by the waiting ingredient `item` (0 for an item that is no ingredient). */
+  servedPoints(item: number): number {
+    const i = this.inItems.indexOf(item);
+    return i < 0 ? 0 : this.servedInc[i];
+  }
+
   /** Product `item` waiting in the buffer (0 for an item that is no product). */
   produced(item: number): number {
     const i = this.outItems.indexOf(item);
@@ -222,6 +238,44 @@ export class MachineSim implements InsertTarget, PickSource {
       return { item, count: 1, inc: 0 };
     }
     return null;
+  }
+
+  // mirrors: LabComponent.InternalUpdateAssemble
+  /**
+   * Stack pass-up (MX §4.4): for each ingredient `upper` also takes, this lab keeps `requireCount + 1 + floor(speed /
+   * 20000)` and gives `upper` what it has beyond that, at most 5 items, and no more than `upper` still wants. The
+   * proliferator points move in proportion to the items.
+   */
+  passIngredientsUp(upper: MachineSim): void {
+    for (let i = 0; i < this.inItems.length; i++) {
+      const j = upper.inItems.indexOf(this.inItems[i]);
+      if (j < 0) continue;
+      const keep = this.inCounts[i] + 1 + Math.floor(this.speedOverrideValue / LAB_KEEP_SPEED_DIVISOR);
+      const give = Math.min(LAB_PASS_UP_PER_TICK, this.servedCount[i] - keep, upper.inLimit[j] - upper.servedCount[j]);
+      if (give <= 0) continue;
+      const inc = Math.floor((this.servedInc[i] * give) / this.servedCount[i]);
+      this.servedCount[i] -= give;
+      this.servedInc[i] -= inc;
+      upper.servedCount[j] += give;
+      upper.servedInc[j] += inc;
+    }
+  }
+
+  // mirrors: LabComponent.InternalUpdateAssemble
+  /**
+   * Stack pass-down (MX §4.4): this lab takes the products `upper` holds until it has `10 · ceil(speed / 10000) - 2`
+   * of each, so the sorters at the bottom of a stack unload all of it.
+   */
+  pullProductsDown(upper: MachineSim): void {
+    const room = LAB_OUTPUT_PER_SPEED * Math.ceil(this.cfg.speed / TIME_UNIT) - LAB_PULL_MARGIN;
+    for (let j = 0; j < this.outItems.length; j++) {
+      const k = upper.outItems.indexOf(this.outItems[j]);
+      if (k < 0) continue;
+      const take = Math.min(room - this.producedCount[j], upper.producedCount[k]);
+      if (take <= 0) continue;
+      this.producedCount[j] += take;
+      upper.producedCount[k] -= take;
+    }
   }
 
   /** J/tick the machine asks for next tick: work power (raised by the proliferator level) while replicating, else idle. */

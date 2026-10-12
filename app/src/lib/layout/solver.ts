@@ -16,6 +16,15 @@
 // Margins 0-2 often leave nets unrouted; a failed candidate is normal, is counted and the loop goes on. A candidate
 // whose footprint is smaller than the best's goes to the full validator, and is emitted if it passes.
 //
+// Motifs (Task 26). Behind `useUnverifiedMotifs` (and `VERIFIED_MOTIFS`, which ships empty) the loop also explores
+// netlists that dense motifs have rewritten (motifs/index.ts: direct insertion, the shared-belt sandwich, lab stacks).
+// After each ordinary iteration, with probability `MOTIF_SHARE`, one more iteration works on a motif variant: the
+// netlist for a random subset of the enabled motifs, placed by its own chain of annealed placements (a placement keeps
+// the motifs' groups rigid, so it cannot be annealed as the plain netlist). The ordinary chain is untouched by this
+// (it has its own random source and its own best), so a run with motifs finds everything the run without them finds
+// and, besides, the best of what the motif chains find. The emitted layout is the smallest of the two. Layouts pass the
+// same validator, whichever chain made them.
+//
 // Footprint. The area, in tiles, of the box around every entity: the boxes of the buildings (poles included), the
 // belt nodes and the ends of the sorters.
 //
@@ -40,6 +49,8 @@ import type { Layout } from '../geometry';
 import { validateLayout } from '../validate';
 import type { ValidateOptions, ValidationReport } from '../validate';
 import { assembleLayout } from './assemble';
+import { applyMotifs, enabledMotifKinds, proposeMotifs } from './motifs';
+import type { MotifKind } from './motifs';
 import { buildNetlist } from './netlist';
 import type { Netlist } from './netlist';
 import { obbsBounds, Occupancy } from './occupancy';
@@ -62,6 +73,11 @@ export interface SolveOptions {
   simulate: boolean;
   simWarmupTicks?: number;
   simMeasureTicks?: number;
+  /**
+   * Also use the dense motifs that have not been verified in game (motifs/index.ts). Default false: only the motifs in
+   * `VERIFIED_MOTIFS` are used, and there are none yet.
+   */
+  useUnverifiedMotifs: boolean;
   /** The clock in milliseconds; injectable for tests. Default `performance.now`. */
   now?: () => number;
 }
@@ -94,12 +110,17 @@ export const DEFAULT_SOLVE_OPTIONS: SolveOptions = {
   minRunMs: 30_000,
   earlyStopFraction: 0.2,
   simulate: true,
+  useUnverifiedMotifs: false,
 };
 
 /** The fallback ladder's margins. */
 const LADDER_MARGINS = [3, 4, 6] as const;
 /** The improvement loop's margins. */
 const IMPROVE_MARGINS = [1, 2] as const;
+/** The share of improvement iterations after which a motif iteration follows (when motifs are on). */
+const MOTIF_SHARE = 0.5;
+/** The motif chains' random source is the seed mixed with this, so the ordinary chain's draws are not touched. */
+const MOTIF_SEED_MIX = 0x5bd1e995;
 
 // ---------------------------------------------------------------------------------------------
 // Annealing effort
@@ -254,19 +275,26 @@ export function* solveSteps(
   const weights = DEFAULT_PLACEMENT_WEIGHTS;
 
   const net: Netlist = buildNetlist(plan, data, effects);
-  const constructiveCache = new Map<number, Placement>();
-  const constructive = (margin: number): Placement => {
-    let p = constructiveCache.get(margin);
-    if (!p) {
-      p = constructivePlacement(net, data, margin);
-      constructiveCache.set(margin, p);
-    }
-    return p;
+  /** The constructive placements of `netlist` by margin, made when first asked for. */
+  const constructiveOf = (netlist: Netlist): ((margin: number) => Placement) => {
+    const cache = new Map<number, Placement>();
+    return (margin) => {
+      let p = cache.get(margin);
+      if (!p) {
+        p = constructivePlacement(netlist, data, margin);
+        cache.set(margin, p);
+      }
+      return p;
+    };
   };
+  const constructive = constructiveOf(net);
 
   let attempts = 0;
   let validated = 0;
+  /** The smallest layout found by any chain: what the result is and `onImproved` reports. */
   let best: Best | null = null;
+  /** The ordinary chain's own best: what its anneals start from. Equal to `best` unless a motif chain has done better. */
+  let baseBest: Best | null = null;
   let lastImprovedAt = 0;
   let lastFailure: string | undefined;
   const failures: string[] = [];
@@ -291,39 +319,39 @@ export function* solveSteps(
     };
   };
 
-  /** A placement taken through taps, routes and power to a layout that passes the static checks. */
-  const build = (placement: Placement, stop: () => boolean): Built => {
+  /** A placement of `netlist` taken through taps, routes and power to a layout that passes the static checks. */
+  const build = (netlist: Netlist, placement: Placement, stop: () => boolean): Built => {
     const occ = new Occupancy(data);
     for (const b of placement.buildings) occ.addBuilding(b);
-    const taps = assignTaps(net, placement, occ, data, effects);
+    const taps = assignTaps(netlist, placement, occ, data, effects);
     if ('failed' in taps) return { failures: [`tap assignment failed: ${taps.failed}`] };
-    const routed = routeNets(net, taps, occ, defaultRouteParams(occ), stop);
+    const routed = routeNets(netlist, taps, occ, defaultRouteParams(occ), stop);
     if (!routed.ok) {
       if (stop()) return { stopped: true };
       return { failures: [`routing left ${routed.conflicts} conflicts; nets without a route: ${routed.unroutable.join(', ') || 'none'}`] };
     }
-    const bare = assembleLayout(net, placement, taps, routed.routes, [], plan, data);
+    const bare = assembleLayout(netlist, placement, taps, routed.routes, [], plan, data);
     const targets = powerTargets(bare, data);
     const poles = placePowerNodes(bare.buildings, targets.consumerPoints, targets.blockedPoints, occ, data, effects);
     if (!poles) return { failures: ['no power node placement covers and links the layout'] };
-    const layout = assembleLayout(net, placement, taps, routed.routes, poles, plan, data);
+    const layout = assembleLayout(netlist, placement, taps, routed.routes, poles, plan, data);
     const checked = validateLayout(layout, plan, data, effects, { simulate: false });
     if (!checked.pass) return { failures: violationMessages(checked) };
     return { layout, footprint: footprintOf(layout, data) };
   };
 
   /** Builds a candidate, turning a crash into a failure so one bad candidate never costs the best layout so far. */
-  const tryBuild = (placement: Placement, stop: () => boolean): Built => {
+  const tryBuild = (netlist: Netlist, placement: Placement, stop: () => boolean): Built => {
     try {
-      return build(placement, stop);
+      return build(netlist, placement, stop);
     } catch (err) {
       return { failures: [`internal error: ${err instanceof Error ? err.message : String(err)}`] };
     }
   };
 
   /**
-   * Runs the full validator on a candidate; a pass is the new best, and is emitted. A throw of the validator or the
-   * simulator is a failure of this candidate like any other.
+   * Runs the full validator on a candidate. A pass is a new best of its chain (`adopt` makes it the overall best too if
+   * it is smaller). A throw of the validator or the simulator is a failure of this candidate like any other.
    */
   const accept = (built: { layout: Layout; footprint: number }, placed: MarginPlacement): { best: Best } | { failures: string[] } => {
     let report: ValidationReport;
@@ -333,9 +361,15 @@ export function* solveSteps(
       return { failures: [`internal error: ${err instanceof Error ? err.message : String(err)}`] };
     }
     if (!report.pass) return { failures: violationMessages(report) };
-    lastImprovedAt = elapsed();
-    onImproved(built.layout, report, built.footprint);
     return { best: { ...placed, layout: built.layout, report, footprint: built.footprint } };
+  };
+
+  /** Makes a layout that passed the full validator the overall best if it is smaller, and reports it. */
+  const adopt = (candidate: Best): void => {
+    lastImprovedAt = elapsed();
+    if (best && candidate.footprint >= best.footprint - FOOTPRINT_EPS) return;
+    best = candidate;
+    onImproved(candidate.layout, candidate.report, candidate.footprint);
   };
 
   // --- fallback ladder
@@ -344,7 +378,7 @@ export function* solveSteps(
     yield;
     if (shouldStop()) return result('user');
     const placed: MarginPlacement = { placement: constructive(margin), margin };
-    const built = tryBuild(placed.placement, shouldStop);
+    const built = tryBuild(net, placed.placement, shouldStop);
     attempts++;
     if ('stopped' in built) return result('user');
     if ('failures' in built) {
@@ -357,7 +391,8 @@ export function* solveSteps(
     validated++;
     const accepted = accept(built, placed);
     if ('best' in accepted) {
-      best = accepted.best;
+      baseBest = accepted.best;
+      adopt(accepted.best);
       progress(`ladder: margin ${margin}`);
       break;
     }
@@ -366,7 +401,7 @@ export function* solveSteps(
     lastFailure = tagged[0];
     progress(`ladder: margin ${margin} rejected`);
   }
-  if (!best) return result(shouldStop() ? 'user' : 'exhausted');
+  if (!best || !baseBest) return result(shouldStop() ? 'user' : 'exhausted');
 
   // --- improvement loop
   const rng = new Rng(opts.seed);
@@ -380,74 +415,211 @@ export function* solveSteps(
     return null;
   };
 
-  for (;;) {
-    yield;
-    const stop = stopReason();
-    if (stop) return result(stop);
+  /** Moves of an anneal: as many as the time left allows (within limits), timed to learn how many fit in a millisecond. */
+  const annealWith = (
+    netlist: Netlist,
+    start: Placement,
+    startCost: number,
+    margin: number,
+    seed: number,
+  ): { annealed: Placement } | { error: string } => {
+    const slotMs = clamp((opts.timeBudgetMs - elapsed()) * SLICE_SHARE, MIN_SLICE_MS, MAX_SLICE_MS);
+    const iterations = Math.round(clamp(slotMs * itersPerMs, MIN_ITERS, Math.max(MIN_ITERS, netlist.machines.length * MAX_ITERS_PER_MACHINE)));
+    const annealStarted = now();
+    let annealed: Placement;
+    try {
+      annealed = annealPlacement(
+        netlist,
+        data,
+        start,
+        { margin, seed, iterations, startTemp: Math.max(START_TEMP_SHARE * startCost, COST_EPS), weights },
+        improveStop,
+      );
+    } catch (err) {
+      return { error: `internal error: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    const annealMs = now() - annealStarted;
+    if (annealMs >= MIN_TIMED_MS && !improveStop()) itersPerMs = (itersPerMs + iterations / annealMs) / 2;
+    return { annealed };
+  };
 
-    const current: Best = best;
+  /** One iteration of the ordinary chain: anneal the placement of its best layout, build, and validate if smaller. */
+  const baseIteration = (): void => {
+    const current: Best = baseBest as Best;
     const margin = IMPROVE_MARGINS[rng.int(IMPROVE_MARGINS.length)];
     const seed = rng.int(0x7fffffff);
     const start = annealStart(current, margin, constructive);
     const startCost = placementCost(net, data, start.placement.buildings, weights);
 
-    const slotMs = clamp((opts.timeBudgetMs - elapsed()) * SLICE_SHARE, MIN_SLICE_MS, MAX_SLICE_MS);
-    const iterations = Math.round(clamp(slotMs * itersPerMs, MIN_ITERS, Math.max(MIN_ITERS, net.machines.length * MAX_ITERS_PER_MACHINE)));
-    const annealStarted = now();
-    let annealed: Placement;
-    try {
-      annealed = annealPlacement(
-        net,
-        data,
-        start.placement,
-        { margin, seed, iterations, startTemp: Math.max(START_TEMP_SHARE * startCost, COST_EPS), weights },
-        improveStop,
-      );
-    } catch (err) {
+    const outcome = annealWith(net, start.placement, startCost, margin, seed);
+    if ('error' in outcome) {
       attempts++;
-      lastFailure = `internal error: ${err instanceof Error ? err.message : String(err)}`;
+      lastFailure = outcome.error;
       noteInternalError(margin, lastFailure);
       progress(`improve: margin ${margin} errored`);
-      continue;
+      return;
     }
-    const annealMs = now() - annealStarted;
-    if (annealMs >= MIN_TIMED_MS && !improveStop()) itersPerMs = (itersPerMs + iterations / annealMs) / 2;
+    const { annealed } = outcome;
 
     attempts++;
     if (start.placement === current.placement && annealed.cost >= startCost - COST_EPS) {
       // the anneal found nothing better than the placement of the best layout: nothing new to build
       lastFailure = `margin ${margin}: the anneal found no better placement`;
       progress(`improve: margin ${margin}, no better placement`);
-      continue;
+      return;
     }
 
     const placed: MarginPlacement = { placement: annealed, margin };
-    const built = tryBuild(annealed, improveStop);
+    const built = tryBuild(net, annealed, improveStop);
     if ('stopped' in built) {
       progress(`improve: margin ${margin} stopped`);
-      continue;
+      return;
     }
     if ('failures' in built) {
       lastFailure = `margin ${margin}: ${built.failures[0]}`;
       if (built.failures[0].startsWith('internal error')) noteInternalError(margin, built.failures[0]);
       progress(`improve: margin ${margin} failed`);
-      continue;
+      return;
     }
     validated++;
     if (built.footprint >= current.footprint - FOOTPRINT_EPS) {
       lastFailure = undefined;
       progress(`improve: margin ${margin}, no smaller (${built.footprint.toFixed(0)} against ${current.footprint.toFixed(0)})`);
-      continue;
+      return;
     }
     const accepted = accept(built, placed);
     if ('best' in accepted) {
-      best = accepted.best;
+      baseBest = accepted.best;
+      adopt(accepted.best);
       lastFailure = undefined;
       progress(`improve: margin ${margin}, footprint ${built.footprint.toFixed(0)}`);
     } else {
       lastFailure = `margin ${margin}: ${accepted.failures[0]}`;
       if (accepted.failures[0].startsWith('internal error')) noteInternalError(margin, accepted.failures[0]);
       progress(`improve: margin ${margin} rejected by the simulation`);
+    }
+  };
+
+  // --- motif chains
+  /** A netlist rewritten by the motifs of `kinds`, and the best placements found for it. */
+  interface Variant {
+    kinds: MotifKind[];
+    net: Netlist;
+    constructive: (margin: number) => Placement;
+    /**
+     * The smallest layout of this variant that passed the static checks: it starts the next anneal. The full validator
+     * has only judged it if it was below the overall best when it was found.
+     */
+    best: (MarginPlacement & { footprint: number }) | null;
+  }
+  const motifKinds = enabledMotifKinds(opts.useUnverifiedMotifs);
+  let variants: Variant[] | null = null;
+  let motifsOff = motifKinds.size === 0;
+  const motifRng = new Rng((opts.seed ^ MOTIF_SEED_MIX) >>> 0);
+
+  /** The variants: one per non-empty subset of the enabled motifs that changes the netlist, the fewest motifs first. */
+  const makeVariants = (): Variant[] => {
+    const kinds = [...motifKinds].sort();
+    const subsets: MotifKind[][] = [];
+    for (let mask = 1; mask < 1 << kinds.length; mask++) subsets.push(kinds.filter((_, i) => mask & (1 << i)));
+    subsets.sort((a, b) => a.length - b.length);
+    const made: Variant[] = [];
+    const seen = new Set<string>();
+    for (const subset of subsets) {
+      const instances = proposeMotifs(net, data, effects, new Set(subset));
+      if (instances.length === 0) continue;
+      const key = JSON.stringify(instances.map((i) => i.machineIds));
+      if (seen.has(key)) continue; // another set of motifs makes the same groups
+      seen.add(key);
+      const variantNet = applyMotifs(net, instances, data, effects);
+      made.push({ kinds: subset, net: variantNet, constructive: constructiveOf(variantNet), best: null });
+    }
+    return made;
+  };
+
+  /** One iteration of a motif chain: as `baseIteration`, on the netlist of a random variant. */
+  const motifIteration = (): void => {
+    if (variants === null) {
+      try {
+        variants = makeVariants();
+      } catch (err) {
+        variants = [];
+        lastFailure = `internal error: ${err instanceof Error ? err.message : String(err)}`;
+        noteInternalError(0, lastFailure);
+      }
+      if (variants.length === 0) motifsOff = true;
+    }
+    if (variants.length === 0) return;
+    // half the time the variant with the most motifs, else any
+    const variant = variants[motifRng.next() < 0.5 ? variants.length - 1 : motifRng.int(variants.length)];
+    const name = variant.kinds.join('+');
+    const margin = IMPROVE_MARGINS[motifRng.int(IMPROVE_MARGINS.length)];
+    const seed = motifRng.int(0x7fffffff);
+    const start = annealStart(variant.best, margin, variant.constructive);
+    const startCost = placementCost(variant.net, data, start.placement.buildings, weights);
+
+    const outcome = annealWith(variant.net, start.placement, startCost, margin, seed);
+    attempts++;
+    if ('error' in outcome) {
+      lastFailure = outcome.error;
+      noteInternalError(margin, lastFailure);
+      progress(`motif ${name}: margin ${margin} errored`);
+      return;
+    }
+    const { annealed } = outcome;
+    if (variant.best && start.placement === variant.best.placement && annealed.cost >= startCost - COST_EPS) {
+      lastFailure = `motif ${name}, margin ${margin}: the anneal found no better placement`;
+      progress(`motif ${name}: margin ${margin}, no better placement`);
+      return;
+    }
+
+    const placed: MarginPlacement = { placement: annealed, margin };
+    const built = tryBuild(variant.net, annealed, improveStop);
+    if ('stopped' in built) {
+      progress(`motif ${name}: margin ${margin} stopped`);
+      return;
+    }
+    if ('failures' in built) {
+      lastFailure = `motif ${name}, margin ${margin}: ${built.failures[0]}`;
+      if (built.failures[0].startsWith('internal error')) noteInternalError(margin, built.failures[0]);
+      progress(`motif ${name}: margin ${margin} failed`);
+      return;
+    }
+    validated++;
+    if (variant.best && built.footprint >= variant.best.footprint - FOOTPRINT_EPS) {
+      lastFailure = undefined;
+      progress(`motif ${name}: margin ${margin}, no smaller (${built.footprint.toFixed(0)} against ${variant.best.footprint.toFixed(0)})`);
+      return;
+    }
+    // smaller than this variant's best: it is the variant's new start; the full validator only runs for a new overall best
+    variant.best = { ...placed, footprint: built.footprint };
+    if (best && built.footprint >= best.footprint - FOOTPRINT_EPS) {
+      lastFailure = undefined;
+      progress(`motif ${name}: margin ${margin}, footprint ${built.footprint.toFixed(0)}, not below ${best.footprint.toFixed(0)}`);
+      return;
+    }
+    const accepted = accept(built, placed);
+    if ('best' in accepted) {
+      adopt(accepted.best);
+      lastFailure = undefined;
+      progress(`motif ${name}: margin ${margin}, footprint ${built.footprint.toFixed(0)}`);
+    } else {
+      lastFailure = `motif ${name}, margin ${margin}: ${accepted.failures[0]}`;
+      if (accepted.failures[0].startsWith('internal error')) noteInternalError(margin, accepted.failures[0]);
+      progress(`motif ${name}: margin ${margin} rejected by the simulation`);
+    }
+  };
+
+  for (;;) {
+    yield;
+    const stop = stopReason();
+    if (stop) return result(stop);
+    baseIteration();
+    if (!motifsOff && motifRng.next() < MOTIF_SHARE) {
+      yield;
+      const stopMotif = stopReason();
+      if (stopMotif) return result(stopMotif);
+      motifIteration();
     }
   }
 }

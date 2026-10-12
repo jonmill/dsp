@@ -7,6 +7,7 @@ import type { SolveResult } from '../lib/layout/solver';
 import { compositeLayout } from '../lib/validate/testkit';
 import type { ValidationReport } from '../lib/validate';
 import BlueprintPanel from './BlueprintPanel.svelte';
+import OptionsPanel from './OptionsPanel.svelte';
 import PlanTable from './PlanTable.svelte';
 import SolvePanel from './SolvePanel.svelte';
 import { createAppState } from './state.svelte';
@@ -221,5 +222,22 @@ describe('SolvePanel', () => {
     await app.whenSettled();
     app.startSolve();
     expect(html(SolvePanel, app)).toContain('Worker is not defined');
+  });
+});
+
+describe('OptionsPanel', () => {
+  it('offers the dense motifs as an unchecked option, labelled as not yet verified in game', async () => {
+    const { app } = await appWith();
+    const page = render(OptionsPanel, { props: { app } }).body;
+    expect(page).toContain('Use dense motifs not yet verified in-game');
+    expect(page).toMatch(/<input[^>]*type="checkbox"[^>]*>/);
+    expect(page).not.toMatch(/<input[^>]*type="checkbox"[^>]*\bchecked\b/);
+  });
+
+  it('shows the box checked once the option is on', async () => {
+    const { app } = await appWith();
+    app.setUseUnverifiedMotifs(true);
+    const page = render(OptionsPanel, { props: { app } }).body;
+    expect(page).toMatch(/<input[^>]*type="checkbox"[^>]*\bchecked\b/);
   });
 });

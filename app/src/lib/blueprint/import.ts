@@ -22,6 +22,9 @@
  * side, `outputToSlot` on the drop side); an end on a belt is the node of the folded path that the record it links to
  * became.
  *
+ * Stacks. A blueprint stores no link between stacked buildings, only their heights. A multiLevel building (a lab) standing
+ * on another of the same kind, on the same x, y and yaw and one lapJoint higher, gets that building as its `stackParentId`.
+ *
  * What is not imported. Only the kinds the planner models: production buildings, labs, stations, power nodes, belts and
  * sorters. Every other record (splitters, depots, spray coaters, unknown item ids...) is skipped and named in one
  * warning per item id; a belt or sorter end that linked to one is left open (belt) or the sorter is dropped. Throws only for
@@ -30,7 +33,7 @@
 import { estimatePower } from '../calc/power';
 import type { ItemRate, ProductionPlan, Stage, StationSlotDemand } from '../calc/types';
 import type { Building, GameDataIndex, Recipe, TechEffects } from '../data';
-import { headingDeg } from '../geometry';
+import { headingDeg, LEVEL } from '../geometry';
 import type {
   BeltPath,
   Endpoint,
@@ -100,6 +103,29 @@ function snapYaw(deg: number): { yaw: Yaw; off: number } {
 
 /** Smallest angle between two headings in degrees, in [0, 180]. */
 const headingGap = (a: number, b: number): number => Math.abs((((a - b) % 360) + 540) % 360 - 180);
+
+/** Stacked buildings stand on the same x, y (tiles) and one lapJoint apart in z (metres), to within these. */
+const STACK_XY_TOL = 0.05;
+const STACK_Z_TOL_M = 0.05;
+
+/**
+ * Sets `stackParentId` on every multiLevel building that stands directly on another of the same kind: the same x, y
+ * and yaw, and its z one `lapJoint` of the lower building above the lower one's (a blueprint stores no link, the
+ * stack is only a matter of position). The first such building in record order is the parent.
+ */
+function linkStacks(buildings: PlacedBuilding[], defOf: (b: PlacedBuilding) => Building | undefined): void {
+  for (const b of buildings) {
+    const def = defOf(b);
+    if (!def?.geometry.multiLevel) continue;
+    const parent = buildings.find((q) => {
+      if (q === b || q.yaw !== b.yaw || Math.abs(q.x - b.x) > STACK_XY_TOL || Math.abs(q.y - b.y) > STACK_XY_TOL) return false;
+      const lower = defOf(q);
+      if (!lower?.geometry.multiLevel || lower.kind !== def.kind || !(lower.geometry.lapJoint[1] > 0)) return false;
+      return Math.abs((b.z - q.z) * LEVEL - lower.geometry.lapJoint[1]) <= STACK_Z_TOL_M;
+    });
+    if (parent) b.stackParentId = parent.id;
+  }
+}
 
 const point = (r: BlueprintBuilding): GridPoint => ({ x: r.localOffset[0], y: r.localOffset[1], z: r.localOffset[2] });
 
@@ -184,6 +210,8 @@ export function blueprintToLayout(bp: Blueprint, data: GameDataIndex): ImportRes
     buildings.push(b);
     buildingAt.set(pos, b);
   });
+
+  linkStacks(buildings, (b) => data.building(b.itemId));
 
   // -------------------------------------------------------------------------------------------
   // Belts: chains of records, then the folded paths

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { fixtureData, ITEM } from '../testkit';
+import { LabStack } from './labstack';
 import { MachineSim, machineConfig, splitIncLevel } from './machine';
 import type { MachineConfig } from './machine';
 
@@ -440,6 +441,84 @@ describe('MachineSim labs (matrix production)', () => {
     const lab = machineOf(MATRIX_LAB, RECIPE.matrix, 0);
     const out = run(lab, 180 * 400 + 5, { incPerItem: 4 });
     expect(Math.abs((out.get(6001) ?? 0) - 500)).toBeLessThanOrEqual(1);
+  });
+});
+
+describe('lab stacks (MX §4.4): ingredients pass up, products down', () => {
+  const stackOf = (count: number): { labs: MachineSim[]; stack: LabStack } => {
+    const labs = Array.from({ length: count }, () => machineOf(MATRIX_LAB, RECIPE.matrix));
+    return { labs, stack: new LabStack(labs) };
+  };
+
+  it('the lower lab keeps count + 1 of an ingredient and passes the rest up, at most 5 a tick', () => {
+    const { labs, stack } = stackOf(2);
+    serve(labs[0], COIL, 12);
+    stack.tick();
+    expect(labs[0].served(COIL)).toBe(7);
+    expect(labs[1].served(COIL)).toBe(5);
+    stack.tick();
+    // the upper lab wants 6: it takes the 1 it is short of, though the lower lab has 5 over its share to give
+    expect(labs[1].served(COIL)).toBe(6);
+    expect(labs[0].served(COIL)).toBe(6);
+    stack.tick();
+    expect(labs[1].served(COIL)).toBe(6);
+    expect(labs[0].served(COIL)).toBe(6);
+  });
+
+  it('a lab with no more than count + 1 passes nothing up', () => {
+    const { labs, stack } = stackOf(2);
+    serve(labs[0], COIL, 2);
+    stack.tick();
+    expect(labs[0].served(COIL)).toBe(2);
+    expect(labs[1].served(COIL)).toBe(0);
+  });
+
+  it('carries the proliferator points of the items it passes', () => {
+    const { labs, stack } = stackOf(2);
+    serve(labs[0], COIL, 12, 4);
+    stack.tick();
+    // 5 of 12 items moved, with their share of the 48 points (floor of 48 * 5 / 12 = 20)
+    expect(labs[1].served(COIL)).toBe(5);
+    expect(labs[1].servedPoints(COIL)).toBe(20);
+    expect(labs[0].servedPoints(COIL)).toBe(28);
+  });
+
+  it('the lower lab pulls products down until it holds 10 · ceil(speed) - 2 = 8', () => {
+    const { labs, stack } = stackOf(2);
+    run(labs[1], 180 * 20, { drain: false });
+    expect(labs[1].produced(6001)).toBe(10);
+    stack.tick();
+    expect(labs[0].produced(6001)).toBe(8);
+    expect(labs[1].produced(6001)).toBe(2);
+    expect(labs[0].pickProduct(6001, () => true)).not.toBeNull();
+    stack.tick();
+    expect(labs[0].produced(6001)).toBe(8); // refilled from above
+    expect(labs[1].produced(6001)).toBe(1);
+  });
+
+  it('only items both labs deal in pass: a lab on another recipe takes nothing it does not use', () => {
+    const lower = machineOf(MATRIX_LAB, RECIPE.matrix);
+    const upper = machineOf(MATRIX_LAB, 18); // Energy Matrix: it uses none of the Electromagnetic Matrix's ingredients
+    const stack = new LabStack([lower, upper]);
+    serve(lower, COIL, 12);
+    stack.tick();
+    expect(upper.served(COIL)).toBe(0);
+    expect(lower.served(COIL)).toBe(12);
+  });
+
+  it.each([1, 3, 6])('a stack of %i fed and unloaded only at the bottom makes the matrices of that many labs (±2 %%)', (count) => {
+    const { labs, stack } = stackOf(count);
+    const bottom = labs[0];
+    const ticks = 180 * 400;
+    let made = 0;
+    for (let t = 0; t < ticks; t++) {
+      for (const item of bottom.ingredientItems()) if (bottom.needs(item)) bottom.insert(item, 1, 0);
+      for (const lab of labs) lab.tick(1);
+      stack.tick();
+      for (let p = bottom.pickProduct(6001, () => true); p !== null; p = bottom.pickProduct(6001, () => true)) made += p.count;
+    }
+    const wanted = 400 * count;
+    expect(Math.abs(made - wanted)).toBeLessThanOrEqual(0.02 * wanted);
   });
 });
 

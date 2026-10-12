@@ -20,6 +20,7 @@ import type {
 import { DEFAULT_SOLVE_OPTIONS, solve } from '../layout/solver';
 import { data as kitData, effects as kitEffects, planFor, SMELTER } from '../layout/testkit';
 import { runSimulation } from '../validate';
+import { compositeLayout } from '../validate/testkit';
 import { layoutToBlueprintString } from './build';
 import { decodeBlueprint } from './codec';
 import { blueprintToLayout, regressionPlanFor } from './import';
@@ -722,6 +723,29 @@ describe('blueprintToLayout: belt tiers', () => {
   });
 });
 
+describe('blueprintToLayout: direct insertion', () => {
+  test('a sorter between two buildings comes back with both slots, the filter and the span', () => {
+    const original = compositeLayout().kit.layout();
+    const link = original.sorters.find((s) => s.pick.kind === 'building' && s.drop.kind === 'building')!;
+    link.filterItemId = 1101;
+    link.span = 2;
+    const { layout, warnings } = roundTrip(original);
+    expect(warnings).toEqual([]);
+    const got = layout.sorters.filter((s) => s.pick.kind === 'building' && s.drop.kind === 'building');
+    expect(got).toHaveLength(1);
+    const [s] = got;
+    expect(s).toMatchObject({ filterItemId: 1101, span: 2 });
+    const end = (e: Endpoint): { slot: number; at: [number, number] } => {
+      if (e.kind !== 'building') throw new Error('not a building end');
+      const b = layout.buildings.find((x) => x.id === e.buildingId)!;
+      return { slot: e.slot, at: [b.x, b.y] };
+    };
+    const [pick, drop] = [end(s.pick), end(s.drop)];
+    expect([pick.slot, drop.slot]).toEqual([4, 10]);
+    expect([pick.at[0] - drop.at[0], pick.at[1] - drop.at[1]]).toEqual([-4, 0]); // the assemblers at (6, 8) and (10, 8)
+  });
+});
+
 describe('blueprintToLayout: labs', () => {
   const MATRIX_LAB = 2901;
   /** Electromagnetic Matrix, 180 ticks. */
@@ -760,6 +784,64 @@ describe('blueprintToLayout: labs', () => {
     const bp = labBlueprint([2, 0]);
     bp.body.buildings[0].recipeId = 0;
     expect(blueprintToLayout(bp, data).layout.buildings[0].recipeId).toBeUndefined();
+  });
+
+  describe('stacked labs', () => {
+    /** Three labs on one spot at 0, 3 and 6 levels (the 4 m lapJoint), each stacked on the one below, and a lone lab. */
+    const stackLayout = () =>
+      layoutOf({
+        buildings: [
+          { id: 1, itemId: MATRIX_LAB, x: 0, y: 0, z: 0, yaw: 0, recipeId: RECIPE },
+          { id: 2, itemId: MATRIX_LAB, x: 0, y: 0, z: 3, yaw: 0, recipeId: RECIPE, stackParentId: 1 },
+          { id: 3, itemId: MATRIX_LAB, x: 0, y: 0, z: 6, yaw: 0, recipeId: RECIPE, stackParentId: 2 },
+          { id: 4, itemId: MATRIX_LAB, x: 8, y: 0, z: 0, yaw: 0, recipeId: RECIPE },
+          tower(5, 4, 0),
+        ],
+      });
+
+    test('the builder writes the height of every lab and nothing links them', () => {
+      const { bp } = roundTrip(stackLayout());
+      expect(bp.body.buildings.slice(0, 4).map((r) => r.localOffset[2])).toEqual([0, 3, 6, 0]);
+      expect(bp.body.buildings.slice(0, 4).map((r) => [r.inputObjIdx, r.outputObjIdx])).toEqual([[-1, -1], [-1, -1], [-1, -1], [-1, -1]]);
+    });
+
+    test('the importer finds the stack again: heights and stackParentId (ids are record indexes)', () => {
+      const { layout, warnings } = roundTrip(stackLayout());
+      expect(warnings).toEqual([]);
+      const labs = layout.buildings.filter((b) => b.itemId === MATRIX_LAB);
+      expect(labs.map((b) => [b.id, b.z, b.stackParentId])).toEqual([
+        [0, 0, undefined],
+        [1, 3, 0],
+        [2, 6, 1],
+        [3, 0, undefined],
+      ]);
+    });
+
+    test('a lab merely standing at the right height elsewhere, or with another yaw, is not stacked', () => {
+      const layout = layoutOf({
+        buildings: [
+          { id: 1, itemId: MATRIX_LAB, x: 0, y: 0, z: 0, yaw: 0, recipeId: RECIPE },
+          { id: 2, itemId: MATRIX_LAB, x: 9, y: 0, z: 3, yaw: 0, recipeId: RECIPE },
+          { id: 3, itemId: MATRIX_LAB, x: 0, y: 0, z: 3, yaw: 90, recipeId: RECIPE },
+          { id: 4, itemId: MATRIX_LAB, x: 0, y: 0, z: 2, yaw: 0, recipeId: RECIPE },
+        ],
+      });
+      const imported = roundTrip(layout).layout;
+      expect(imported.buildings.map((b) => b.stackParentId)).toEqual([undefined, undefined, undefined, undefined]);
+    });
+
+    test('a blueprint the game exported (no builder, no ids to trust) is read by position alone', () => {
+      const { bp } = roundTrip(stackLayout());
+      const shuffled = reorder(bp, [3, 2, 0, 1, 4]);
+      const labs = blueprintToLayout(shuffled, data).layout.buildings.filter((b) => b.itemId === MATRIX_LAB);
+      const byZ = new Map(labs.map((b) => [b.id, b]));
+      expect(labs.map((b) => [b.z, b.stackParentId === undefined ? undefined : byZ.get(b.stackParentId)?.z])).toEqual([
+        [0, undefined],
+        [6, 3],
+        [0, undefined],
+        [3, 0],
+      ]);
+    });
   });
 
   test('the regression plan gives a lab a stage at its assemble speed', () => {

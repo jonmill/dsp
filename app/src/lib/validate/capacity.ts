@@ -9,13 +9,16 @@
 // `recipeId` equals the building's `recipeId`. A building that matches no stage is not judged. The layout solver
 // sets `role` to `stage:<stageIndex>` when it places a stage's machines.
 //
+// Stacks. Only the bottom lab of a stack (`stackParentId`) takes sorters (MX §4.4), so the stack is one machine: its
+// bottom lab must be fed what every lab of the stack uses, the sum of their stages' per-machine inputs.
+//
 // Which sorters feed which ingredient. A sorter dropping into a building carries its `filterItemId`; an unfiltered
 // one (filter 0) carries the item of the belt it picks from. An unfiltered sorter that picks from a building is
 // attributed to no ingredient. Each ingredient needs the planned rates of its sorters to add up to at least 99.9 %
 // of the required rate.
 import type { ProductionPlan, Stage } from '../calc';
 import type { GameDataIndex, TechEffects } from '../data';
-import type { BeltPath, Layout, Sorter } from '../geometry';
+import type { BeltPath, Layout, PlacedBuilding, Sorter } from '../geometry';
 import type { Violation, ViolationEntity } from './types';
 
 /** A cargo holds at most four items (MX §2.1). */
@@ -159,25 +162,58 @@ export function checkCapacity(
     if (!firstStageOfRecipe.has(stage.recipeId)) firstStageOfRecipe.set(stage.recipeId, stage);
   }
   const machineViolations: Violation[] = [];
-  for (const b of layout.buildings) {
+  const stageOf = (b: PlacedBuilding): Stage | undefined => {
     const tag = b.role === undefined ? null : STAGE_ROLE.exec(b.role);
-    const stage =
+    return (
       (tag ? plan.stages[Number(tag[1])] : undefined) ??
-      (b.recipeId === undefined ? undefined : firstStageOfRecipe.get(b.recipeId));
-    if (!stage || stage.machines <= 0) continue;
-    for (const input of stage.inputs) {
-      const required = input.perSecond / stage.machines;
-      const feed = feeds.get(b.id)?.get(input.itemId);
+      (b.recipeId === undefined ? undefined : firstStageOfRecipe.get(b.recipeId))
+    );
+  };
+  // A stack of labs is one machine: only its bottom building takes sorters (MX §4.4), and it must bring in what every
+  // lab of the stack uses. `stacks` lists the buildings stacked on a building of the layout under their bottom one.
+  const placed = new Set(layout.buildings.map((b) => b.id));
+  const byId = new Map(layout.buildings.map((b) => [b.id, b] as const));
+  const bottomOf = (b: PlacedBuilding): PlacedBuilding => {
+    let at = b;
+    for (let steps = 0; steps < layout.buildings.length && at.stackParentId !== undefined; steps++) {
+      const below = byId.get(at.stackParentId);
+      if (!below || below === at) break;
+      at = below;
+    }
+    return at;
+  };
+  const stacks = new Map<number, PlacedBuilding[]>();
+  for (const b of layout.buildings) {
+    if (b.stackParentId === undefined || !placed.has(b.stackParentId)) continue;
+    const bottom = bottomOf(b);
+    if (bottom === b) continue; // a loop of stackParentIds: the geometry checks report it
+    const list = stacks.get(bottom.id);
+    if (list) list.push(b);
+    else stacks.set(bottom.id, [b]);
+  }
+  for (const b of layout.buildings) {
+    if (b.stackParentId !== undefined && placed.has(b.stackParentId)) continue;
+    const members = [b, ...(stacks.get(b.id) ?? [])];
+    // item id -> what the stack's machines take per second, in the order the plan lists the inputs
+    const required = new Map<number, number>();
+    for (const member of members) {
+      const stage = stageOf(member);
+      if (!stage || stage.machines <= 0) continue;
+      for (const input of stage.inputs) required.set(input.itemId, (required.get(input.itemId) ?? 0) + input.perSecond / stage.machines);
+    }
+    for (const [itemId, need] of required) {
+      const feed = feeds.get(b.id)?.get(itemId);
       const supplied = feed?.rate ?? 0;
-      if (!fallsShort(supplied, required)) continue;
+      if (!fallsShort(supplied, need)) continue;
       const entities: ViolationEntity[] = [{ kind: 'building', id: b.id }];
       for (const id of feed?.sorters ?? []) entities.push({ kind: 'sorter', id });
+      const wants = members.length > 1 ? `its stack of ${members.length} needs ${fmt(need)} in all` : `its stage needs ${fmt(need)} per machine`;
       machineViolations.push({
         code: 'RATE_MACHINE_INPUT',
         entities,
         message:
-          `building ${b.id} (${data.building(b.itemId)?.name}) gets ${fmt(supplied)} of ${itemName(data, input.itemId)} ` +
-          `from ${feed?.sorters.length ?? 0} sorter(s), but its stage needs ${fmt(required)} per machine`,
+          `building ${b.id} (${data.building(b.itemId)?.name}) gets ${fmt(supplied)} of ${itemName(data, itemId)} ` +
+          `from ${feed?.sorters.length ?? 0} sorter(s), but ${wants}`,
       });
     }
   }

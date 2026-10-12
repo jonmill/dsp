@@ -13,6 +13,7 @@ import type { ProductionPlan, ItemRate } from '../../calc';
 import type { Building, GameDataIndex, Recipe, TechEffects } from '../../data';
 import type { Endpoint, Layout, PlacedBuilding, Sorter } from '../../geometry';
 import { CoaterSim, coaterConfig } from './coater';
+import { LabStack } from './labstack';
 import { MachineSim, machineConfig } from './machine';
 import { SorterSim, sorterSettings } from './sorter';
 import type { BeltRef } from './sorter';
@@ -167,6 +168,7 @@ export function runSimulation(
   const progress = { count: 0 };
 
   const machines = addMachines(world, layout, plan, data, meter, progress, warnings);
+  addLabStacks(world, layout, machines.byBuilding, warnings);
   addSorters(world, layout, data, effects, buildingById, machines.byBuilding, meter, progress, warnings);
   addCoaters(world, layout, data, meter, warnings);
 
@@ -345,6 +347,35 @@ function addMachines(
     world.addEntity(machineEntity(world, machine, meter, progress), 'machines');
   }
   return { list, byBuilding };
+}
+
+/**
+ * A `LabStack` for every stack of machines the layout declares through `stackParentId` (MX §4.4): the machine of the
+ * bottom building first, each next one on the one before. It ticks after the machines, in the same step.
+ */
+function addLabStacks(world: World, layout: Layout, machines: Map<number, MachineSim>, warnings: string[]): void {
+  const above = new Map<number, PlacedBuilding>();
+  for (const b of layout.buildings) {
+    const below = b.stackParentId;
+    if (below === undefined || !machines.has(b.id) || !machines.has(below)) continue;
+    const taken = above.get(below);
+    if (taken) {
+      warnings.push(`buildings ${taken.id} and ${b.id} are both stacked on building ${below}; only ${taken.id} is linked`);
+      continue;
+    }
+    above.set(below, b);
+  }
+  for (const b of layout.buildings) {
+    const bottom = machines.get(b.id);
+    if (!bottom || !above.has(b.id)) continue;
+    if (b.stackParentId !== undefined && machines.has(b.stackParentId)) continue; // not the bottom of its stack
+    const labs = [bottom];
+    for (let next = above.get(b.id); next && labs.length <= layout.buildings.length; next = above.get(next.id)) {
+      labs.push(machines.get(next.id) as MachineSim);
+    }
+    const stack = new LabStack(labs);
+    world.addEntity({ tick: () => stack.tick() }, 'machines');
+  }
 }
 
 function machineEntity(world: World, machine: MachineSim, meter: PowerMeter, progress: { count: number }): SimEntity {

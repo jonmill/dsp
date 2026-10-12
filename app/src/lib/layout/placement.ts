@@ -8,6 +8,13 @@
 // stages by role); a station carries `role: 'station:<index>'` and no `StationConfig` yet (its ports are assigned
 // when the belts are routed).
 //
+// Motif groups. A netlist that carries `motifs` (motifs/apply.ts) names machines that stand in a fixed arrangement:
+// the group's leader (its first member) has a pose, and every other member stands at its `dx, dy` (tiles, turned with the
+// leader's yaw), at `dz` levels and with its `yaw` added to the leader's. A group is placed, and in annealing moved,
+// turned and priced, as one rigid piece; a member that stands on another (`onTop`) carries that building as its
+// `stackParentId`. Members of one group are not held apart by the margin (the arrangement is the point of the group);
+// the margin keeps groups, and machines in no group, apart from each other as before.
+//
 // Margin. For building-against-building collision every footprint counts as grown by `margin` tiles, so two buildings
 // need `2 * margin` tiles between them. With `margin >= 1` there is always a lattice line for a belt, and room for
 // the sorters on both sides of it, between neighbours. The grown footprint keeps square corners.
@@ -18,8 +25,9 @@
 // nearest of the station's belt ports (the lattice point a belt leaves it from). Taking the nearest port is the best
 // a router could do for that net alone, so the term is optimistic when several nets want the same port.
 import type { GameDataIndex } from '../data';
-import { buildingDef, obbOverlap, portInfos } from '../geometry';
+import { buildingDef, obbOverlap, portInfos, rotateYaw } from '../geometry';
 import type { PlacedBuilding, Yaw } from '../geometry';
+import type { MotifGroup, MotifMember } from './motifs/types';
 import type { Netlist } from './netlist';
 import { Occupancy } from './occupancy';
 import { Rng } from './rng';
@@ -60,6 +68,23 @@ export function machineIdOfBuilding(buildingId: number): number | undefined {
 }
 
 const YAWS: readonly Yaw[] = [0, 90, 180, 270];
+
+/** Where a group member stands when its leader stands at (x, y) with `yaw`. */
+export function memberPose(m: MotifMember, leader: { x: number; y: number; yaw: Yaw }): { x: number; y: number; yaw: Yaw } {
+  const [east, north] = rotateYaw(m.dx, m.dy, leader.yaw);
+  return { x: leader.x + east, y: leader.y + north, yaw: ((leader.yaw + m.yaw) % 360) as Yaw };
+}
+
+/** The groups of a netlist, by the machine ids that lead them and that follow. */
+function groupIndex(net: Netlist): { leaders: Map<number, MotifGroup>; followers: Set<number> } {
+  const leaders = new Map<number, MotifGroup>();
+  const followers = new Set<number>();
+  for (const g of net.motifs?.groups ?? []) {
+    leaders.set(g.members[0].machineId, g);
+    for (const m of g.members.slice(1)) followers.add(m.machineId);
+  }
+  return { leaders, followers };
+}
 /** Float noise allowance when rounding a coordinate up to the next whole tile. */
 const SNAP_EPS = 1e-9;
 /** Clear tiles between rows of machines, beyond the margins: room for the belts that run along the row. */
@@ -248,29 +273,54 @@ export function constructivePlacement(net: Netlist, data: GameDataIndex, margin:
   const left = net.stations.length > 0 ? Math.ceil(stationsRight + channel - SNAP_EPS) : 0;
   const bottom = net.stations.length > 0 ? stationsBottom : 0;
 
-  // machines: grouped by stage, in rows
-  const stages = new Map<number, (typeof net.machines)[number][]>();
-  for (const m of net.machines) {
-    const list = stages.get(m.stageIndex);
-    if (list) list.push(m);
-    else stages.set(m.stageIndex, [m]);
+  // machines: grouped by stage, in rows. A motif group is one piece in the row of its leader's stage, as wide and as high
+  // as the box around its members; its other members are placed with it.
+  const { leaders, followers } = groupIndex(net);
+  const machineById = new Map(net.machines.map((m) => [m.id, m] as const));
+  interface Piece {
+    machine: (typeof net.machines)[number];
+    members: MotifMember[];
+    /** The box around the piece's members, relative to the leader's position (leader at yaw 0). */
+    fp: { minX: number; maxX: number; minY: number; maxY: number };
   }
-  const footprint = (itemId: number) => occ.footprintOf(itemId, 0);
-  const pitch = (itemId: number): number => {
-    const fp = footprint(itemId);
-    return fp.maxX - fp.minX + gap;
+  const pieceOf = (m: (typeof net.machines)[number]): Piece => {
+    const group = leaders.get(m.id);
+    if (!group) return { machine: m, members: [], fp: occ.footprintOf(m.buildingItemId, 0) };
+    const fp = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+    for (const member of group.members) {
+      const mm = machineById.get(member.machineId);
+      if (!mm) throw new Error(`constructivePlacement: group member ${member.machineId} is not a machine of the netlist`);
+      const f = occ.footprintOf(mm.buildingItemId, member.yaw);
+      fp.minX = Math.min(fp.minX, member.dx + f.minX);
+      fp.maxX = Math.max(fp.maxX, member.dx + f.maxX);
+      fp.minY = Math.min(fp.minY, member.dy + f.minY);
+      fp.maxY = Math.max(fp.maxY, member.dy + f.maxY);
+    }
+    return { machine: m, members: group.members, fp };
   };
+  const stages = new Map<number, Piece[]>();
+  for (const m of net.machines) {
+    if (followers.has(m.id)) continue;
+    const list = stages.get(m.stageIndex);
+    const piece = pieceOf(m);
+    if (list) list.push(piece);
+    else stages.set(m.stageIndex, [piece]);
+  }
+  const pitch = (p: Piece): number => p.fp.maxX - p.fp.minX + gap;
   let pitchSum = 0;
   let heightSum = 0;
   let widest = 0;
-  for (const m of net.machines) {
-    const fp = footprint(m.buildingItemId);
-    pitchSum += pitch(m.buildingItemId);
-    heightSum += fp.maxY - fp.minY;
-    widest = Math.max(widest, pitch(m.buildingItemId));
+  let pieces = 0;
+  for (const list of stages.values()) {
+    for (const p of list) {
+      pitchSum += pitch(p);
+      heightSum += p.fp.maxY - p.fp.minY;
+      widest = Math.max(widest, pitch(p));
+      pieces++;
+    }
   }
   // rows of width L and mean height h hold pitchSum / L rows: square when L^2 = pitchSum * (h + channel)
-  const meanHeight = net.machines.length > 0 ? heightSum / net.machines.length : 0;
+  const meanHeight = pieces > 0 ? heightSum / pieces : 0;
   const rowWidth = Math.max(widest - gap, Math.ceil(Math.sqrt(pitchSum * (meanHeight + channel))));
 
   let rowBottom = bottom;
@@ -285,32 +335,43 @@ export function constructivePlacement(net: Netlist, data: GameDataIndex, margin:
   };
   const xFor = (fp: { minX: number }): number => Math.ceil(cursor - fp.minX - SNAP_EPS);
   for (const stage of [...stages.keys()].sort((a, b) => a - b)) {
-    const machines = stages.get(stage) as (typeof net.machines)[number][];
-    const stageWidth = machines.reduce((w, m) => w + pitch(m.buildingItemId), 0) - gap;
+    const list = stages.get(stage) as Piece[];
+    const stageWidth = list.reduce((w, p) => w + pitch(p), 0) - gap;
     if (inRow > 0 && cursor + stageWidth > left + rowWidth && stageWidth <= rowWidth) newRow();
-    for (const m of machines) {
-      const fp = footprint(m.buildingItemId);
+    for (const piece of list) {
+      const { fp, machine: m } = piece;
       let x = xFor(fp);
       if (inRow > 0 && x + fp.maxX > left + rowWidth) {
         newRow();
         x = xFor(fp);
       }
       const y = Math.ceil(rowBottom - fp.minY - SNAP_EPS);
-      buildings.push({
-        id: placementBuildingIdOf(m.id),
-        itemId: m.buildingItemId,
-        x,
-        y,
-        z: 0,
-        yaw: 0,
-        recipeId: m.recipeId,
-        role: `stage:${m.stageIndex}`,
-      });
+      const stand = (machine: typeof m, pose: { x: number; y: number; yaw: Yaw }, dz: number, onTop?: number): void => {
+        buildings.push({
+          id: placementBuildingIdOf(machine.id),
+          itemId: machine.buildingItemId,
+          x: pose.x,
+          y: pose.y,
+          z: dz,
+          yaw: pose.yaw,
+          recipeId: machine.recipeId,
+          ...(onTop === undefined ? {} : { stackParentId: placementBuildingIdOf(onTop) }),
+          role: `stage:${machine.stageIndex}`,
+        });
+      };
+      if (piece.members.length === 0) stand(m, { x, y, yaw: 0 }, 0);
+      else {
+        for (const member of piece.members) {
+          stand(machineById.get(member.machineId) as typeof m, memberPose(member, { x, y, yaw: 0 }), member.dz, member.onTop);
+        }
+      }
       rowTop = Math.max(rowTop, y + fp.maxY);
       cursor = x + fp.maxX + gap;
       inRow++;
     }
   }
+  // stations first, then the machines by id, whatever order the pieces were stood in
+  if (leaders.size > 0) buildings.sort((a, b) => a.id - b.id);
   return { buildings, cost: placementCost(net, data, buildings, DEFAULT_PLACEMENT_WEIGHTS) };
 }
 
@@ -352,6 +413,9 @@ function checkParams(p: PlacementParams): void {
  *  - swap the positions of two machines of different stages;
  *  - turn one machine by 90 degrees;
  *  - translate all machines of one stage by the same 1..4 tiles.
+ * Machines in a motif group (see the file comment) move as the group: a translation of one member or of a stage takes
+ * every group it touches along, a turn is a quarter turn of the whole group about its leader, and a swap only swaps
+ * machines that are in no group. The group's own arrangement is never tested against the margin.
  * A move that raises the cost by `d` is accepted with probability `exp(-d / T)`; `T` falls geometrically from
  * `p.startTemp` to a thousandth of it over `p.iterations`. The result depends only on the inputs and `p.seed`.
  * `shouldStop` is asked before the first move and every 256 moves; when it says yes the best so far is returned.
@@ -383,16 +447,50 @@ export function annealPlacement(
   });
   const statics = init.buildings.filter((b) => !machineAt.has(b.id));
 
+  // motif groups, as machine indexes: leader first
+  const indexOfMachine = new Map(net.machines.map((m, k) => [m.id, k] as const));
+  const groupOf = new Int32Array(n).fill(-1);
+  const groupMembers: { k: number; member: MotifMember }[][] = [];
+  for (const g of net.motifs?.groups ?? []) {
+    const list = g.members.map((member) => {
+      const k = indexOfMachine.get(member.machineId);
+      if (k === undefined) throw new Error(`annealPlacement: group member ${member.machineId} is not a machine of the netlist`);
+      if (groupOf[k] >= 0) throw new Error(`annealPlacement: machine ${member.machineId} is in two groups`);
+      groupOf[k] = groupMembers.length;
+      return { k, member };
+    });
+    groupMembers.push(list);
+  }
+  // the initial placement has to keep every group as it is
+  for (const list of groupMembers) {
+    const lead = cur[list[0].k];
+    for (const { k, member } of list.slice(1)) {
+      const want = memberPose(member, lead);
+      const b = cur[k];
+      if (b.x !== want.x || b.y !== want.y || b.yaw !== want.yaw || b.z !== member.dz) {
+        throw new Error(`annealPlacement: the initial placement does not keep machine ${member.machineId} where its group puts it`);
+      }
+    }
+  }
+  const mates = (k: number): Set<number> | undefined =>
+    groupOf[k] < 0 ? undefined : new Set(groupMembers[groupOf[k]].map((e) => cur[e.k].id));
+
   const initCost = placementCost(net, data, init.buildings, weights);
   const unchanged = (): Placement => ({ buildings: init.buildings.map((b) => ({ ...b })), cost: initCost });
 
   // the initial placement has to be sound, or no move could make it so
-  for (const b of [...statics, ...cur]) {
+  for (const b of statics) {
     if (occ.buildingCollides(b, margin)) {
       throw new Error(`annealPlacement: the initial placement has colliding buildings at margin ${margin} (building ${b.id})`);
     }
     occ.addBuilding(b);
   }
+  cur.forEach((b, k) => {
+    if (occ.buildingCollides(b, margin, mates(k))) {
+      throw new Error(`annealPlacement: the initial placement has colliding buildings at margin ${margin} (building ${b.id})`);
+    }
+    occ.addBuilding(b);
+  });
   if (n === 0 || p.iterations === 0) return unchanged();
 
   // machine state
@@ -468,14 +566,14 @@ export function annealPlacement(
   const netStamp = new Int32Array(netCount);
   const affected: number[] = [];
 
-  // stage groups
-  const groupOfStage = new Map<number, number[]>();
+  // the machines of each stage
+  const machinesOfStage = new Map<number, number[]>();
   stageOf.forEach((s, k) => {
-    const g = groupOfStage.get(s);
+    const g = machinesOfStage.get(s);
     if (g) g.push(k);
-    else groupOfStage.set(s, [k]);
+    else machinesOfStage.set(s, [k]);
   });
-  const groups = [...groupOfStage.entries()].sort((a, b) => a[0] - b[0]).map(([, g]) => g);
+  const stages = [...machinesOfStage.entries()].sort((a, b) => a[0] - b[0]).map(([, g]) => g);
 
   let curArea = area();
   let cost = weights.area * curArea + weights.wire * wire;
@@ -493,6 +591,8 @@ export function annealPlacement(
   const oldY: number[] = [];
   const oldT: number[] = [];
   const ignore = new Set<number>();
+  /** The trial move swaps two machines (they move relative to each other). */
+  let swapping = false;
   const probe: PlacedBuilding = { id: 0, itemId: 0, x: 0, y: 0, z: 0, yaw: 0 };
   const candidate = (j: number): PlacedBuilding => ({
     ...cur[mvK[j]],
@@ -504,14 +604,39 @@ export function annealPlacement(
   const rng = new Rng(p.seed);
   const step = (): number => (1 + rng.int(MAX_STEP)) * (rng.next() < 0.5 ? -1 : 1);
 
+  /** Adds the machine at index `k`, moved to (x, y) with `turns` quarter turns, to the trial move. */
+  const moveMachine = (k: number, x: number, y: number, turns: number): void => {
+    mvK.push(k);
+    mvX.push(x);
+    mvY.push(y);
+    mvT.push(turns);
+  };
+  /** Adds the group of the machine at index `k`, with its leader at (x, y) turned `turns` quarter turns, to the trial move. */
+  const moveGroup = (g: number, x: number, y: number, turns: number): void => {
+    for (const { k, member } of groupMembers[g]) {
+      const pose = memberPose(member, { x, y, yaw: YAWS[turns] });
+      moveMachine(k, pose.x, pose.y, YAWS.indexOf(pose.yaw));
+    }
+  };
+  /** Moves machine `k` (with its group, if it has one) by (dx, dy); a group that is already in the move is not added twice. */
+  const shift = (k: number, dx: number, dy: number): void => {
+    const g = groupOf[k];
+    if (g < 0) return moveMachine(k, X[k] + dx, Y[k] + dy, TURNS[k]);
+    const lead = groupMembers[g][0].k;
+    if (mvK.includes(lead)) return;
+    moveGroup(g, X[lead] + dx, Y[lead] + dy, TURNS[lead]);
+  };
+
   /** Fills the trial move; false if the dice gave no move. */
   const propose = (): boolean => {
     mvK.length = mvX.length = mvY.length = mvT.length = 0;
+    swapping = false;
     const r = rng.next();
     if (r >= P_TRANSLATE && r < P_SWAP) {
       const a = rng.int(n);
       const b = rng.int(n);
-      if (stageOf[a] === stageOf[b]) return false;
+      if (stageOf[a] === stageOf[b] || groupOf[a] >= 0 || groupOf[b] >= 0) return false;
+      swapping = true;
       mvK.push(a, b);
       mvX.push(X[b], X[a]);
       mvY.push(Y[b], Y[a]);
@@ -520,22 +645,19 @@ export function annealPlacement(
     }
     if (r >= P_SWAP && r < P_ROTATE) {
       const k = rng.int(n);
-      mvK.push(k);
-      mvX.push(X[k]);
-      mvY.push(Y[k]);
-      mvT.push((TURNS[k] + 1) & 3);
+      const g = groupOf[k];
+      if (g < 0) moveMachine(k, X[k], Y[k], (TURNS[k] + 1) & 3);
+      else {
+        const lead = groupMembers[g][0].k;
+        moveGroup(g, X[lead], Y[lead], (TURNS[lead] + 1) & 3);
+      }
       return true;
     }
-    const members = r < P_TRANSLATE ? [rng.int(n)] : groups[rng.int(groups.length)];
+    const members = r < P_TRANSLATE ? [rng.int(n)] : stages[rng.int(stages.length)];
     const axes = rng.int(3); // 0: x, 1: y, 2: both
     const dx = axes !== 1 ? step() : 0;
     const dy = axes !== 0 ? step() : 0;
-    for (const k of members) {
-      mvK.push(k);
-      mvX.push(X[k] + dx);
-      mvY.push(Y[k] + dy);
-      mvT.push(TURNS[k]);
-    }
+    for (const k of members) shift(k, dx, dy);
     return true;
   };
 
@@ -553,7 +675,7 @@ export function annealPlacement(
       probe.yaw = YAWS[mvT[j]];
       if (occ.buildingCollides(probe, margin, ignore)) return true;
     }
-    if (mvK.length === 2) {
+    if (swapping) {
       // the two swapped machines move relative to each other
       const reach = 2 * margin;
       const a = occ.obbsOf(candidate(0));

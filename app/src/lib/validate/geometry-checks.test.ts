@@ -162,7 +162,7 @@ describe('1 BUILDING_OVERLAP', () => {
     expect(only(check(inside), 'BUILDING_OVERLAP')).toHaveLength(1);
   });
 
-  describe('multiLevel stacking at the lapJoint offset is exempt', () => {
+  describe('a declared stack at the lapJoint offset is exempt', () => {
     // Make the fixture labs 10 m tall so that a stack at the 4 m lapJoint really overlaps without the exemption.
     const tall = patchBuilding(fixtureData, ITEM.matrixLab, (b) => ({
       ...b,
@@ -172,25 +172,136 @@ describe('1 BUILDING_OVERLAP', () => {
       },
     }));
     const lapLevels = 3; // the lab's lapJoint, 4 m
+    const effectsAt = (labLevel: number) => ({ ...fixtureEffects, labLevel });
 
-    test('pass: labs at 0, 3 and 6 levels (every pair, including the ends of the stack)', () => {
-      const kit = new LayoutKit(tall, fixtureEffects);
-      for (const z of [0, lapLevels, 2 * lapLevels]) kit.building(ITEM.matrixLab, 0, 0, 0, { z });
+    /** `count` labs on one spot, each stacked on the one below (the bottom one first). */
+    function labStack(kit: LayoutKit, count: number, over: (i: number) => Partial<ReturnType<LayoutKit['building']>> = () => ({})) {
+      const labs: ReturnType<LayoutKit['building']>[] = [];
+      for (let i = 0; i < count; i++) {
+        labs.push(kit.building(ITEM.matrixLab, 0, 0, 0, { z: i * lapLevels, ...(i > 0 ? { stackParentId: labs[i - 1].id } : {}), ...over(i) }));
+      }
+      return labs;
+    }
+
+    test('pass: labs at 0, 3 and 6 levels, each stacked on the one below (every pair, including the ends of the stack)', () => {
+      const kit = new LayoutKit(tall, effectsAt(3));
+      labStack(kit, 3);
       expect(only(check(kit), 'BUILDING_OVERLAP')).toEqual([]);
     });
 
-    test('fail: the same labs at 0 and 2 levels (not the lapJoint offset)', () => {
-      const kit = new LayoutKit(tall, fixtureEffects);
-      kit.building(ITEM.matrixLab, 0, 0, 0, { z: 0 });
-      kit.building(ITEM.matrixLab, 0, 0, 0, { z: 2 });
+    test('pass: a stack of exactly labLevel labs, and a stack of 15 at labLevel 15', () => {
+      const three = new LayoutKit(tall, effectsAt(3));
+      labStack(three, 3);
+      expect(only(check(three), 'BUILDING_OVERLAP')).toEqual([]);
+      const fifteen = new LayoutKit(tall, effectsAt(15));
+      labStack(fifteen, 15);
+      expect(only(check(fifteen), 'BUILDING_OVERLAP')).toEqual([]);
+    });
+
+    test('fail: the same stack with no stackParentId (an overlap like any other)', () => {
+      const kit = new LayoutKit(tall, effectsAt(3));
+      for (const z of [0, lapLevels, 2 * lapLevels]) kit.building(ITEM.matrixLab, 0, 0, 0, { z });
+      expect(only(check(kit), 'BUILDING_OVERLAP')).toHaveLength(3);
+    });
+
+    test('fail: more labs than labLevel, naming the lab that makes the stack too tall', () => {
+      const kit = new LayoutKit(tall, effectsAt(3));
+      const labs = labStack(kit, 4);
+      const v = only(check(kit), 'BUILDING_OVERLAP');
+      expect(v).toHaveLength(1);
+      expect(v[0].entities).toEqual([
+        { kind: 'building', id: labs[3].id },
+        { kind: 'building', id: labs[2].id },
+      ]);
+      expect(v[0].message).toMatch(/4 high/);
+      expect(v[0].message).toMatch(/labLevel 3/);
+    });
+
+    test('a stack taller than labLevel is reported even when the labs do not overlap in height', () => {
+      const kit = new LayoutKit(fixtureData, effectsAt(2)); // the fixture lab is 3.1 m tall: 4 m apart they do not touch
+      labStack(kit, 3);
       expect(only(check(kit), 'BUILDING_OVERLAP')).toHaveLength(1);
     });
 
+    test('fail: the same labs at 0 and 2 levels (not the lapJoint offset)', () => {
+      const kit = new LayoutKit(tall, effectsAt(3));
+      const bottom = kit.building(ITEM.matrixLab, 0, 0, 0, { z: 0 });
+      kit.building(ITEM.matrixLab, 0, 0, 0, { z: 2, stackParentId: bottom.id });
+      const v = only(check(kit), 'BUILDING_OVERLAP');
+      expect(v.length).toBeGreaterThanOrEqual(1);
+      expect(v.some((x) => /lapJoint/.test(x.message))).toBe(true);
+    });
+
     test('fail: at the lapJoint offset but not on top of each other', () => {
-      const kit = new LayoutKit(tall, fixtureEffects);
-      kit.building(ITEM.matrixLab, 0, 0, 0, { z: 0 });
-      kit.building(ITEM.matrixLab, 1, 0, 0, { z: lapLevels });
-      expect(only(check(kit), 'BUILDING_OVERLAP')).toHaveLength(1);
+      const kit = new LayoutKit(tall, effectsAt(3));
+      const bottom = kit.building(ITEM.matrixLab, 0, 0, 0, { z: 0 });
+      kit.building(ITEM.matrixLab, 1, 0, 0, { z: lapLevels, stackParentId: bottom.id });
+      const v = only(check(kit), 'BUILDING_OVERLAP');
+      expect(v.length).toBeGreaterThanOrEqual(1);
+      expect(v.some((x) => /same x, y/.test(x.message))).toBe(true);
+    });
+
+    test('fail: stacked with a different yaw', () => {
+      const kit = new LayoutKit(tall, effectsAt(3));
+      const bottom = kit.building(ITEM.matrixLab, 0, 0, 0, { z: 0 });
+      kit.building(ITEM.matrixLab, 0, 0, 90, { z: lapLevels, stackParentId: bottom.id });
+      expect(only(check(kit), 'BUILDING_OVERLAP').some((x) => /yaw/.test(x.message))).toBe(true);
+    });
+
+    test('fail: a stackParentId that is not in the layout, or the building itself', () => {
+      const kit = new LayoutKit(fixtureData, effectsAt(3));
+      kit.building(ITEM.matrixLab, 0, 0, 0, { z: lapLevels, stackParentId: 99 });
+      const lab = kit.building(ITEM.matrixLab, 20, 0, 0, { z: lapLevels });
+      lab.stackParentId = lab.id;
+      const v = only(check(kit), 'BUILDING_OVERLAP');
+      expect(v).toHaveLength(2);
+      expect(v[0].message).toMatch(/not in the layout/);
+      expect(v[1].message).toMatch(/itself/);
+    });
+
+    test('fail: a building that cannot be stacked (not multiLevel) with a stackParentId', () => {
+      const kit = new LayoutKit();
+      const bottom = kit.assembler(0, 0);
+      kit.building(ITEM.assembler, 0, 0, 0, { z: 3, stackParentId: bottom.id, recipeId: 1 });
+      const v = only(check(kit), 'BUILDING_OVERLAP');
+      expect(v.length).toBeGreaterThanOrEqual(1);
+      expect(v.some((x) => /multiLevel/.test(x.message))).toBe(true);
+    });
+
+    test('fail: a stack of two kinds of building', () => {
+      const kit = new LayoutKit(tall, effectsAt(3));
+      const lab = kit.building(ITEM.matrixLab, 0, 0, 0);
+      kit.building(2020, 0, 0, 0, { z: lapLevels, stackParentId: lab.id });
+      expect(only(check(kit), 'BUILDING_OVERLAP').some((x) => /kind/.test(x.message))).toBe(true);
+    });
+
+    test('a sorter on the bottom lab is fine; a sorter on a stacked lab is not (multiLevelAllowInserter is false)', () => {
+      const kit = new LayoutKit(fixtureData, effectsAt(3));
+      const labs = labStack(kit, 2);
+      const belt = kit.belt(1, 1202, line([-6, -4], [6, -4]));
+      // slot 7 faces south (0, -1): the first lattice point outside is two rows below the lab's centre... checked below
+      const tap = kit.tapPoint(labs[0], 7);
+      belt.nodes = line([tap.x - 3, tap.y], [tap.x + 3, tap.y]);
+      kit.sorter(onNode(belt, 3), onSlot(labs[0], 7), 1, { filterItemId: 1202 });
+      expect(only(check(kit), 'SORTER_SLOT_INVALID')).toEqual([]);
+
+      const upper = new LayoutKit(fixtureData, effectsAt(3));
+      const ul = labStack(upper, 2);
+      const ub = upper.belt(1, 1202, line([-6, -4], [6, -4]));
+      const ut = upper.tapPoint(ul[1], 7);
+      ub.nodes = line([ut.x - 3, ut.y], [ut.x + 3, ut.y]);
+      const s = upper.sorter(onNode(ub, 3), onSlot(ul[1], 7), 1, { filterItemId: 1202 });
+      const v = only(check(upper), 'SORTER_SLOT_INVALID');
+      expect(v).toHaveLength(1);
+      expect(v[0].entities).toEqual([{ kind: 'sorter', id: s.id }, { kind: 'building', id: ul[1].id }]);
+      expect(v[0].message).toMatch(/stacked/);
+    });
+
+    test('power: a node that covers the bottom lab covers the whole stack (same x and y)', () => {
+      const kit = new LayoutKit(fixtureData, effectsAt(3));
+      labStack(kit, 3);
+      kit.tesla(8, 0);
+      expect(only(check(kit), 'POWER_UNCOVERED')).toEqual([]);
     });
   });
 });

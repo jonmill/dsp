@@ -16,7 +16,7 @@ import { buildNetlist } from '../src/lib/layout/netlist';
 import { Rng } from '../src/lib/layout/rng';
 import { DEFAULT_SOLVE_OPTIONS, footprintOf, solve } from '../src/lib/layout/solver';
 import type { SolveOptions, SolveResult } from '../src/lib/layout/solver';
-import { data, effects, everything, planFor, processorPlan, SMELTER } from '../src/lib/layout/testkit';
+import { data, effects, everything, matrixPlan, planFor, processorPlan, SMELTER } from '../src/lib/layout/testkit';
 import { runSimulation, validateLayout } from '../src/lib/validate';
 import type { ValidationReport } from '../src/lib/validate';
 
@@ -115,6 +115,74 @@ describe('solver end to end [slow]', () => {
     const { result } = solveLogged('processor 1/s (Mk.III belts)', plan, { timeBudgetMs: 10_000 });
     expectAcceptable('processor 1/s (Mk.III belts)', plan, result);
   }, 180_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// Dense motifs (Task 26)
+
+const MOTIF_ITERATIONS = 24;
+
+/**
+ * Solves on a clock that moves one second per iteration of the ordinary chain (the ladder rungs and the improvement
+ * iterations that work on the plain netlist) and not at all for the motif chains. A run with motifs and a run without
+ * therefore get the same budget of ordinary iterations; the ordinary chain draws from its own random source, so it
+ * does exactly the same in both, and the run with motifs can only have more candidates to choose its best from.
+ */
+function solveCounted(name: string, plan: ProductionPlan, over: Partial<SolveOptions>, fx = effects): SolveResult {
+  const clock = { t: 0 };
+  const t0 = performance.now();
+  const result = solve(
+    plan,
+    data,
+    fx,
+    { ...DEFAULT_SOLVE_OPTIONS, seed: 1, timeBudgetMs: MOTIF_ITERATIONS * 1000, minRunMs: 1e9, ...over, now: () => clock.t },
+    (p) => {
+      if (p.phase !== 'done' && !p.phase.startsWith('motif')) clock.t += 1000;
+    },
+    () => {},
+    () => false,
+  );
+  const sorters = result.layout?.sorters.filter((s) => s.pick.kind === 'building' && s.drop.kind === 'building').length;
+  const stacked = result.layout?.buildings.filter((b) => b.stackParentId !== undefined).length;
+  log(
+    `${name}: footprint ${result.footprint?.toFixed(0)} tiles; ${result.attempts} attempts, ${result.validated} validated; ` +
+      `${sorters} sorters between buildings, ${stacked} stacked labs; ${((performance.now() - t0) / 1000).toFixed(1)} s`,
+  );
+  return result;
+}
+
+describe('solver with dense motifs end to end [slow]', () => {
+  it('(d) 1 Processor/s with useUnverifiedMotifs passes the validator and is no larger than without (same seed, same budget)', async () => {
+    const plan = await processorPlan(1);
+    const without = solveCounted('processor 1/s without motifs', plan, {});
+    const withMotifs = solveCounted('processor 1/s with motifs', plan, { useUnverifiedMotifs: true });
+    expectAcceptable('processor 1/s without motifs', plan, without);
+    const layout = expectAcceptable('processor 1/s with motifs', plan, withMotifs);
+    expect(withMotifs.footprint as number).toBeLessThanOrEqual(without.footprint as number);
+    log(`processor: ${(without.footprint as number).toFixed(0)} tiles without motifs, ${(withMotifs.footprint as number).toFixed(0)} with`);
+    // the motif layout is the one that was asked for: the same machines
+    expect(layout.buildings.filter((b) => b.recipeId !== undefined)).toHaveLength(
+      without.layout!.buildings.filter((b) => b.recipeId !== undefined).length,
+    );
+  }, 600_000);
+
+  it('(e) 2 Electromagnetic Matrix/s: the six labs stack up to labLevel, the layout passes, and it is smaller than without motifs', async () => {
+    const plan = await matrixPlan(2);
+    const fx = { ...effects, labLevel: 3 };
+    const without = solveCounted('matrix 2/s without motifs', plan, {}, fx);
+    const withMotifs = solveCounted('matrix 2/s with motifs (labLevel 3)', plan, { useUnverifiedMotifs: true }, fx);
+    expectAcceptable('matrix 2/s without motifs', plan, without, fx);
+    const layout = expectAcceptable('matrix 2/s with motifs', plan, withMotifs, fx);
+    expect(withMotifs.footprint as number).toBeLessThanOrEqual(without.footprint as number);
+    expect(withMotifs.footprint as number).toBeLessThan(without.footprint as number);
+    const labs = layout.buildings.filter((b) => b.itemId === 2901);
+    expect(labs).toHaveLength(6);
+    expect(labs.some((b) => b.stackParentId !== undefined)).toBe(true);
+    expect(Math.max(...labs.map((b) => b.z))).toBeLessThanOrEqual(6);
+    // the same layout is not valid where labs may only stack 2 high
+    const tooTall = validateLayout(layout, plan, data, { ...fx, labLevel: 2 }, { simulate: false });
+    expect(tooTall.pass).toBe(false);
+  }, 600_000);
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -437,6 +437,77 @@ describe('RATE_MACHINE_INPUT', () => {
   });
 });
 
+describe('RATE_MACHINE_INPUT: a lab stack is one machine (MX §4.4)', () => {
+  const RECIPE_EM_MATRIX = 9; // 1 Magnetic Coil + 1 Circuit Board -> 1 Electromagnetic Matrix, 3 s
+  const COIL = 1202;
+  const BOARD = 1301;
+  // 6 labs share the stage; each takes 1/3 per second of each ingredient
+  const plan = planOf([
+    planStage(RECIPE_EM_MATRIX, {
+      buildingItemId: ITEM.matrixLab,
+      machines: 6,
+      exactMachines: 6,
+      inputs: [
+        { itemId: COIL, perSecond: 2 },
+        { itemId: BOARD, perSecond: 2 },
+      ],
+    }),
+  ]);
+
+  /** A stack of `count` labs with a coil and a board belt beside the bottom one. */
+  function stack(count: number) {
+    const kit = new LayoutKit();
+    const labs: PlacedBuilding[] = [];
+    for (let i = 0; i < count; i++) {
+      labs.push(
+        kit.building(ITEM.matrixLab, 20, 8, 0, {
+          recipeId: RECIPE_EM_MATRIX,
+          role: 'stage:0',
+          z: 3 * i,
+          ...(i > 0 ? { stackParentId: labs[i - 1].id } : {}),
+        }),
+      );
+    }
+    const coil = kit.belt(3, COIL, line([0, 6], [30, 6]));
+    const board = kit.belt(3, BOARD, line([0, 4], [30, 4]));
+    return { kit, labs, coil, board };
+  }
+  const input = (kit: LayoutKit): Violation[] => only(checkCapacity(kit.layout(), plan, kit.data, fixtureEffects), 'RATE_MACHINE_INPUT');
+
+  test('a stack of 3 needs 3 labs of each ingredient from the sorters of its bottom lab', () => {
+    const { kit, labs, coil, board } = stack(3);
+    kit.sorter(onNode(coil, 20), onSlot(labs[0], 7), 1, { tierItemId: ITEM.sorter.mk3, plannedRate: 1, filterItemId: COIL });
+    kit.sorter(onNode(board, 20), onSlot(labs[0], 8), 1, { tierItemId: ITEM.sorter.mk3, plannedRate: 1, filterItemId: BOARD });
+    expect(input(kit)).toEqual([]);
+  });
+
+  test('fails when the bottom lab gets only its own share, naming the bottom lab and the stack total', () => {
+    const { kit, labs, coil, board } = stack(3);
+    kit.sorter(onNode(coil, 20), onSlot(labs[0], 7), 1, { tierItemId: ITEM.sorter.mk3, plannedRate: 1 / 3, filterItemId: COIL });
+    kit.sorter(onNode(board, 20), onSlot(labs[0], 8), 1, { tierItemId: ITEM.sorter.mk3, plannedRate: 1, filterItemId: BOARD });
+    const v = input(kit);
+    expect(v).toHaveLength(1);
+    expect(v[0].entities[0]).toEqual({ kind: 'building', id: labs[0].id });
+    expect(v[0].message).toMatch(/Magnetic Coil/);
+    expect(v[0].message).toMatch(/stack of 3/);
+    expect(v[0].message).toMatch(/needs 1\/s/);
+  });
+
+  test('the stacked labs themselves are not judged on their own (they take no sorters)', () => {
+    const { kit, labs, coil, board } = stack(3);
+    kit.sorter(onNode(coil, 20), onSlot(labs[0], 7), 1, { tierItemId: ITEM.sorter.mk3, plannedRate: 1, filterItemId: COIL });
+    kit.sorter(onNode(board, 20), onSlot(labs[0], 8), 1, { tierItemId: ITEM.sorter.mk3, plannedRate: 1, filterItemId: BOARD });
+    expect(input(kit).filter((x) => x.entities.some((e) => e.id === labs[1].id || e.id === labs[2].id))).toEqual([]);
+  });
+
+  test('a lone lab (no stack) is judged as before: it needs only its own share', () => {
+    const { kit, labs, coil, board } = stack(1);
+    kit.sorter(onNode(coil, 20), onSlot(labs[0], 7), 1, { tierItemId: ITEM.sorter.mk3, plannedRate: 1 / 3, filterItemId: COIL });
+    kit.sorter(onNode(board, 20), onSlot(labs[0], 8), 1, { tierItemId: ITEM.sorter.mk3, plannedRate: 1 / 3, filterItemId: BOARD });
+    expect(input(kit)).toEqual([]);
+  });
+});
+
 describe('checkCapacity as a whole', () => {
   test('the composite layout, planned at half a Mk.I belt, passes', () => {
     const c = compositeLayout();

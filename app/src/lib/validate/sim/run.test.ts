@@ -432,6 +432,98 @@ describe('runSimulation: labs', () => {
   });
 });
 
+describe('runSimulation: lab stacks', () => {
+  const COIL = 1202;
+  const BOARD = 1301;
+  const MATRIX = 6001;
+
+  /**
+   * `stacks` stacks of `height` Matrix Labs (height 1: lone labs), each fed coils and boards by Mk.III sorters and
+   * unloaded by one, on its bottom lab only (a tall stack needs the fast ones: a Mk.I sorter moves 1.5 items/s). The plan is `stacks * height` labs making 1/3 matrix/s each.
+   */
+  function labs(stacks: number, height: number) {
+    const kit = new LayoutKit();
+    const source = kit.station(0, 0, 0, ITEM.ils, { station: stationConfig(2) });
+    source.station!.slots[0].itemId = COIL;
+    source.station!.slots[1].itemId = BOARD;
+    source.station!.ports[1] = { dir: 1, storageIdx: 2 };
+    const sink = kit.station(0, 60);
+    sink.station!.slots[0].itemId = MATRIX;
+    sink.station!.ports[2] = { dir: 2, storageIdx: 0 };
+    const length = 20 + 10 * stacks;
+    const coil = kit.belt(1, COIL, line([0, 5], [length, 5]), { source: { buildingId: source.id, port: 0 } });
+    const board = kit.belt(1, BOARD, line([0, 6], [length, 6]), { source: { buildingId: source.id, port: 1 } });
+    const out = kit.belt(1, MATRIX, line([0, 12], [length, 12]), { sink: { kind: 'port', buildingId: sink.id, port: 2 } });
+    for (let k = 0; k < stacks; k++) {
+      const x = 20 + 10 * k;
+      let below: number | undefined;
+      for (let level = 0; level < height; level++) {
+        const lab = kit.building(ITEM.matrixLab, x, 8, 0, {
+          recipeId: 9,
+          role: 'stage:0',
+          z: 3 * level,
+          ...(below === undefined ? {} : { stackParentId: below }),
+        });
+        below = lab.id;
+        if (level > 0) continue;
+        kit.sorter(onNode(coil, x), onSlot(lab, 0), 1, { filterItemId: COIL, tierItemId: ITEM.sorter.mk3 });
+        kit.sorter(onNode(board, x), onSlot(lab, 1), 1, { filterItemId: BOARD, tierItemId: ITEM.sorter.mk3 });
+        kit.sorter(onSlot(lab, 2), onNode(out, x), 1, { filterItemId: MATRIX, tierItemId: ITEM.sorter.mk3 });
+      }
+    }
+    const count = stacks * height;
+    const base = smelterRowLayout(1).plan;
+    const stage = {
+      ...base.stages[0],
+      recipeId: 9,
+      buildingItemId: ITEM.matrixLab,
+      machines: count,
+      exactMachines: count,
+      craftsPerSecond: count / 3,
+      inputs: [
+        { itemId: COIL, perSecond: count / 3 },
+        { itemId: BOARD, perSecond: count / 3 },
+      ],
+      outputs: [{ itemId: MATRIX, perSecond: count / 3 }],
+    };
+    const plan = {
+      ...base,
+      stages: [stage],
+      request: { ...base.request, targetItemId: MATRIX },
+      actualTargetRate: count / 3,
+      exports: [{ itemId: MATRIX, perSecond: count / 3 }],
+    };
+    return { kit, plan };
+  }
+  const simulateLabs = (rig: ReturnType<typeof labs>) =>
+    runSimulation(rig.kit.layout(), rig.plan, fixtureData, fixtureEffects, { warmupTicks: 3600, measureTicks: 18000 });
+
+  it('6 Matrix Labs as 2 stacks of 3 make the matrices of 6 labs (within 2 %)', () => {
+    const flat = simulateLabs(labs(6, 1));
+    const stacked = simulateLabs(labs(2, 3));
+    expect(Math.abs(flat.measuredTargetRate - 2)).toBeLessThan(0.04);
+    expect(Math.abs(stacked.measuredTargetRate - flat.measuredTargetRate)).toBeLessThanOrEqual(0.02 * flat.measuredTargetRate);
+    expect(stacked.deadlocked).toBe(false);
+    expect(stacked.warnings).toEqual([]);
+    // every lab of the stacks worked, the unfed upper ones too
+    expect(stacked.machineStats).toHaveLength(6);
+    for (const m of stacked.machineStats) expect(m.busyFraction).toBeGreaterThan(0.95);
+  });
+
+  it('a stack of 6 labs fed only at the bottom makes 6 labs of matrices', () => {
+    const six = simulateLabs(labs(1, 6));
+    expect(Math.abs(six.measuredTargetRate - 2)).toBeLessThan(0.04);
+  });
+
+  it('without the links the upper labs would starve: that is what the stackParentId buys', () => {
+    const rig = labs(2, 3);
+    const layout = rig.kit.layout();
+    layout.buildings = layout.buildings.map((b) => ({ ...b, stackParentId: undefined }));
+    const sim = runSimulation(layout, rig.plan, fixtureData, fixtureEffects, { warmupTicks: 3600, measureTicks: 18000 });
+    expect(sim.measuredTargetRate).toBeLessThan(0.4 * 6 / 3 + 0.05);
+  });
+});
+
 describe('runSimulation: spray coaters', () => {
   /** The smelter row with a coater on the ore belt before the first smelter, and a Mk.III proliferator belt above it. */
   function sprayedRow(): { layout: Layout; row: ReturnType<typeof smelterRowLayout> } {

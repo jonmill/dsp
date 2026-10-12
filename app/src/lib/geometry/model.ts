@@ -42,6 +42,12 @@ export interface PlacedBuilding {
   /** 0 extra products, 1 speedup. */
   prolifMode?: 0 | 1;
   station?: StationConfig;
+  /**
+   * The building this one stands on, one lapJoint below (labs: MX §4.4, §8). The stacked building has the parent's
+   * x, y and yaw and `z = parent.z + lapJoint / LEVEL`. Only the bottom building of a stack takes sorters; the validator
+   * exempts exactly such pairs from BUILDING_OVERLAP and holds the stack to `effects.labLevel` high.
+   */
+  stackParentId?: number;
   /** Free-form tag, e.g. "stage:51". */
   role?: string;
 }

@@ -184,6 +184,19 @@
         takes longer; after that the solver keeps shrinking it until the budget runs out, or earlier when nothing
         improves. It does not change the plan.
       </p>
+      <label class="check">
+        <input
+          type="checkbox"
+          checked={app.useUnverifiedMotifs}
+          onchange={(event) => app.setUseUnverifiedMotifs(event.currentTarget.checked)}
+        />
+        <span>Use dense motifs not yet verified in-game</span>
+      </label>
+      <p class="hint">
+        Direct insertion between machines, belts shared by two rows of machines and stacked labs pack the layout
+        tighter. The layout is checked like any other, but the game rules these rely on have not been confirmed in the
+        game yet, so such a blueprint may not paste.
+      </p>
     </fieldset>
   </div>
 </section>
@@ -233,5 +246,12 @@
   input[type='number'] {
     width: 72px;
     text-align: right;
+  }
+
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 8px;
   }
 </style>

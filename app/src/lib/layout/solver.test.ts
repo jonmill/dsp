@@ -7,7 +7,8 @@ import type { ValidateOptions, ValidationReport } from '../validate';
 import type { SimResult } from '../validate/sim/run';
 import { annealStart, DEFAULT_SOLVE_OPTIONS, footprintOf, solve, solveSteps, validateWithRetry } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
-import { ASSEMBLER, data, effects, occupancyOf, planFor, SMELTER } from './testkit';
+import { VERIFIED_MOTIFS } from './motifs';
+import { ASSEMBLER, data, effects, matrixPlan, occupancyOf, planFor, SMELTER } from './testkit';
 
 /** 3 Iron Ingots/s on three smelters from supplied Iron Ore: three machines, one station. Small and quick to solve. */
 const ingotPlan = (): Promise<ProductionPlan> =>
@@ -454,4 +455,127 @@ describe('solve', () => {
       if (i > 0) expect(f).toBeLessThanOrEqual(ends[i - 1]);
     });
   }, 120_000);
+});
+
+describe('solve with dense motifs', () => {
+  /** The matrix chain fills over a few game minutes: a warm-up of two. */
+  const ADAPTIVE = { simWarmupTicks: 7_200, simMeasureTicks: 3_600 };
+
+  /** 1 Magnetic Coil/s on base-tier machines: four machines, and a direct-insertion cluster that holds all of them. */
+  const coilPlan = (): Promise<ProductionPlan> =>
+    planFor({
+      targetItemId: 1202,
+      suppliedItemIds: new Set([1001, 1002]),
+      finalFacilityItemId: ASSEMBLER,
+      facilityOverrides: { 6: ASSEMBLER, 1: SMELTER, 2: SMELTER, 3: SMELTER },
+    });
+
+  /**
+   * A run on a clock that moves one step per iteration of the ordinary chain and not at all for the motif chains, so
+   * that runs with and without motifs have the same budget in ordinary iterations.
+   */
+  function runWith(plan: ProductionPlan, over: Partial<SolveOptions>, steps: number, fx = effects) {
+    const clock = { t: 0 };
+    const improved: { layout: Layout; report: ValidationReport; footprint: number; phase: string }[] = [];
+    const phases: string[] = [];
+    let phase = '';
+    const result = solve(
+      plan,
+      data,
+      fx,
+      { ...DEFAULT_SOLVE_OPTIONS, ...SIM, seed: 7, minRunMs: 1e9, timeBudgetMs: steps * 1_000, ...over, now: () => clock.t },
+      (p) => {
+        phases.push(p.phase);
+        phase = p.phase;
+        if (p.phase !== 'done' && !p.phase.startsWith('motif')) clock.t += 1_000;
+      },
+      (layout, report, footprint) => improved.push({ layout, report, footprint, phase }),
+      () => false,
+    );
+    return { result, improved, phases };
+  }
+
+  it('is off by default: no motif iteration runs, and the motifs-off run is the run of before', async () => {
+    expect(DEFAULT_SOLVE_OPTIONS.useUnverifiedMotifs).toBe(false);
+    expect(VERIFIED_MOTIFS.size).toBe(0);
+    const r = runWith(await coilPlan(), {}, 8);
+    expect(r.phases.some((p) => p.startsWith('motif'))).toBe(false);
+    expect(r.result.failures).toEqual([]);
+  }, 120_000);
+
+  it('with useUnverifiedMotifs the loop also works on motif netlists, and every layout it emits passes the validator', async () => {
+    const plan = await coilPlan();
+    const r = runWith(plan, { useUnverifiedMotifs: true }, 10);
+    expect(r.phases.some((p) => p.startsWith('motif'))).toBe(true);
+    expect(r.result.failures).toEqual([]);
+    expect(r.improved.length).toBeGreaterThanOrEqual(1);
+    for (const imp of r.improved) {
+      expect(messages(imp.report)).toEqual([]);
+      const again = validateLayout(imp.layout, plan, data, effects, { warmupTicks: SIM.simWarmupTicks, measureTicks: SIM.simMeasureTicks });
+      expect(messages(again)).toEqual([]);
+      expect(imp.footprint).toBeCloseTo(footprintOf(imp.layout, data), 9);
+    }
+    r.improved.forEach((imp, i) => {
+      if (i > 0) expect(imp.footprint).toBeLessThan(r.improved[i - 1].footprint);
+    });
+    expect(r.result.layout).toBe(r.improved[r.improved.length - 1].layout);
+  }, 180_000);
+
+  it('finds a layout no larger than the run without motifs (same seed, same ordinary iterations), and here a smaller one from a motif chain', async () => {
+    const plan = await coilPlan();
+    const without = runWith(plan, { seed: 1 }, 12);
+    const withMotifs = runWith(plan, { seed: 1, useUnverifiedMotifs: true }, 12);
+    expect(withMotifs.result.footprint).toBeLessThanOrEqual(without.result.footprint as number);
+    expect(withMotifs.result.footprint).toBeLessThan(without.result.footprint as number);
+    // a motif chain found the smaller layout: the progress says "motif <kinds>: margin n, footprint f" for a new best
+    expect(withMotifs.phases.some((p) => /^motif [a-zA-Z+]+: margin \d, footprint \d+$/.test(p))).toBe(true);
+    process.stdout.write(`coil: ${without.result.footprint?.toFixed(0)} tiles without motifs, ${withMotifs.result.footprint?.toFixed(0)} with\n`);
+  }, 180_000);
+
+  it('uses the motifs in VERIFIED_MOTIFS without being asked, and only those', async () => {
+    const plan = await matrixPlan(2);
+    const fx = { ...effects, labLevel: 3 };
+    VERIFIED_MOTIFS.add('labStack');
+    try {
+      const r = runWith(plan, ADAPTIVE, 8, fx);
+      expect(r.result.failures).toEqual([]);
+      const motifPhases = r.phases.filter((p) => p.startsWith('motif'));
+      expect(motifPhases.length).toBeGreaterThan(0);
+      expect(motifPhases.every((p) => p.startsWith('motif labStack:'))).toBe(true);
+    } finally {
+      VERIFIED_MOTIFS.delete('labStack');
+    }
+    expect(VERIFIED_MOTIFS.size).toBe(0);
+  }, 180_000);
+
+  it('stacks the labs of a matrix plan at labLevel 3, and the stacked layout passes the validator at that labLevel only', async () => {
+    const plan = await matrixPlan(2);
+    const fx = { ...effects, labLevel: 3 };
+    VERIFIED_MOTIFS.add('labStack');
+    try {
+      const r = runWith(plan, ADAPTIVE, 14, fx);
+      const stacked = r.improved.filter((i) => i.layout.buildings.some((b) => b.stackParentId !== undefined));
+      expect(stacked.length).toBeGreaterThan(0);
+      for (const imp of stacked) {
+        expect(messages(imp.report)).toEqual([]);
+        const labs = imp.layout.buildings.filter((b) => b.itemId === 2901);
+        expect(labs).toHaveLength(6);
+        expect(Math.max(...labs.map((b) => b.z))).toBeLessThanOrEqual(6); // at most 3 high
+        const again = validateLayout(imp.layout, plan, data, fx, { simulate: false });
+        expect(again.pass).toBe(true);
+        expect(validateLayout(imp.layout, plan, data, { ...fx, labLevel: 2 }, { simulate: false }).pass).toBe(false);
+      }
+    } finally {
+      VERIFIED_MOTIFS.delete('labStack');
+    }
+  }, 300_000);
+
+  it('does not touch the ordinary chain: with motifs on and no motif layout better, the result is the ordinary one', async () => {
+    // the ingot plan has nothing a motif can do (a single stage of identical smelters makes sandwiches only)
+    const plan = await ingotPlan();
+    const without = runWith(plan, {}, 8);
+    const withMotifs = runWith(plan, { useUnverifiedMotifs: true }, 8);
+    expect(withMotifs.result.footprint).toBeLessThanOrEqual(without.result.footprint as number);
+    expect(withMotifs.result.failures).toEqual([]);
+  }, 180_000);
 });

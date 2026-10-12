@@ -43,6 +43,7 @@ import type { ItemRate, ProductionPlan, StationSlotDemand } from '../calc';
 import type { GameDataIndex, TechEffects } from '../data';
 import type { StationSlotConfig } from '../geometry';
 import { beltCapacity, sorterRate } from '../validate/capacity';
+import type { NetlistMotifs } from './motifs/types';
 
 export interface MachineInst {
   id: number;
@@ -94,6 +95,11 @@ export interface Netlist {
   sorterTierItemId: 2011 | 2012 | 2013 | 2014;
   beltTierItemId: 2001 | 2002 | 2003;
   warnings: string[];
+  /**
+   * Set by `applyMotifs` (motifs/index.ts), never by `buildNetlist`: machines that placement keeps together, and the
+   * sorters between them that stand in for belts. The nets are those left after the motifs took theirs off.
+   */
+  motifs?: NetlistMotifs;
 }
 
 const BELT_TIERS = [2001, 2002, 2003] as const;
@@ -104,7 +110,7 @@ const STATION_ITEM = { planetary: 2103, interstellar: 2104 } as const;
 export const NET_LOAD = 0.95;
 const DEFAULT_MAX_MACHINES_PER_NET = 12;
 /** More sorters than this on one machine tap do not fit beside the machine. */
-const MAX_SORTERS_PER_TAP = 3;
+export const MAX_SORTERS_PER_TAP = 3;
 /** Belt ports on a logistics station. */
 const STATION_PORTS = 12;
 /** Items/s below which a rate counts as zero (float noise from running sums). */

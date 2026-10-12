@@ -479,3 +479,39 @@ describe('assignTaps sorter ends (the validator\'s SORTER_SPAN and SORTER_SKEW r
     expect(res.taps.every((t) => t.span === 1)).toBe(true);
   });
 });
+
+describe('assignTaps with the internal sorters of motifs', () => {
+  it('leaves the slots they use to them: the tap takes another slot, on both machines', () => {
+    const { placement } = lone(ASSEMBLER);
+    const tap = { machineId: 1, itemId: 1001, dir: 'in' as const, rate: 1, sorters: 1 };
+    const net: Netlist = synthNetlist([{ building: ASSEMBLER, count: 1 }], [], [{ taps: [tap] }]);
+    const occ = occupancyOf(placement.buildings);
+    const plain = ok(assignTaps(net, placement, occ, data, effects));
+    const taken = plain.taps[0].slot;
+
+    const internal = (fromMachine: number, fromSlot: number, toMachine: number, toSlot: number) => ({
+      fromMachine, fromSlot, toMachine, toSlot, itemId: 1101, span: 1 as const, plannedRate: 1,
+    });
+    // the tap's slot is the sorter's drop slot...
+    const asDrop: Netlist = { ...net, motifs: { groups: [], sorters: [internal(2, 0, 1, taken)] } };
+    expect(ok(assignTaps(asDrop, placement, occ, data, effects)).taps.map((t) => t.slot)).not.toContain(taken);
+    // ...or its pick slot
+    const asPick: Netlist = { ...net, motifs: { groups: [], sorters: [internal(1, taken, 2, 0)] } };
+    expect(ok(assignTaps(asPick, placement, occ, data, effects)).taps.map((t) => t.slot)).not.toContain(taken);
+    // a sorter on another machine's slot does not matter
+    const elsewhere: Netlist = { ...net, motifs: { groups: [], sorters: [internal(2, taken, 3, taken)] } };
+    expect(ok(assignTaps(elsewhere, placement, occ, data, effects))).toEqual(plain);
+  });
+
+  it('fails the usual way when the internal sorters leave a machine too few slots', () => {
+    const { placement } = lone(ASSEMBLER);
+    const tap = { machineId: 1, itemId: 1001, dir: 'in' as const, rate: 1, sorters: 1 };
+    const net: Netlist = synthNetlist([{ building: ASSEMBLER, count: 1 }], [], [{ taps: [tap] }]);
+    const all = Array.from({ length: 12 }, (_, slot) => ({
+      fromMachine: 2, fromSlot: 0, toMachine: 1, toSlot: slot, itemId: 1101, span: 1 as const, plannedRate: 1,
+    }));
+    const res = assignTaps({ ...net, motifs: { groups: [], sorters: all } }, placement, occupancyOf(placement.buildings), data, effects);
+    expect(res).toHaveProperty('failed');
+    expect((res as { failed: string }).failed).toMatch(/no usable sorter slot/);
+  });
+});

@@ -13,8 +13,12 @@ import { assembleLayout } from './assemble';
 import { buildNetlist } from './netlist';
 import type { BeltNet, Netlist } from './netlist';
 import { Occupancy } from './occupancy';
+import { constructivePlacement } from './placement';
 import type { Placement } from './placement';
+import { placePowerNodes, powerTargets } from './power';
+import { defaultRouteParams, routeNets } from './router';
 import type { RoutedNet } from './router';
+import { assignTaps } from './taps';
 import type { TapAssignment } from './taps';
 
 export const parsed = loadFixtureGameData();
@@ -67,6 +71,23 @@ export async function processorPlan(perSecond = 1): Promise<ProductionPlan> {
 /** Processors on Mk.III assemblers, everything unlocked, ore/copper/silicon supplied: a real plan's netlist. */
 export async function processorNetlist(perSecond = 1): Promise<Netlist> {
   return buildNetlist(await processorPlan(perSecond), data, effects);
+}
+
+export const MATRIX_LAB = 2901;
+
+/** `perSecond` Electromagnetic Matrix/s on Matrix Labs (6 labs at 2/s) from supplied ores: 11 machines, 8 nets. */
+export async function matrixPlan(perSecond = 2): Promise<ProductionPlan> {
+  return planFor({
+    targetItemId: 6001,
+    finalFacilityItemId: MATRIX_LAB,
+    quantity: { kind: 'rate', perSecond },
+    suppliedItemIds: new Set([1001, 1002, 1003]),
+  });
+}
+
+/** The netlist of `matrixPlan`; `fx` is the tech state (the labs stack as high as its `labLevel`). */
+export async function matrixNetlist(perSecond = 2, fx: TechEffects = effects): Promise<Netlist> {
+  return buildNetlist(await matrixPlan(perSecond), data, fx);
 }
 
 const BASE_TIER_BY_TYPE: Record<string, number> = {
@@ -173,4 +194,27 @@ export function spanOnePoints(b: PlacedBuilding): { x: number; y: number }[] {
 /** The layout a placement, its taps and the routes make, without power nodes (`assembleLayout` on an empty plan). */
 export function layoutOf(net: Netlist, placement: Placement, taps: TapAssignment, routes: RoutedNet[]): Layout {
   return assembleLayout(net, placement, taps, routes, [], planOf([]), data);
+}
+
+/**
+ * The pipeline of one solver candidate with the constructive placement at `margin`: taps, routes, power nodes, the
+ * layout. `placement` replaces the constructive one when given. Throws, naming the stage, when one of them fails.
+ */
+export function pipelineLayout(
+  net: Netlist,
+  plan: ProductionPlan,
+  margin = 4,
+  placement: Placement = constructivePlacement(net, data, margin),
+  fx: TechEffects = effects,
+): { layout: Layout; placement: Placement; taps: TapAssignment } {
+  const occ = occupancyOf(placement.buildings);
+  const taps = assignTaps(net, placement, occ, data, fx);
+  if ('failed' in taps) throw new Error(`assignTaps failed: ${taps.failed}`);
+  const routed = routeNets(net, taps, occ, defaultRouteParams(occ), () => false);
+  if (!routed.ok) throw new Error(`routing left ${routed.conflicts} conflicts; unroutable nets ${routed.unroutable.join(', ')}`);
+  const bare = assembleLayout(net, placement, taps, routed.routes, [], plan, data);
+  const targets = powerTargets(bare, data);
+  const poles = placePowerNodes(bare.buildings, targets.consumerPoints, targets.blockedPoints, occ, data, fx);
+  if (!poles) throw new Error('no power node placement covers and links the layout');
+  return { layout: assembleLayout(net, placement, taps, routed.routes, poles, plan, data), placement, taps };
 }

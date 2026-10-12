@@ -8,7 +8,7 @@ import { LayoutKit, onNode, onSlot } from '../validate/testkit';
 import { assembleLayout } from './assemble';
 import { buildNetlist } from './netlist';
 import type { Netlist } from './netlist';
-import { constructivePlacement, stationBuildingId } from './placement';
+import { constructivePlacement, placementBuildingIdOf, stationBuildingId } from './placement';
 import type { Placement } from './placement';
 import { placePowerNodes, powerTargets } from './power';
 import { defaultRouteParams, routeNets } from './router';
@@ -262,4 +262,46 @@ describe('the Processor netlist end to end', () => {
     expect(report.pass).toBe(true);
     expect(report.sim!.measuredTargetRate).toBeGreaterThanOrEqual(0.99);
   }, 300_000);
+});
+
+describe('assembleLayout with motifs', () => {
+  it('writes the internal sorters of the netlist as sorters between two buildings, after the tap sorters', async () => {
+    const plan = await ironIngotPlan();
+    const s = solve(plan);
+    const machine = s.net.machines[0];
+    const net: Netlist = {
+      ...s.net,
+      motifs: {
+        groups: [],
+        sorters: [
+          { fromMachine: machine.id, fromSlot: 4, toMachine: machine.id, toSlot: 10, itemId: 1101, span: 2, plannedRate: 0.75 },
+        ],
+      },
+    };
+    const layout = assembleLayout(net, s.placement, s.taps, s.routes, [], plan, data);
+    expect(layout.sorters).toHaveLength(s.base.sorters.length + 1);
+    expect(layout.sorters.slice(0, s.base.sorters.length)).toEqual(s.base.sorters);
+    const internal = layout.sorters[layout.sorters.length - 1];
+    expect(internal).toEqual({
+      id: s.base.sorters.length + 1,
+      tierItemId: net.sorterTierItemId,
+      filterItemId: 1101,
+      span: 2,
+      pick: { kind: 'building', buildingId: placementBuildingIdOf(machine.id), slot: 4 },
+      drop: { kind: 'building', buildingId: placementBuildingIdOf(machine.id), slot: 10 },
+      plannedRate: 0.75,
+    });
+  });
+
+  it('keeps the stacks of the placement: z and stackParentId come through to the layout', async () => {
+    const plan = await ironIngotPlan();
+    const s = solve(plan);
+    const machineId = placementBuildingIdOf(s.net.machines[0].id);
+    const placement: Placement = {
+      ...s.placement,
+      buildings: s.placement.buildings.map((b) => (b.id === machineId ? { ...b, z: 3, stackParentId: stationBuildingId(0) } : b)),
+    };
+    const layout = assembleLayout(s.net, placement, s.taps, s.routes, [], plan, data);
+    expect(layout.buildings.find((b) => b.id === machineId)).toMatchObject({ z: 3, stackParentId: stationBuildingId(0) });
+  });
 });

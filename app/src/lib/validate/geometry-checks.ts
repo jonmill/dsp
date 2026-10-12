@@ -60,6 +60,12 @@ const TOL = 1e-6;
 const MAX_LATTICE_WALK = 16;
 /** Flat steps a lift needs on each side (MX §2.4). */
 const FLAT_STEPS_AROUND_LIFT = 2;
+/** Stacked buildings share x and y to within this many tiles. */
+const STACK_XY_TOL = 0.05;
+/** A stacked building stands within this many metres of the lower one's lapJoint height. */
+const STACK_Z_TOL_M = 0.05;
+/** A lapJoint at most this many metres high is no lapJoint (the data holds 0 for buildings that cannot stack). */
+const STACK_MIN_LAP_M = 0.01;
 
 // ---------------------------------------------------------------------------------------------
 // Spatial hash
@@ -221,6 +227,10 @@ class GeometryChecker {
   private readonly boxGrid: SpatialGrid;
   /** Midpoints of the sorters whose ends could be placed: sorters are power consumers. */
   private readonly sorterPoints: { s: Sorter; x: number; y: number }[] = [];
+  /** Entries (by position in `layout.buildings`) whose `stackParentId` names a building they may stand on. */
+  private readonly stackedOk = new Set<number>();
+  /** What is wrong with the stacks the layout declares, in building order. */
+  private readonly stackProblems: { entities: [BuildingEntry, BuildingEntry?]; text: string }[] = [];
 
   constructor(
     private readonly layout: Layout,
@@ -241,6 +251,7 @@ class GeometryChecker {
     }
     this.boxGrid = new SpatialGrid(this.boxes.length, CELL_TILES);
     this.boxes.forEach((box, i) => this.boxGrid.add(i, ...bounds(box.obb)));
+    this.analyzeStacks();
   }
 
   run(): Violation[] {
@@ -298,8 +309,9 @@ class GeometryChecker {
 
   // mirrors: BuildTool_Click.CheckBuildConditions
   /**
-   * Pairwise `obbOverlap` of building boxes, found through the spatial hash. Buildings stacked on the same spot
-   * at the `lapJoint` height (`multiLevel`) are exempt.
+   * Pairwise `obbOverlap` of building boxes, found through the spatial hash. Buildings of one declared stack
+   * (`stackParentId`, one `lapJoint` apart, see `analyzeStacks`) are exempt. A stack that breaks the stacking rules
+   * (wrong place, wrong height, too tall) is reported here too, after the overlaps.
    */
   private buildingOverlaps(): void {
     const seen = new Set<number>();
@@ -321,17 +333,91 @@ class GeometryChecker {
         );
       });
     });
+    for (const { entities, text } of this.stackProblems) {
+      this.emit('BUILDING_OVERLAP', entities.flatMap((e) => (e ? [building(e.b.id)] : [])), text, MIRROR_CLICK);
+    }
   }
 
-  /** Two multiLevel buildings on one spot whose heights differ by a whole number of the lower one's lapJoints. */
+  /**
+   * Stacking (MX §4.4, §8). A building that carries a `stackParentId` stands on that building: the same kind of
+   * multiLevel building, on the same x, y and yaw, one `lapJoint` of the lower one higher. A stack of labs is at most
+   * `effects.labLevel` high (other kinds are not limited here: their limits are not modelled). `stackedOk` holds the
+   * buildings whose link to the building below is right; `stackProblems` the rest, and the stacks that are too tall.
+   */
+  private analyzeStacks(): void {
+    const linkProblem = (e: BuildingEntry, parent: BuildingEntry): string | undefined => {
+      const geo = (x: BuildingEntry) => x.bd.geometry;
+      if (e.bd.kind !== parent.bd.kind) {
+        return `${label(e)} is stacked on ${label(parent)}, but they are different kinds of building (${e.bd.kind} and ${parent.bd.kind})`;
+      }
+      if (!geo(e).multiLevel || !geo(parent).multiLevel) {
+        const flat = geo(e).multiLevel ? parent : e;
+        return `${label(e)} is stacked on ${label(parent)}, but ${label(flat)} is not multiLevel and cannot be stacked`;
+      }
+      if (Math.abs(e.b.x - parent.b.x) > STACK_XY_TOL || Math.abs(e.b.y - parent.b.y) > STACK_XY_TOL) {
+        return `${label(e)} is stacked on ${label(parent)}, but is not on the same x, y: ${at(e.b)} against ${at(parent.b)}`;
+      }
+      if (e.b.yaw !== parent.b.yaw) {
+        return `${label(e)} is stacked on ${label(parent)}, but its yaw is ${e.b.yaw} and the building below has yaw ${parent.b.yaw}`;
+      }
+      const lap = geo(parent).lapJoint[1];
+      const dz = e.b.z - parent.b.z;
+      if (!(lap > STACK_MIN_LAP_M) || Math.abs(dz * LEVEL - lap) > STACK_Z_TOL_M) {
+        return (
+          `${label(e)} is stacked on ${label(parent)} at z ${num(e.b.z)}, ${num(dz)} levels up, but the lapJoint of ` +
+          `${parent.bd.name} is ${num(lap)} m = ${num(lap / LEVEL)} levels: it must stand at z ${num(parent.b.z + lap / LEVEL)}`
+        );
+      }
+      return undefined;
+    };
+
+    for (const e of this.entries) {
+      const parentId = e.b.stackParentId;
+      if (parentId === undefined) continue;
+      if (parentId === e.b.id) {
+        this.stackProblems.push({ entities: [e], text: `${label(e)} cannot be stacked on itself` });
+        continue;
+      }
+      const parent = this.entryById.get(parentId);
+      if (!parent) {
+        this.stackProblems.push({ entities: [e], text: `${label(e)} is stacked on building ${parentId}, which is not in the layout` });
+        continue;
+      }
+      const problem = linkProblem(e, parent);
+      if (problem) this.stackProblems.push({ entities: [e, parent], text: problem });
+      else this.stackedOk.add(e.index);
+    }
+
+    // Heights, from the links that are right; a loop of links is cut where it closes.
+    const height = (e: BuildingEntry, seen: Set<number>): number => {
+      if (!this.stackedOk.has(e.index) || seen.has(e.index)) return 1;
+      seen.add(e.index);
+      return 1 + height(this.entryById.get(e.b.stackParentId as number) as BuildingEntry, seen);
+    };
+    for (const e of this.entries) {
+      if (!this.stackedOk.has(e.index)) continue;
+      const limit = e.bd.kind === 'lab' ? this.effects.labLevel : Infinity;
+      const high = height(e, new Set());
+      if (high > limit) {
+        this.stackProblems.push({
+          entities: [e, this.entryById.get(e.b.stackParentId as number)],
+          text: `the stack ends at ${label(e)} and is ${high} high; at labLevel ${limit} a stack of labs is at most ${limit} high`,
+        });
+      }
+    }
+  }
+
+  /** Is one of the two stacked, directly or through the buildings between them, on the other? */
   private isStacked(a: BuildingEntry, b: BuildingEntry): boolean {
-    if (!a.bd.geometry.multiLevel || !b.bd.geometry.multiLevel) return false;
-    if (Math.abs(a.b.x - b.b.x) > 0.05 || Math.abs(a.b.y - b.b.y) > 0.05) return false;
     const [lower, upper] = a.b.z <= b.b.z ? [a, b] : [b, a];
-    const lap = lower.bd.geometry.lapJoint[1];
-    if (!(lap > 0.01)) return false;
-    const steps = ((upper.b.z - lower.b.z) * LEVEL) / lap;
-    return steps > 0.5 && Math.abs(steps - Math.round(steps)) * lap < 0.05;
+    let cur: BuildingEntry = upper;
+    for (let steps = 0; steps <= this.entries.length; steps++) {
+      if (!this.stackedOk.has(cur.index)) return false;
+      const parent = this.entryById.get(cur.b.stackParentId as number) as BuildingEntry;
+      if (parent === lower) return true;
+      cur = parent;
+    }
+    return false;
   }
 
   // -------------------------------------------------------------------------------------------
@@ -657,6 +743,16 @@ class GeometryChecker {
           continue;
         }
         end.building = entry;
+        if (entry.b.stackParentId !== undefined && !entry.bd.geometry.multiLevelAllowInserter) {
+          this.emit(
+            'SORTER_SLOT_INVALID',
+            [sorter(s.id), building(entry.b.id)],
+            `${who} is on ${label(entry)}, which is stacked on building ${entry.b.stackParentId}: ${entry.bd.name}s take sorters on the bottom level of a stack only (multiLevelAllowInserter is false, MX §8)`,
+            MIRROR_INSERTER,
+          );
+          ctx.resolved = false;
+          continue;
+        }
         if (entry.bd.kind === 'station' || entry.bd.station !== undefined) {
           this.emit(
             'SORTER_TO_STATION',

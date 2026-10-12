@@ -2,9 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { planProduction } from '../calc';
 import type { PlanRequest } from '../calc';
 import { allTechs, computeTechEffects, GameDataIndex } from '../data';
-import { buildingOBBs, obbOverlap } from '../geometry';
+import { buildingOBBs, obbOverlap, rotateYaw } from '../geometry';
 import type { PlacedBuilding } from '../geometry';
 import { loadFixtureGameData } from '../../../test/fixtures/fixtureGameData';
+import { applyMotifs, proposeMotifs } from './motifs';
+import type { MotifGroup } from './motifs';
 import { buildNetlist } from './netlist';
 import type { BeltNet, Netlist } from './netlist';
 import {
@@ -17,6 +19,7 @@ import {
   stationBuildingId,
 } from './placement';
 import type { Placement, PlacementParams } from './placement';
+import { matrixNetlist } from './testkit';
 
 const parsed = loadFixtureGameData();
 const data = new GameDataIndex(parsed);
@@ -586,5 +589,163 @@ describe('annealPlacement', () => {
     expect(ms).toBeLessThan(10000);
     expectSoundPlacement(net, out, 2);
     expect(out.cost).toBeLessThanOrEqual(init.cost);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Motif groups
+
+describe('placement with motif groups', () => {
+  /** The matrix netlist with its six labs stacked 3 high (labLevel 3): two groups of three labs. */
+  async function stackedNetlist(): Promise<Netlist> {
+    const fx = { ...effects, labLevel: 3 };
+    const base = await matrixNetlist(2, fx);
+    return applyMotifs(base, proposeMotifs(base, data, fx, new Set(['labStack'])), data, fx);
+  }
+
+  /** Smelter at the origin of its group, an assembler 4 east, another turned a quarter and 6 north. */
+  function groupedNetlist(): Netlist {
+    const net = synthNetlist(
+      [{ building: SMELTER, count: 4 }, { building: ASSEMBLER, count: 6 }],
+      [PLS],
+      [
+        { taps: [1, 5, 6, 7], station: { idx: 0, as: 'source' } },
+        { taps: [2, 5, 8, 9] },
+        { taps: [3, 6, 10] },
+        { taps: [4, 7, 9, 10], station: { idx: 0, as: 'sink' } },
+      ],
+    );
+    const group: MotifGroup = {
+      kind: 'direct',
+      members: [
+        { machineId: 5, dx: 0, dy: 0, dz: 0, yaw: 0 },
+        { machineId: 1, dx: 4, dy: 0, dz: 0, yaw: 180 },
+        { machineId: 6, dx: 0, dy: 6, dz: 0, yaw: 90 },
+      ],
+    };
+    return { ...net, motifs: { groups: [group], sorters: [] } };
+  }
+
+  /** Every member of every group stands where its leader's pose puts it. */
+  function expectGroupsRigid(net: Netlist, p: Placement): void {
+    const byId = new Map(p.buildings.map((b) => [b.id, b] as const));
+    for (const g of net.motifs?.groups ?? []) {
+      const lead = byId.get(placementBuildingIdOf(g.members[0].machineId))!;
+      for (const m of g.members) {
+        const b = byId.get(placementBuildingIdOf(m.machineId))!;
+        const [east, north] = rotateYaw(m.dx, m.dy, lead.yaw);
+        expect([b.x, b.y, b.z, b.yaw], `machine ${m.machineId}`).toEqual([lead.x + east, lead.y + north, m.dz, (lead.yaw + m.yaw) % 360]);
+        expect(b.stackParentId).toBe(m.onTop === undefined ? undefined : placementBuildingIdOf(m.onTop));
+      }
+    }
+  }
+
+  /** Brute force: no two buildings of different groups (or in none) closer than 2 * margin tiles. */
+  function expectNoCollisionsBetweenGroups(net: Netlist, p: Placement, margin: number): void {
+    const groupOf = new Map<number, number>();
+    (net.motifs?.groups ?? []).forEach((g, i) => g.members.forEach((m) => groupOf.set(placementBuildingIdOf(m.machineId), i)));
+    const mates = (a: PlacedBuilding, b: PlacedBuilding): boolean => groupOf.has(a.id) && groupOf.get(a.id) === groupOf.get(b.id);
+    const all = p.buildings;
+    for (let i = 0; i < all.length; i++) {
+      for (let j = i + 1; j < all.length; j++) {
+        if (mates(all[i], all[j])) continue;
+        const hit = obbsOf(all[i]).some((a) => obbsOf(all[j]).some((c) => obbOverlap({ ...a, hx: a.hx + 2 * margin, hy: a.hy + 2 * margin }, c)));
+        expect(hit, `buildings ${all[i].id} and ${all[j].id} collide at margin ${margin}`).toBe(false);
+      }
+    }
+  }
+
+  describe('constructivePlacement', () => {
+    it('stands a stack of labs on one footprint: same x, y and yaw, 3 levels apart, each on the one below', async () => {
+      const net = await stackedNetlist();
+      const p = constructivePlacement(net, data, 2);
+      expect(p.buildings).toHaveLength(net.stations.length + net.machines.length);
+      expectGroupsRigid(net, p);
+      const [g] = net.motifs!.groups;
+      const stack = g.members.map((m) => p.buildings.find((b) => b.id === placementBuildingIdOf(m.machineId))!);
+      expect(stack.map((b) => b.z)).toEqual([0, 3, 6]);
+      expect(new Set(stack.map((b) => `${b.x},${b.y},${b.yaw}`)).size).toBe(1);
+      expect(stack[0].stackParentId).toBeUndefined();
+      expect(stack[1].stackParentId).toBe(stack[0].id);
+      expect(stack[2].stackParentId).toBe(stack[1].id);
+    });
+
+    it('is collision free at the margin apart from the stacks themselves, and takes the room of a stack once', async () => {
+      const net = await stackedNetlist();
+      const stacked = constructivePlacement(net, data, 2);
+      expectNoCollisionsBetweenGroups(net, stacked, 2);
+      const flat = constructivePlacement(await matrixNetlist(2, { ...effects, labLevel: 3 }), data, 2);
+      const box = (p: Placement): number => {
+        let [x0, x1, y0, y1] = [Infinity, -Infinity, Infinity, -Infinity];
+        for (const b of p.buildings) for (const o of obbsOf(b)) {
+          x0 = Math.min(x0, o.cx - o.hx); x1 = Math.max(x1, o.cx + o.hx); y0 = Math.min(y0, o.cy - o.hy); y1 = Math.max(y1, o.cy + o.hy);
+        }
+        return (x1 - x0) * (y1 - y0);
+      };
+      expect(box(stacked)).toBeLessThan(box(flat));
+    });
+
+    it('places a group made of different buildings as one piece of the box around its members, in the row of its leader', () => {
+      const net = groupedNetlist();
+      const p = constructivePlacement(net, data, 2);
+      expectGroupsRigid(net, p);
+      expectNoCollisionsBetweenGroups(net, p, 2);
+      expect(p.buildings.map((b) => b.id)).toEqual([...p.buildings.map((b) => b.id)].sort((a, b) => a - b));
+    });
+
+    it('is deterministic, and prices a group like any other machines', () => {
+      const net = groupedNetlist();
+      expect(constructivePlacement(net, data, 2)).toEqual(constructivePlacement(net, data, 2));
+      const p = constructivePlacement(net, data, 2);
+      expect(p.cost).toBe(placementCost(net, data, p.buildings, DEFAULT_PLACEMENT_WEIGHTS));
+    });
+  });
+
+  describe('annealPlacement', () => {
+    it('moves and turns a group as one piece: every member stays where the leader puts it (seeds 1 to 4)', () => {
+      const net = groupedNetlist();
+      const init = constructivePlacement(net, data, 2);
+      const yaws = new Set<number>();
+      for (let seed = 1; seed <= 4; seed++) {
+        const out = annealPlacement(net, data, init, params({ seed, iterations: 8000 }), never);
+        expectGroupsRigid(net, out);
+        expectNoCollisionsBetweenGroups(net, out, 2);
+        expect(out.cost).toBeLessThanOrEqual(init.cost);
+        yaws.add(out.buildings.find((b) => b.id === placementBuildingIdOf(5))!.yaw);
+      }
+      expect(yaws.size).toBeGreaterThan(1); // the group does get turned
+    });
+
+    it('keeps the stacks of a matrix netlist standing: heights, parents and one footprint per stack', async () => {
+      const net = await stackedNetlist();
+      const init = constructivePlacement(net, data, 1);
+      const out = annealPlacement(net, data, init, params({ margin: 1, iterations: 6000 }), never);
+      expectGroupsRigid(net, out);
+      expectNoCollisionsBetweenGroups(net, out, 1);
+      expect(out.cost).toBeLessThanOrEqual(init.cost);
+      expect(out).toEqual(annealPlacement(net, data, init, params({ margin: 1, iterations: 6000 }), never));
+    });
+
+    it('does not swap a machine of a group (a swap would pull it out of its arrangement)', () => {
+      const net = groupedNetlist();
+      const init = constructivePlacement(net, data, 2);
+      const out = annealPlacement(net, data, init, params({ iterations: 20000 }), never);
+      expectGroupsRigid(net, out);
+    });
+
+    it('refuses an initial placement in which a group is not as the netlist says', () => {
+      const net = groupedNetlist();
+      const init = constructivePlacement(net, data, 2);
+      const broken = { ...init, buildings: init.buildings.map((b) => (b.id === placementBuildingIdOf(1) ? { ...b, x: b.x + 1 } : b)) };
+      expect(() => annealPlacement(net, data, broken, params({ iterations: 100 }), never)).toThrow(/group/);
+    });
+
+    it('is the same as before for a netlist without motifs (the Processor, seed 1)', async () => {
+      const net = await netlistOf(processorRequest(1));
+      const init = constructivePlacement(net, data, 2);
+      const a = annealPlacement(net, data, init, params(), never);
+      const b = annealPlacement({ ...net, motifs: { groups: [], sorters: [] } }, data, init, params(), never);
+      expect(b).toEqual(a);
+    });
   });
 });

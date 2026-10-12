@@ -29,6 +29,8 @@
 // station ports) best, then the nearer tap point, then the lower index. Slots next to one already chosen for the same
 // tap, in the same row, get a bonus, so a tap with several sorters takes a straight stretch of one side.
 //
+// Motifs. The slots that the internal sorters of `Netlist.motifs` use are taken before the first tap is assigned.
+//
 // Ports. A net that starts or ends at a station takes one of its 12 ports. A station's nets are matched to its ports
 // greedily by cost: the distance from the port's first lattice point outside to the net's tap centroid, plus a
 // penalty when the port faces away from it.
@@ -142,6 +144,11 @@ class Assigner {
     private readonly effects: TechEffects,
   ) {
     this.reach = data.data.constants.sorterMaxReachMeters;
+    // the slots the internal sorters of motifs use are theirs: a slot takes one sorter
+    for (const s of net.motifs?.sorters ?? []) {
+      this.usedSlots.add(`${s.fromMachine}:${s.fromSlot}`);
+      this.usedSlots.add(`${s.toMachine}:${s.toSlot}`);
+    }
     for (const b of placement.buildings) this.byId.set(b.id, b);
     this.boxes = placement.buildings.map((b) => {
       const obbs = occ.obbsOf(b);

@@ -124,6 +124,11 @@ export interface AppState {
   readonly rateUnit: 's' | 'min';
   /** The time budget of a solve, in minutes from its start; the first valid layout is always completed. */
   readonly solverBudgetMinutes: number;
+  /**
+   * Let the layout solver use the dense motifs (direct insertion, shared-belt sandwich, lab stacks) that have not been
+   * verified in game. Off by default; the validator judges every layout either way.
+   */
+  readonly useUnverifiedMotifs: boolean;
   /** "Geometry: approximate ..." while GameData geometry is approximate, else null. */
   readonly geometryBadge: string | null;
   /** The Inputs tree, from the target down. */
@@ -153,6 +158,7 @@ export interface AppState {
   setFacilityOverride(recipeId: number, buildingItemId: number | undefined): void;
   setRecipeOverride(itemId: number, recipeId: number | undefined): void;
   setSolverBudgetMinutes(minutes: number): void;
+  setUseUnverifiedMotifs(use: boolean): void;
 
   setUnlockedTechs(techIds: Iterable<number>): void;
   toggleTech(techId: number): void;
@@ -369,6 +375,7 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
   let plan = $state.raw<PlanResult | null>(null);
   let rateUnit = $state<'s' | 'min'>('s');
   let solverBudgetMinutes = $state(DEFAULT_SOLVER_BUDGET_MINUTES);
+  let useUnverifiedMotifs = $state(DEFAULT_SOLVE_OPTIONS.useUnverifiedMotifs);
   let computing = $state(false);
   /** `planSignature` of `plan` while it is ok. */
   let planSig = $state<string | null>(null);
@@ -508,7 +515,7 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
         current,
         index,
         effects,
-        { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: budgetMs, seed: DEFAULT_SOLVE_OPTIONS.seed + solveRuns++ },
+        { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: budgetMs, seed: DEFAULT_SOLVE_OPTIONS.seed + solveRuns++, useUnverifiedMotifs },
         {
           onProgress: (progress) => {
             if (mine === solveToken) solveProgress = progress;
@@ -717,6 +724,9 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
     get solverBudgetMinutes() {
       return solverBudgetMinutes;
     },
+    get useUnverifiedMotifs() {
+      return useUnverifiedMotifs;
+    },
     geometryBadge: badge,
     get tree() {
       return buildTree(index, effects, request, plan);
@@ -794,6 +804,9 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
     },
     setSolverBudgetMinutes(minutes) {
       if (Number.isFinite(minutes) && minutes > 0) solverBudgetMinutes = minutes;
+    },
+    setUseUnverifiedMotifs(use) {
+      useUnverifiedMotifs = use === true;
     },
 
     setUnlockedTechs(techIds) {
