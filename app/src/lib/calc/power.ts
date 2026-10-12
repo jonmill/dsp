@@ -1,7 +1,10 @@
 /**
  * Power estimate for a plan. Game power is held as J/tick; watts are J/tick x 60
  * (`constants.ticksPerSecond`). Sorters and spray coaters are not placed yet, so they are estimated
- * from the machine count; the layout's own count replaces them later.
+ * from the machine count; the layout's own count replaces them later. The coaters are estimated at one per
+ * distinct item that goes into a proliferated stage; a layout has one per belt that carries such an item, and
+ * an item that needs more than one belt (or is cut across several) has more, so `withCoaters` puts the
+ * layout's count in.
  */
 import type { Building, GameDataIndex, TechEffects } from '../data';
 import type { PowerEstimate, ProductionPlan } from './types';
@@ -47,8 +50,7 @@ export function estimatePower(
   const sortersW = sorterCount * (SORTER_DUTY * sorterWork + (1 - SORTER_DUTY) * sorterIdle);
   const sortersPeakW = sorterCount * sorterWork;
 
-  const coater = data.data.buildings.find((b) => b.kind === 'sprayCoater');
-  const coatersW = sprayedBelts.size * (coater?.power.workPerTick ?? 0) * ticksPerSecond;
+  const coatersW = coaterPowerW(sprayedBelts.size, data);
 
   const chargePerTick =
     plan.request.stationChargePerTick ?? stationDefaultChargePerTick[plan.request.stationKind];
@@ -63,4 +65,20 @@ export function estimatePower(
     steadyW: productionWorkW + productionIdleW + sortersW + coatersW + STEADY_STATION_SHARE * stationChargeW,
     peakW: allWorkW + sortersPeakW + coatersW + stationChargeW,
   };
+}
+
+/** What `count` spray coaters draw working, in watts: one per belt that carries an item into a proliferated stage. */
+export function coaterPowerW(count: number, data: GameDataIndex): number {
+  const coater = data.data.buildings.find((b) => b.kind === 'sprayCoater');
+  return count * (coater?.power.workPerTick ?? 0) * data.data.constants.ticksPerSecond;
+}
+
+/**
+ * `power` with the coaters of a layout (`coaters` of them, one per sprayed belt) in place of the plan's estimate of one per
+ * sprayed item: the same figures for the machines, sorters and stations, and the steady and peak totals that follow from them.
+ */
+export function withCoaters(power: PowerEstimate, coaters: number, data: GameDataIndex): PowerEstimate {
+  const coatersW = coaterPowerW(coaters, data);
+  const change = coatersW - power.coatersW;
+  return { ...power, coatersW, steadyW: power.steadyW + change, peakW: power.peakW + change };
 }

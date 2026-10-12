@@ -9,11 +9,11 @@
 // The top passage as a prefab point is [0, 1.333, -1.25] m (one level up, 1.25 m behind the origin along the axis): with the
 // grid convention of `prefabToGrid` that is 0.995 tiles behind the coater, which the game's lattice makes one node.
 //
-// Which way round. The sample has all 8 coaters turned 180, whichever way their belt flows: the belts of its columns 1 and
-// 9 flow north and those of columns 2, 3, 7, 8, 10, 14 and 15 flow south, and the proliferator belt runs along y = 18, north
-// of every coater. So a coater is turned along its belt either way round, and its top passage is the next node upstream (turned
-// with the flow) or downstream (turned against it). The point, the crossing at a right angle and the freedom of the
-// direction are inferred from that one sample, not tested against the game: Task 30's checklist.
+// Which way round. The sample has all 8 coaters turned 180, whichever way their belt flows: they stand in columns 1, 2, 3, 7, 9,
+// 10, 14 and 15; the belts of columns 1 and 9 flow north and those of columns 2, 3, 7, 10, 14 and 15 flow south, and the
+// proliferator belt runs along y = 18, north of every coater. So a coater is turned along its belt either way round, and its
+// top passage is the next node upstream (turned with the flow) or downstream (turned against it). The point, the crossing at a
+// right angle and the freedom of the direction are inferred from that one sample, not tested against the game: Task 30's checklist.
 import type { Building, GameDataIndex, Vec3 } from '../data';
 import type { BeltPath, GridPoint, Layout, PlacedBuilding, SprayCoater } from './model';
 import { headingDeg, LEVEL, prefabToGrid } from './transform';

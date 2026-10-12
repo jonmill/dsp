@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { allTechs, computeTechEffects, GameDataIndex, parseGameData } from '../data';
-import { estimatePower } from './power';
+import { coaterPowerW, estimatePower, withCoaters } from './power';
 import type { PlanRequest, ProductionPlan, Stage } from './types';
 
 const fixturePath = fileURLToPath(new URL('../../../../data/fixture/dsp-fixture.json', import.meta.url));
@@ -109,6 +109,21 @@ describe('estimatePower', () => {
     expect(plain.coatersW).toBe(0);
     const sprayed = estimatePower(plan([stage(4, 4, { proliferated: true })]), data, effects);
     expect(sprayed.coatersW).toBe(2 * 90_000);
+  });
+
+  it('puts the coaters of a layout in place of the estimate of one per item: an item on several belts has several', () => {
+    const p = estimatePower(plan([stage(4, 4, { proliferated: true })]), data, effects);
+    expect(p.coatersW).toBe(2 * 90_000);
+    const laid = withCoaters(p, 5, data);
+    expect(coaterPowerW(5, data)).toBe(5 * 90_000);
+    expect(laid.coatersW).toBe(5 * 90_000);
+    expect(laid.steadyW).toBeCloseTo(p.steadyW + 3 * 90_000, 6);
+    expect(laid.peakW).toBeCloseTo(p.peakW + 3 * 90_000, 6);
+    // everything else is the estimate's
+    expect({ ...laid, coatersW: 0, steadyW: 0, peakW: 0 }).toEqual({ ...p, coatersW: 0, steadyW: 0, peakW: 0 });
+    // the same count gives the same figures back, and none is none
+    expect(withCoaters(p, 2, data)).toEqual(p);
+    expect(withCoaters(p, 0, data).coatersW).toBe(0);
   });
 
   it('steady power adds a tenth of the station charge; peak adds all of it and every machine working', () => {

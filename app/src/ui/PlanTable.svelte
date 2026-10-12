@@ -41,7 +41,7 @@
       { label: 'Production (working)', watts: p.productionWorkW },
       { label: 'Production (idle)', watts: p.productionIdleW },
       { label: 'Sorters (estimate)', watts: p.sortersW },
-      { label: 'Spray coaters', watts: p.coatersW },
+      { label: 'Spray coaters (estimate)', watts: p.coatersW },
       { label: 'Station charging (full rate)', watts: p.stationChargeW },
     ];
   }

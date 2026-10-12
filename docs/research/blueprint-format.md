@@ -348,8 +348,9 @@ Copy the source values exactly. When generating new buildings, use these pattern
 and the `14,15,15,14,0,0` slot fields, no parameters, `pos2 = pos`, `yaw2 = yaw` and tilt and pitch 0. No belt record points at it
 and it points at no belt: the sample links coater and belt only by position.
 - Each coater stands exactly on a belt record (same x and y, z within 0.01), on a straight run of ground belt.
-- All 8 coaters have yaw 180, whichever way their belt flows: the belts of columns x = 2, 3, 7, 8, 10, 14, 15 flow south (yaw 180),
-  those of x = 1 and 9 flow north (yaw 0). So a coater is turned *along* its belt, either way round.
+- All 8 coaters have yaw 180, whichever way their belt flows. They stand in columns x = 1, 2, 3, 7, 9, 10, 14 and 15 (all at y = 17):
+  the belts of columns x = 2, 3, 7, 10, 14 and 15 flow south (yaw 180), those of x = 1 and 9 flow north (yaw 0). So a coater is turned
+  *along* its belt, either way round.
 - One belt at z = 1.00 (1.0 to 1.006) runs along y = 18, north of every coater (which stands at y = 17), crossing the item belts at a
   right angle. It passes the node one step behind each coater (the side its back is on: yaw 180 is south-facing, so north), which
   is the prefab top-passage point `[0, 1.333, -1.25]` m (one level up, 1.25 m = 0.995 tiles behind the origin). It is a dead end that

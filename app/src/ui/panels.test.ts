@@ -112,11 +112,14 @@ describe('ValidationPanel', () => {
     expect(page).toContain('Proliferator');
     expect(page).toContain('Spray coaters');
     expect(page).toContain('Used (simulated)');
+    // the plan estimate counts the 8 coaters of the layout (one per sprayed belt), not the plan's own one per sprayed item
+    expect(page).toContain('Plan estimate (with the 8 spray coaters of this layout)');
     const bare = await appWith(undefined, { ...passing, stage: 'simulation', sim: simulated(1) });
     await bare.finish();
     const plain = html(ValidationPanel, bare.app);
     expect(plain).toContain('Capacity (simulated)');
     expect(plain).not.toContain('Spray coaters');
+    expect(plain).not.toContain('of this layout');
   });
 
   it('says PASS with the simulated capacity next to the provisioned rate, and the measured power next to the estimate', async () => {

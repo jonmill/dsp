@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { withCoaters } from '../lib/calc';
   import type { Violation } from '../lib/validate';
   import { provisionedRate } from '../lib/validate/sim/run';
   import { formatPercent, formatPower, formatRate } from './format';
@@ -13,6 +14,8 @@
   const capacity = $derived(sim?.measuredTargetRate ?? 0);
   /** Only the validator's own verdict makes the figure a problem; more than the provisioned rate is normal. */
   const rateLow = $derived(report?.violations.some((v) => v.code === 'SIM_OUTPUT_LOW') ?? false);
+  /** The plan's power estimate with the layout's own spray coaters (one per sprayed belt) in place of the plan's (one per sprayed item). */
+  const estimate = $derived(plan && sim ? withCoaters(plan.power, sim.coaters.count, app.index) : null);
 
   const STAGES = { geometry: 'geometry rules', capacity: 'belt and sorter capacity', simulation: 'tick simulation' } as const;
 
@@ -101,9 +104,9 @@
               <td class="r num">{formatPower(sim.power.peakW)}</td>
             </tr>
             <tr>
-              <th scope="row">Plan estimate</th>
-              <td class="r num">{formatPower(plan.power.steadyW)}</td>
-              <td class="r num">{formatPower(plan.power.peakW)}</td>
+              <th scope="row">Plan estimate{sim.coaters.count > 0 ? ` (with the ${sim.coaters.count} spray coaters of this layout)` : ''}</th>
+              <td class="r num">{formatPower(estimate?.steadyW ?? plan.power.steadyW)}</td>
+              <td class="r num">{formatPower(estimate?.peakW ?? plan.power.peakW)}</td>
             </tr>
           </tbody>
         </table>
