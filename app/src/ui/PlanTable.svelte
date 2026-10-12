@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { headroomMachines } from '../lib/calc';
   import type { PlanError, ProductionPlan } from '../lib/calc';
   import { provisionedRate } from '../lib/validate/sim/run';
   import { buildingName, formatCount, formatPercent, formatPower, formatRate, itemName } from './format';
@@ -116,6 +117,7 @@
         <tbody>
           {#each plan.stages as stage (stage.recipeId)}
             {@const recipe = app.index.recipe(stage.recipeId)}
+            {@const spare = headroomMachines(stage)}
             <tr>
               <td>
                 <span class="cell">
@@ -135,6 +137,9 @@
               <td class="r num">
                 <strong>{stage.machines}</strong>
                 <span class="muted">({formatCount(stage.exactMachines)})</span>
+                {#if spare > 0}
+                  <span class="tag" title="Added so the stage keeps spare capacity (Options: machine headroom)">+{spare} headroom</span>
+                {/if}
               </td>
               <td class="r num">
                 <span class="util" style:--fill="{Math.min(100, stage.utilization * 100)}%"></span>

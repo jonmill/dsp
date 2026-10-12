@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { DEFAULT_MACHINE_HEADROOM } from '../lib/calc';
   import type { Recipe } from '../lib/data';
   import { buildingName, facilityLabel, formatPower, itemName } from './format';
+  import { MAX_MACHINE_HEADROOM } from './state.svelte';
   import type { AppState } from './state.svelte';
 
   let { app }: { app: AppState } = $props();
@@ -33,6 +35,9 @@
   const planned = $derived(
     new Map(app.plan?.ok ? app.plan.plan.stages.map((s) => [s.recipeId, s.buildingItemId] as const) : []),
   );
+
+  /** The headroom in percent, as the field shows it (0.075 is 7.5, not 7.500000000000001). */
+  const headroomPercent = (): number => +((app.request.machineHeadroom ?? DEFAULT_MACHINE_HEADROOM) * 100).toFixed(4);
 
   function numberOrNull(text: string): number | null {
     const value = Number(text);
@@ -114,6 +119,33 @@
           <span>{formatPower(range.max * ticksPerSecond)}</span>
         </div>
       </div>
+    </fieldset>
+
+    <fieldset>
+      <legend>Machine headroom</legend>
+      <label class="row">
+        <span>Spare capacity</span>
+        <input
+          class="num"
+          type="number"
+          aria-label="Machine headroom"
+          min="0"
+          max={MAX_MACHINE_HEADROOM * 100}
+          step="any"
+          value={headroomPercent()}
+          onchange={(event) => {
+            const percent = numberOrNull(event.currentTarget.value);
+            if (percent !== null) app.setMachineHeadroom(percent / 100);
+            event.currentTarget.value = String(headroomPercent());
+          }}
+        />
+        <span class="muted">%</span>
+      </label>
+      <p class="hint">
+        A stage that would keep less than this much of its machines spare gets one more machine: at 1 %, any stage that
+        would run above 99 % busy. That keeps the output from swinging around the plan rate. 0 sizes every stage to its
+        exact need. The building count you ask for stays as it is.
+      </p>
     </fieldset>
 
     {#if alternates.length > 0}

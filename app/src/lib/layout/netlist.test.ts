@@ -67,8 +67,15 @@ const PROCESSOR_MK1 = {
   3: ARC_SMELTER,
   59: ARC_SMELTER,
 };
+// No machine headroom: these tests pin the exact-sized netlist (25 machines; the 2/s iron ore net is one net).
 const processorRequest = (over: Partial<PlanRequest> = {}): PlanRequest =>
-  request({ targetItemId: PROCESSOR, suppliedItemIds: new Set(ORES), facilityOverrides: PROCESSOR_MK1, ...over });
+  request({
+    targetItemId: PROCESSOR,
+    suppliedItemIds: new Set(ORES),
+    facilityOverrides: PROCESSOR_MK1,
+    machineHeadroom: 0,
+    ...over,
+  });
 
 const BASE_TIER_BY_TYPE: Record<string, number> = {
   ASSEMBLE: ASSEMBLER_MK1,

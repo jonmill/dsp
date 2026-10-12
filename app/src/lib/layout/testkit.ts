@@ -32,6 +32,13 @@ export const SMELTER = 2302;
 export const PLS = 2103;
 export const ILS = 2104;
 
+/**
+ * The plans of this kit are sized without machine headroom: the layout tests pin machine counts and structures
+ * (25 machines, 6 labs in 2 stacks, 12 smelters in a row), and the benchmark plans built from them stay comparable with the
+ * rows of docs/benchmarks.md. The sizing itself is tested in calc/plan.test.ts, and the ladder sweeps run the defaults.
+ */
+const NO_HEADROOM = 0;
+
 /** A plan for `over.targetItemId` at 1/s with everything unlocked, planetary stations and no proliferator. */
 export async function planFor(over: Partial<PlanRequest> & Pick<PlanRequest, 'targetItemId'>): Promise<ProductionPlan> {
   const request: PlanRequest = {
@@ -43,6 +50,7 @@ export async function planFor(over: Partial<PlanRequest> & Pick<PlanRequest, 'ta
     recipeOverrides: {},
     proliferator: { tier: 0, mode: 'extra' },
     stationKind: 'planetary',
+    machineHeadroom: NO_HEADROOM,
     ...over,
   };
   const result = await planProduction(request, data, effects);
@@ -65,6 +73,7 @@ export async function processorPlan(perSecond = 1, proliferator: ProliferatorSet
     recipeOverrides: {},
     proliferator,
     stationKind: 'planetary',
+    machineHeadroom: NO_HEADROOM,
   };
   const result = await planProduction(request, data, effects);
   if (!result.ok) throw new Error(`plan failed: ${result.error.kind}: ${result.error.message}`);
@@ -104,9 +113,13 @@ const BASE_TIER_BY_TYPE: Record<string, number> = {
 
 /**
  * 1 Quantum Chip/s on base-tier machines from the raw resources and Hydrogen: 19 stages, 231 machines, 56 nets (108 machines with
- * Mk.III proliferator, extra products).
+ * Mk.III proliferator, extra products). `machineHeadroom` is the planner's (`DEFAULT_MACHINE_HEADROOM` adds a 7th Oil Refinery to the
+ * Plasma Refining stage, which needs 5.977, when proliferated).
  */
-export async function quantumPlan(proliferator: ProliferatorSetting = { tier: 0, mode: 'extra' }): Promise<ProductionPlan> {
+export async function quantumPlan(
+  proliferator: ProliferatorSetting = { tier: 0, mode: 'extra' },
+  machineHeadroom = NO_HEADROOM,
+): Promise<ProductionPlan> {
   const request: PlanRequest = {
     targetItemId: 1305,
     quantity: { kind: 'rate', perSecond: 1 },
@@ -119,6 +132,7 @@ export async function quantumPlan(proliferator: ProliferatorSetting = { tier: 0,
     recipeOverrides: { 1114: 16 },
     proliferator,
     stationKind: 'planetary',
+    machineHeadroom,
   };
   const result = await planProduction(request, data, effects);
   if (!result.ok) throw new Error(`plan failed: ${result.error.kind}: ${result.error.message}`);

@@ -282,6 +282,34 @@ describe('options', () => {
     expect(app.solverBudgetMinutes).toBe(25);
   });
 
+  it('plans with a 1 % machine headroom until it is changed, and the counts follow it', async () => {
+    const app = createApp();
+    expect(app.request.machineHeadroom).toBe(0.01);
+    app.setTarget(PROCESSOR);
+    const machines = (plan: ProductionPlan): number => plan.stages.reduce((n, s) => n + s.machines, 0);
+    const withHeadroom = okPlan(await app.recompute());
+    app.setMachineHeadroom(0);
+    expect(app.request.machineHeadroom).toBe(0);
+    const without = okPlan(await app.recompute());
+    expect(machines(withHeadroom)).toBeGreaterThan(machines(without));
+    expect(without.stages.every((s) => s.machines === Math.max(1, Math.ceil(s.exactMachines - 1e-9)))).toBe(true);
+    expect(without.request.machineHeadroom).toBe(0);
+  });
+
+  it('keeps the machine headroom between 0 and 10 %, and ignores what is not a number', () => {
+    const app = createApp();
+    app.setMachineHeadroom(0.05);
+    expect(app.request.machineHeadroom).toBe(0.05);
+    app.setMachineHeadroom(-0.02);
+    expect(app.request.machineHeadroom).toBe(0);
+    app.setMachineHeadroom(0.5);
+    expect(app.request.machineHeadroom).toBe(0.1);
+    app.setMachineHeadroom(0.03);
+    app.setMachineHeadroom(Number.NaN);
+    app.setMachineHeadroom(Number.POSITIVE_INFINITY);
+    expect(app.request.machineHeadroom).toBe(0.03);
+  });
+
   it('uses unverified motifs only when asked: off by default, switched by setUseUnverifiedMotifs', () => {
     const app = createApp();
     expect(app.useUnverifiedMotifs).toBe(false);

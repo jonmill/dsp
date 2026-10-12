@@ -26,6 +26,23 @@ import type {
 /** Rates and counts below this are solver noise. */
 const EPS = 1e-9;
 
+/**
+ * Spare machine capacity every stage is sized with (`PlanRequest.machineHeadroom`): a stage that `ceil(exact)` machines
+ * would run above 99 % gets one more. A stage with under 1 % of slack swings around the simulator's 0.99 output gate
+ * (Plasma Refining for a Quantum Chip: 5.977 machines on 6), and a factory that only works some of the time is no plan.
+ */
+export const DEFAULT_MACHINE_HEADROOM = 0.01;
+
+/** Machines for `exact` machine-seconds per second: `ceil(exact * (1 + headroom))`, at least one, noise below `EPS` ignored. */
+export function machinesFor(exact: number, headroom: number): number {
+  return Math.max(1, Math.ceil(exact * (1 + headroom) - EPS));
+}
+
+/** The machines of `stage` that only the headroom added (`machines` less what `ceil(exactMachines)` alone gives). */
+export function headroomMachines(stage: Pick<Stage, 'machines' | 'exactMachines'>): number {
+  return stage.machines - machinesFor(stage.exactMachines, 0);
+}
+
 /** LP values are rounded to 1e-12 so 7.999999999999996 machines read as 8. */
 function clean(value: number): number {
   return Math.round(value * 1e12) / 1e12;
@@ -385,7 +402,11 @@ class Planner {
         message: `The requested quantity of ${this.itemName(req.targetItemId)} (${required} per second) is too small to plan.`,
       });
     }
-    const stages = stageNodes.map((n) => this.stageOf(n, crafts.get(n.recipe.id) as number));
+    // The stage `pin` fixes is the user's count of buildings: no headroom there.
+    const headroom = req.machineHeadroom ?? DEFAULT_MACHINE_HEADROOM;
+    const stages = stageNodes.map((n) =>
+      this.stageOf(n, crafts.get(n.recipe.id) as number, n.recipe.id === pin?.recipeId ? 0 : headroom),
+    );
 
     const { importRate, exportRate } = this.balance(nodes, solution.values, required);
     const materials = [...importRate].map(([itemId, perSecond]) => ({ itemId, perSecond }));
@@ -560,6 +581,13 @@ class Planner {
       const what = req.quantity.kind === 'rate' ? 'rate' : 'building count';
       throw new PlanFailure({ kind: 'infeasible', message: `The requested ${what} must be a positive number (got ${amount}).` });
     }
+    const headroom = req.machineHeadroom ?? DEFAULT_MACHINE_HEADROOM;
+    if (!Number.isFinite(headroom) || headroom < 0) {
+      throw new PlanFailure({
+        kind: 'infeasible',
+        message: `The machine headroom must be a fraction of at least 0 (got ${headroom}).`,
+      });
+    }
   }
 
   // -- LP ----------------------------------------------------------------------------------
@@ -632,10 +660,10 @@ class Planner {
     return ordered;
   }
 
-  private stageOf(n: Node, x: number): Stage {
+  private stageOf(n: Node, x: number, headroom: number): Stage {
     const { recipe, building, effect } = n;
     const exact = x * n.secondsPerCraft;
-    const machines = Math.max(1, Math.ceil(exact - EPS));
+    const machines = machinesFor(exact, headroom);
     const rates = (list: { itemId: number; count: number }[], multiplier: number): ItemRate[] => {
       const merged = new Map<number, number>();
       for (const { itemId, count } of list) merged.set(itemId, (merged.get(itemId) ?? 0) + count * multiplier * x);

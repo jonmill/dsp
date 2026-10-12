@@ -340,6 +340,7 @@ describe('a real plan whose final stage has spare capacity', () => {
         recipeOverrides: {},
         proliferator: { tier: 0, mode: 'extra' },
         stationKind: 'planetary',
+        machineHeadroom: 0, // the layout below is hand-built for the exact sizing: 1 smelter, 2 assemblers
       },
       fixtureData,
       computeTechEffects(fixtureData.data, everything),

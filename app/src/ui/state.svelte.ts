@@ -18,7 +18,7 @@
  * layout so far (it is replaced as the worker reports better ones); `blueprint` is made from it on demand.
  */
 import { layoutToBlueprintString } from '../lib/blueprint';
-import { compatibleFacilities, isPlannableRecipe, planProduction, plannableProducers } from '../lib/calc';
+import { compatibleFacilities, DEFAULT_MACHINE_HEADROOM, isPlannableRecipe, planProduction, plannableProducers } from '../lib/calc';
 import type { PlanRequest, PlanResult, ProductionPlan, ProliferatorSetting } from '../lib/calc';
 import { allTechs, computeTechEffects, GameDataIndex, techClosure } from '../lib/data';
 import type { Building, GameData, Item, Recipe, TechEffects } from '../lib/data';
@@ -42,6 +42,8 @@ export const ACTIVE_PROFILE_KEY = 'dsp-planner.activeProfile.v1';
 
 export const DEBOUNCE_MS = 150;
 export const DEFAULT_SOLVER_BUDGET_MINUTES = 10;
+/** The most spare machine capacity the Options panel offers: 10 %. */
+export const MAX_MACHINE_HEADROOM = 0.1;
 
 /** Water and crude oil are pumped, not mined, so they are not typed RESOURCE; they are still raw. */
 const EXTRA_RAW_ITEMS = [1000, 1007];
@@ -153,6 +155,8 @@ export interface AppState {
   toggleSupplied(itemId: number): void;
   setProliferator(setting: ProliferatorSetting): void;
   setStationKind(kind: PlanRequest['stationKind']): void;
+  /** Spare machine capacity as a fraction (0.01 = 1 %), clamped to 0..`MAX_MACHINE_HEADROOM`; what is not a number is ignored. */
+  setMachineHeadroom(fraction: number): void;
   /** J/tick, clamped to the slider range; undefined restores the default for the station kind. */
   setStationCharge(perTick: number | undefined): void;
   setFacilityOverride(recipeId: number, buildingItemId: number | undefined): void;
@@ -371,6 +375,7 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
     recipeOverrides: {},
     proliferator: { tier: 0, mode: 'extra' },
     stationKind: 'planetary',
+    machineHeadroom: DEFAULT_MACHINE_HEADROOM,
   });
   let plan = $state.raw<PlanResult | null>(null);
   let rateUnit = $state<'s' | 'min'>('s');
@@ -780,6 +785,10 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
     },
     setStationKind(kind) {
       update({ ...request, stationKind: kind, stationChargePerTick: undefined });
+    },
+    setMachineHeadroom(fraction) {
+      if (!Number.isFinite(fraction)) return;
+      update({ ...request, machineHeadroom: Math.min(MAX_MACHINE_HEADROOM, Math.max(0, fraction)) });
     },
     setStationCharge(perTick) {
       if (perTick === undefined || !Number.isFinite(perTick)) {

@@ -195,6 +195,35 @@ describe('PlanTable', () => {
     expect(page).toContain(`up to ${+plan!.actualTargetRate.toFixed(3)}/s capacity`);
   });
 
+  it('marks the machines the headroom added, and only those', async () => {
+    const app = createAppState(data);
+    app.setTarget(IRON_INGOT);
+    app.setFinalFacility(2302); // Arc Smelter: 1 Iron Ingot/s each
+    app.setQuantity({ kind: 'rate', perSecond: 2 });
+    await app.whenSettled();
+    const plan = app.plan?.ok ? app.plan.plan : null;
+    const stage = plan!.stages[0];
+    expect(stage.exactMachines).toBeCloseTo(2, 6); // 2 smelters would run at 100 %
+    expect(stage.machines).toBe(3);
+    const page = html(PlanTable, app);
+    expect(page).toContain('+1 headroom');
+    expect(page.match(/\+\d+ headroom/g)).toEqual(['+1 headroom']); // the smelter stage only
+    app.setMachineHeadroom(0);
+    await app.whenSettled();
+    expect(html(PlanTable, app)).not.toContain('headroom');
+  });
+
+  it('does not mark the target stage of a buildings request', async () => {
+    const app = createAppState(data);
+    app.setTarget(IRON_INGOT);
+    app.setFinalFacility(2302);
+    app.setQuantity({ kind: 'buildings', count: 2 });
+    await app.whenSettled();
+    const plan = app.plan?.ok ? app.plan.plan : null;
+    expect(plan!.stages[0].machines).toBe(2);
+    expect(html(PlanTable, app)).not.toContain('headroom');
+  });
+
   it('shows no capacity when the machines make exactly what was requested', async () => {
     const app = createAppState(data);
     app.setTarget(IRON_INGOT);
@@ -252,6 +281,19 @@ describe('OptionsPanel', () => {
     expect(page).toContain('Use dense motifs not yet verified in-game');
     expect(page).toMatch(/<input[^>]*type="checkbox"[^>]*>/);
     expect(page).not.toMatch(/<input[^>]*type="checkbox"[^>]*\bchecked\b/);
+  });
+
+  it('offers the machine headroom as a percentage, 1 by default, and shows what was set', async () => {
+    const { app } = await appWith();
+    const input = (): string => render(OptionsPanel, { props: { app } }).body.match(/<input[^>]*aria-label="Machine headroom"[^>]*>/)?.[0] ?? '';
+    expect(input()).toContain('type="number"');
+    expect(input()).toContain('min="0"');
+    expect(input()).toContain('max="10"');
+    expect(input()).toContain('value="1"');
+    app.setMachineHeadroom(0.075);
+    expect(input()).toContain('value="7.5"');
+    app.setMachineHeadroom(0);
+    expect(input()).toContain('value="0"');
   });
 
   it('shows the box checked once the option is on', async () => {

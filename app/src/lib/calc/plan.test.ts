@@ -4,7 +4,8 @@ import { describe, expect, it } from 'vitest';
 import { allTechs, computeTechEffects, GameDataIndex, parseGameData, techClosure } from '../data';
 import type { TechEffects } from '../data';
 import { solveLP } from './lp';
-import { planProduction } from './plan';
+import { provisionedRate } from '../validate/sim/run';
+import { DEFAULT_MACHINE_HEADROOM, headroomMachines, machinesFor, planProduction } from './plan';
 import type { PlanError, PlanRequest, ProductionPlan, Stage } from './types';
 
 const fixturePath = fileURLToPath(new URL('../../../../data/fixture/dsp-fixture.json', import.meta.url));
@@ -113,7 +114,8 @@ describe('planProduction: Processor chain (datasets.md "Test targets")', () => {
   });
 
   it('sizes each stage: Processor 4, Circuit Board 4/3 -> 2, Microcrystalline 16/3 -> 6, Silicon 8, Iron 2, Copper 3', async () => {
-    const plan = await planOf(processorRequest());
+    // The datasets.md counts are what each stage needs, so no headroom (the headroom sizes are in 'machine headroom' below).
+    const plan = await planOf(processorRequest({ machineHeadroom: 0 }));
     const expectStage = (recipeId: number, exact: number, machines: number, buildingItemId: number) => {
       const s = stageFor(plan, recipeId);
       expect(s.exactMachines).toBeCloseTo(exact, 9);
@@ -146,7 +148,8 @@ describe('planProduction: Processor chain (datasets.md "Test targets")', () => {
   });
 
   it('imports 2 Iron Ore, 3 Copper Ore and 8 Silicon Ore per second and exports only the Processor', async () => {
-    const plan = await planOf(processorRequest());
+    // No headroom: the 4 Processor assemblers then make exactly the 1/s asked for (with it, 5 make 1.25/s).
+    const plan = await planOf(processorRequest({ machineHeadroom: 0 }));
     expect(plan.imports).toEqual([
       { itemId: 1001, perSecond: expect.closeTo(2, 9) },
       { itemId: 1002, perSecond: expect.closeTo(3, 9) },
@@ -186,7 +189,10 @@ describe('planProduction: Processor chain (datasets.md "Test targets")', () => {
   });
 
   it('with Assembling Machine Mk.III on the Processor recipe, 2 machines are enough', async () => {
-    const plan = await planOf(processorRequest({ facilityOverrides: { ...PROCESSOR_MK1, 51: ASSEMBLER_MK3 } }));
+    // Enough to make the 1/s, so no headroom: 2 machines would run at 100 %, and with the default 1 % a 3rd is added.
+    const plan = await planOf(
+      processorRequest({ facilityOverrides: { ...PROCESSOR_MK1, 51: ASSEMBLER_MK3 }, machineHeadroom: 0 }),
+    );
     const s = stageFor(plan, 51);
     expect(s.machines).toBe(2);
     expect(s.exactMachines).toBeCloseTo(2, 9);
@@ -356,8 +362,8 @@ describe('planProduction: alternate recipes and by-products', () => {
       }),
     );
     expect(plan.stages.map((s) => s.recipeId)).toEqual([32]);
-    expect(plan.stages[0].machines).toBe(1);
     expect(plan.stages[0].exactMachines).toBeCloseTo(1, 9);
+    expect(plan.stages[0].machines).toBe(2); // 1 plant would run at 100 %: the default headroom adds one
     expect(plan.imports).toEqual([{ itemId: 1011, perSecond: expect.closeTo(1, 9) }]);
     expect(plan.exports).toEqual([
       { itemId: 1123, perSecond: expect.closeTo(1, 9) },
@@ -424,7 +430,8 @@ describe('planProduction: alternate recipes and by-products', () => {
     expect(s.recipeId).toBe(9);
     expect(data.building(s.buildingItemId)?.kind).toBe('lab');
     expect(s.buildingItemId).toBe(MATRIX_LAB);
-    expect(s.machines).toBe(3); // 3 s per craft at 1x
+    expect(s.exactMachines).toBeCloseTo(3, 9); // 3 s per craft at 1x
+    expect(s.machines).toBe(4); // 3 labs would run at 100 %: the default headroom adds one
     expect(s.workPowerW).toBe(480_000);
   });
 
@@ -433,7 +440,8 @@ describe('planProduction: alternate recipes and by-products', () => {
       request({ targetItemId: 6001, suppliedItemIds: new Set([1202, 1301]), finalFacilityItemId: 2902 }),
     );
     expect(plan.stages[0].buildingItemId).toBe(2902);
-    expect(plan.stages[0].machines).toBe(1);
+    expect(plan.stages[0].exactMachines).toBeCloseTo(1, 9);
+    expect(plan.stages[0].machines).toBe(2); // 1 lab would run at 100 %: the default headroom adds one
     expect(plan.stages[0].effectiveSpeed).toBeCloseTo(3, 9);
   });
 
@@ -669,7 +677,8 @@ describe('planProduction: proliferator', () => {
   });
 
   it('Mk.III speed-up on the Processor: 2 Mk.I assemblers, unchanged inputs, 675 kW each', async () => {
-    const plan = await planOf(processorRequest({ proliferator: { tier: 3, mode: 'speed' } }));
+    // 2 is what the stage needs; with the default headroom they would run at 100 % and a 3rd is added.
+    const plan = await planOf(processorRequest({ proliferator: { tier: 3, mode: 'speed' }, machineHeadroom: 0 }));
     const s = stageFor(plan, 51);
     expect(s.exactMachines).toBeCloseTo(2, 9);
     expect(s.machines).toBe(2);
@@ -711,6 +720,140 @@ describe('planProduction: proliferator', () => {
     expect(plan.warnings).toHaveLength(1);
     expect(plan.warnings[0]).toContain('Assembling Machine Mk.II');
     expect(plan.warnings[0]).toMatch(/speed/i);
+  });
+});
+
+describe('planProduction: machine headroom', () => {
+  it('defaults to 1 %', () => {
+    expect(DEFAULT_MACHINE_HEADROOM).toBe(0.01);
+  });
+
+  it('machinesFor adds one machine exactly when ceil(exact) would run above 99 %', () => {
+    expect(machinesFor(5.977, 0.01)).toBe(7); // 99.6 % of 6
+    expect(machinesFor(5.94, 0.01)).toBe(6); // exactly 99 % of 6 is still fine
+    expect(machinesFor(5.9405, 0.01)).toBe(6); // the line is 1 / 1.01 = 99.0099 %, 5.940594 machines of 6
+    expect(machinesFor(5.9407, 0.01)).toBe(7);
+    expect(machinesFor(5.5, 0.01)).toBe(6);
+    expect(machinesFor(0.3, 0.01)).toBe(1);
+    expect(machinesFor(0.995, 0.01)).toBe(2); // one machine at 99.5 %
+    // A stage that needs exactly 6 runs at 100 % on 6 machines, the worst case: it gets a 7th.
+    expect(machinesFor(6, 0.01)).toBe(7);
+    expect(machinesFor(6 + 1e-12, 0.01)).toBe(7);
+  });
+
+  it('machinesFor with no headroom is the old ceil, noise below 1e-9 ignored', () => {
+    expect(machinesFor(5.977, 0)).toBe(6);
+    expect(machinesFor(6, 0)).toBe(6);
+    expect(machinesFor(6 + 1e-12, 0)).toBe(6);
+    expect(machinesFor(6.001, 0)).toBe(7);
+    expect(machinesFor(0.0001, 0)).toBe(1);
+  });
+
+  it('scales with the fraction asked for', () => {
+    expect(machinesFor(5.5, 0.1)).toBe(7); // 5.5 / 6 is 91.7 %, but a 10 % headroom wants 6.05
+    expect(machinesFor(5.4, 0.1)).toBe(6);
+  });
+
+  it('headroomMachines is what the headroom added to a stage', async () => {
+    const plan = await planOf(processorRequest());
+    expect(plan.stages.map(headroomMachines)).toEqual([1, 0, 0, 1, 1, 1]);
+    const plain = await planOf(processorRequest({ machineHeadroom: 0 }));
+    expect(plain.stages.map(headroomMachines)).toEqual([0, 0, 0, 0, 0, 0]);
+  });
+
+  it('sizes the Processor chain with the default 1 % headroom', async () => {
+    const plan = await planOf(processorRequest());
+    const expectStage = (recipeId: number, exact: number, machines: number) => {
+      const s = stageFor(plan, recipeId);
+      expect(s.exactMachines).toBeCloseTo(exact, 9);
+      expect(s.machines).toBe(machines);
+      expect(s.utilization).toBeCloseTo(exact / machines, 9); // still exact / machines
+    };
+    expectStage(51, 4, 5); // 100 %
+    expectStage(50, 4 / 3, 2); // 67 %: no headroom needed
+    expectStage(53, 16 / 3, 6); // 89 %
+    expectStage(59, 8, 9);
+    expectStage(1, 2, 3);
+    expectStage(3, 3, 4);
+  });
+
+  it('an explicit 0.01 is the default', async () => {
+    const byDefault = await planOf(processorRequest());
+    const explicit = await planOf(processorRequest({ machineHeadroom: 0.01 }));
+    expect(explicit.stages.map((s) => s.machines)).toEqual(byDefault.stages.map((s) => s.machines));
+  });
+
+  it('machineHeadroom 0 reproduces the old counts', async () => {
+    const plan = await planOf(processorRequest({ machineHeadroom: 0 }));
+    expect(plan.stages.map((s) => [s.recipeId, s.machines])).toEqual([
+      [51, 4],
+      [50, 2],
+      [53, 6],
+      [1, 2],
+      [3, 3],
+      [59, 8],
+    ]);
+  });
+
+  it('a stage at 99.5 % of its machines gets one more, one at 98.5 % does not (through the planner)', async () => {
+    const tight = await planOf(processorRequest({ quantity: { kind: 'rate', perSecond: 0.995 } }));
+    expect(stageFor(tight, 51).exactMachines).toBeCloseTo(3.98, 9);
+    expect(stageFor(tight, 51).machines).toBe(5);
+    const loose = await planOf(processorRequest({ quantity: { kind: 'rate', perSecond: 0.985 } }));
+    expect(stageFor(loose, 51).exactMachines).toBeCloseTo(3.94, 9);
+    expect(stageFor(loose, 51).machines).toBe(4);
+  });
+
+  it('buildings mode: the target stage keeps the user count, the stages behind it get headroom', async () => {
+    const plan = await planOf(processorRequest({ quantity: { kind: 'buildings', count: 4 } }));
+    const target = stageFor(plan, 51);
+    expect(target.machines).toBe(4);
+    expect(target.utilization).toBeCloseTo(1, 9);
+    expect(headroomMachines(target)).toBe(0);
+    expect(stageFor(plan, 1).machines).toBe(3); // 2 exact Arc Smelters
+    expect(plan.exports[0]).toEqual({ itemId: 1303, perSecond: expect.closeTo(1, 9) });
+    expect(plan.actualTargetRate).toBeCloseTo(1, 9);
+  });
+
+  it('buildings mode keeps the count however large the headroom is', async () => {
+    for (const count of [1, 3, 4, 7]) {
+      const plan = await planOf(processorRequest({ quantity: { kind: 'buildings', count }, machineHeadroom: 0.1 }));
+      expect(stageFor(plan, 51).machines).toBe(count);
+    }
+  });
+
+  it('buildings mode with the Mk.III extra-products target recipe pinned keeps its count too', async () => {
+    const plan = await planOf(
+      processorRequest({ quantity: { kind: 'buildings', count: 4 }, proliferator: { tier: 3, mode: 'extra' } }),
+    );
+    expect(stageFor(plan, 51).machines).toBe(4);
+    expect(plan.exports[0].perSecond).toBeCloseTo(1.25, 9);
+  });
+
+  it('the target export, and so the provisioned rate, stays what was asked; the capacity counts the extra machine', async () => {
+    const plan = await planOf(processorRequest());
+    expect(stageFor(plan, 51).machines).toBe(5);
+    expect(plan.exports[0]).toEqual({ itemId: 1303, perSecond: expect.closeTo(1, 9) });
+    expect(provisionedRate(plan)).toBeCloseTo(1, 9);
+    expect(plan.actualTargetRate).toBeCloseTo(1.25, 9); // 5 machines x 0.25 crafts/s
+    const plain = await planOf(processorRequest({ machineHeadroom: 0 }));
+    expect(provisionedRate(plain)).toBeCloseTo(1, 9);
+    expect(plain.actualTargetRate).toBeCloseTo(1, 9);
+  });
+
+  it('power counts the extra machines idle', async () => {
+    const plain = await planOf(processorRequest({ machineHeadroom: 0 }));
+    const plan = await planOf(processorRequest());
+    expect(plan.power.productionWorkW).toBeCloseTo(plain.power.productionWorkW, 3); // the work done is the same
+    expect(plan.power.productionIdleW).toBeGreaterThan(plain.power.productionIdleW);
+  });
+
+  it('rejects a headroom that is negative or not a number', async () => {
+    for (const machineHeadroom of [-0.01, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const error = await errorOf(processorRequest({ machineHeadroom }));
+      expect(error.kind).toBe('infeasible');
+      expect(error.message).toMatch(/headroom/i);
+    }
   });
 });
 

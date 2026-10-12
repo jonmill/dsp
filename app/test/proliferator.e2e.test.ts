@@ -6,6 +6,7 @@
 // layout that the validator and the simulator take as they took the original. Slow: it logs the numbers the report
 // quotes (rate, proliferator used, footprint and time with and without the proliferator). Run with `npm run test:e2e`.
 import { describe, expect, it } from 'vitest';
+import { DEFAULT_MACHINE_HEADROOM, headroomMachines } from '../src/lib/calc';
 import type { ProductionPlan } from '../src/lib/calc';
 import { blueprintToLayout, decodeBlueprint, layoutToBlueprintString, regressionPlanFor } from '../src/lib/blueprint';
 import type { Layout } from '../src/lib/geometry';
@@ -117,8 +118,11 @@ describe('the proliferator network end to end [slow]', () => {
   // Fix round 1: these three had no coating window on the ladder's rungs (Quantum Chip: Copper Ingot 3 producers / 8 consumers, High-purity
   // Silicon 7 / 6, Circuit Board 2 / 6; High-Explosive Shell Set: producers at nodes 1 and 12 of a net, consumers from 28, with lifts
   // between), and High-Explosive Shell Set read 0.89 of its rate for the 80 game minutes its Sulfuric Acid belt took to fill.
+  // Task 28c: the Quantum Chip is planned with the default machine headroom, as the user gets it: Plasma Refining needs 5.977 Oil
+  // Refineries, 6 left it 0.4 % of slack and the oil chain swung around the plan rate (64 % of the 300 s windows reached 0.99), so
+  // it gets a 7th. The other two keep the exact sizing the regression above was found with.
   const LARGE: [string, () => Promise<ProductionPlan>][] = [
-    ['Quantum Chip', () => quantumPlan({ tier: 3, mode: 'extra' })],
+    ['Quantum Chip', () => quantumPlan({ tier: 3, mode: 'extra' }, DEFAULT_MACHINE_HEADROOM)],
     [
       'High-Explosive Shell Set',
       () =>
@@ -140,6 +144,10 @@ describe('the proliferator network end to end [slow]', () => {
   ];
   it.each(LARGE)('%s 1/s with Mk.III extra products: the ladder alone (timeBudgetMs 1) gives a layout that passes a plain validateLayout', async (name, makePlan) => {
     const plan = await makePlan();
+    if (name === 'Quantum Chip') {
+      const added = plan.stages.filter((s) => headroomMachines(s) > 0);
+      expect(added.map((s) => [data.recipe(s.recipeId).name, s.exactMachines.toFixed(3), s.machines])).toEqual([['Plasma Refining', '5.977', 7]]);
+    }
     const { result, seconds } = solveLogged(`${name} Mk.III`, plan, { timeBudgetMs: 1 });
     expect(result.layout, `${name}: no layout; ${result.failures.join(' || ')}`).not.toBeNull();
     const layout = result.layout as Layout;

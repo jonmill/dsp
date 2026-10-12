@@ -28,6 +28,13 @@ export interface PlanRequest {
   stationKind: 'planetary' | 'interstellar';
   /** J/tick; defaults to the constants entry for `stationKind`. */
   stationChargePerTick?: number;
+  /**
+   * Spare machine capacity as a fraction of what a stage needs (0.01 = 1 %); defaults to
+   * `DEFAULT_MACHINE_HEADROOM`. A stage is sized `ceil(exact * (1 + headroom))`, so any stage that
+   * `ceil(exact)` machines would run above `1 / (1 + headroom)` (99 % at the default) gets one more.
+   * The stage that `quantity.kind === 'buildings'` pins keeps the count the user asked for.
+   */
+  machineHeadroom?: number;
 }
 
 export interface Stage {
