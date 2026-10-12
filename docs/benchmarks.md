@@ -126,3 +126,6 @@ Appended by `npm run bench`; a new run goes at the end.
 | 2026-10-12 | 95b6851 | after Task 27, seed 3, paired | quantum-chip | 231 / 56 | 60 | 3.2 | ladder: margin 3 | 1.000 | 45011 | 24613 | 2 / 8 | budget | 60.0 |
 | 2026-10-12 | 95b6851 | after Task 27, seed 3, paired | circuit-board | 3 / 5 | 60 | 0.0 | ladder: margin 3 | 1.500 | 529 | 174 | 669 / 899 | budget | 60.0 |
 | 2026-10-12 | 95b6851 | after Task 27, seed 3, paired | smelter-row | 12 / 2 | 60 | 0.0 | ladder: margin 3 | 1.000 | 1477 | 400 | 112 / 169 | budget | 60.0 |
+| 2026-10-12 | d80dea0 | after Task 27 fix round 1, seed 1 | quantum-chip | 231 / 56 | 60 | 3.1 | ladder: margin 3 | 1.000 | 45011 | 27550 | 2 / 8 | budget | 60.0 |
+| 2026-10-12 | d80dea0 | after Task 27 fix round 1, seed 2 | quantum-chip | 231 / 56 | 60 | 3.1 | ladder: margin 3 | 1.000 | 45011 | 23491 | 3 / 14 | budget | 60.0 |
+| 2026-10-12 | d80dea0 | after Task 27 fix round 1, seed 3 | quantum-chip | 231 / 56 | 60 | 3.1 | ladder: margin 3 | 1.000 | 45011 | 22784 | 2 / 7 | budget | 60.0 |
