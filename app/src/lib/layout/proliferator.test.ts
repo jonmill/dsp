@@ -6,14 +6,15 @@ import { MAX_WARMUP_TICKS, runSimulation, validateLayout } from '../validate';
 import { assembleLayout } from './assemble';
 import { buildNetlist } from './netlist';
 import type { Netlist } from './netlist';
-import { feedProliferator, placeBays } from './proliferator';
+import { feedProliferator, placeBays, routeKeepsTaps } from './proliferator';
 import { COATER_ID_OFFSET, coaterIdOf, constructivePlacement } from './placement';
 import { placePowerNodes, powerTargets } from './power';
 import { defaultRouteParams, routeNets } from './router';
+import { BayRouter } from './router';
 import type { Bay } from './router';
 import { assignTaps } from './taps';
-import type { TapAssignment } from './taps';
-import { data, effects, everything, occupancyOf, processorNetlist, processorPlan } from './testkit';
+import type { AssignedTap, TapAssignment } from './taps';
+import { ASSEMBLER, data, effects, everything, occupancyOf, PLS, processorNetlist, processorPlan, synthNetlist } from './testkit';
 
 const never = () => false;
 
@@ -165,6 +166,81 @@ describe('placeBays: the room for a coater, made on every sprayed net', () => {
     expect(placeBays(net, taps, placement, routed.routes.map((r) => ({ ...r, nodes: [] })), occ, data, params, never)).toMatchObject({
       failed: expect.stringMatching(/^net \d+ \(item \d+\) has no route to put a spray coater on$/),
     });
+  });
+});
+
+describe('a bay never costs a net a tap', () => {
+  /** P (3,8) makes, B (8,8) and A (3,10) take; the route it had goes along y = 8 to B and back along y = 10 to A. The plan goes to A first. */
+  function scenario() {
+    const dirs: ['out' | 'in', number, number][] = [['out', 3, 8], ['in', 3, 10], ['in', 8, 8]];
+    const net = synthNetlist(
+      [{ building: ASSEMBLER, count: 3 }],
+      [PLS],
+      [{ taps: dirs.map(([dir], i) => ({ machineId: 1 + i, itemId: 1001, dir, rate: 1, sorters: 1 })), sprayed: true }],
+    );
+    const taps: TapAssignment = {
+      taps: dirs.map(([dir, x, y], i): AssignedTap => ({ netId: 1, machineId: 1 + i, slot: 0, span: 1, point: { x, y }, axis: 'x', dir, sorterIndex: 0, rate: 1 })),
+      stationPorts: [],
+    };
+    const corners: [number, number][] = [[2, 8], [9, 8], [9, 10], [2, 10]];
+    const old: GridPoint[] = [{ x: 2, y: 8, z: 0 }];
+    for (const [x, y] of corners.slice(1)) {
+      let p = old[old.length - 1];
+      while (p.x !== x || p.y !== y) {
+        p = { x: p.x + Math.sign(x - p.x), y: p.y + (p.x === x ? Math.sign(y - p.y) : 0), z: 0 };
+        old.push(p);
+      }
+    }
+    const params = { ...defaultRouteParams(occupancyOf([])), bounds: { minX: 0, minY: 0, maxX: 30, maxY: 30 } };
+    return { net, taps, old, params, placement: { buildings: [], cost: 0 } };
+  }
+
+  it('routeKeepsTaps: every tap point of the net on the ground, and only that net\'s', () => {
+    const { taps, old } = scenario();
+    expect(routeKeepsTaps(taps, 1, old)).toBe(true);
+    expect(routeKeepsTaps(taps, 1, old.filter((p) => !(p.x === 8 && p.y === 8)))).toBe(false); // B lost
+    expect(routeKeepsTaps(taps, 1, old.map((p) => (p.x === 8 && p.y === 8 ? { ...p, z: 1 } : p)))).toBe(false); // B passed above
+    expect(routeKeepsTaps(taps, 2, [])).toBe(true); // no tap of net 2
+  });
+
+  it('placeBays turns down a route through a bay that lost a tap, and says so when no candidate keeps them', () => {
+    const { net, taps, old, params, placement } = scenario();
+    const calls: GridPoint[][] = [];
+    const dropper = {
+      route: (_id: number, _bay: Bay, _closed: readonly GridPoint[], was: readonly GridPoint[]) => {
+        const lost = was.filter((p) => !(p.x === 8 && p.y === 8));
+        calls.push(lost);
+        return lost;
+      },
+    };
+    const out = placeBays(net, taps, placement, [{ netId: 1, nodes: old }], occupancyOf([]), data, params, never, dropper);
+    expect(out).toMatchObject({ failed: expect.stringMatching(/^no place for the spray coater of net 1 /) });
+    expect(calls.length).toBeGreaterThan(1); // every candidate was tried, none taken
+  });
+
+  it('placeBays with the real router keeps all three taps', () => {
+    const { net, taps, old, params, placement } = scenario();
+    const out = placeBays(net, taps, placement, [{ netId: 1, nodes: old }], occupancyOf([]), data, params, never);
+    if (!('bays' in out)) throw new Error(JSON.stringify(out));
+    const route = out.routes[0].nodes;
+    for (const t of taps.taps) expect(route.some((p) => p.z === 0 && p.x === t.point.x && p.y === t.point.y), `tap (${t.point.x}, ${t.point.y})`).toBe(true);
+    const mid = out.bays[0].cells[1];
+    expect(route.some((p) => p.z === 0 && p.x === mid.x && p.y === mid.y)).toBe(true);
+    expect(routeKeepsTaps(taps, 1, route)).toBe(true);
+  });
+
+  it('BayRouter itself never returns a route without a tap of the net, whichever bay it is given', () => {
+    const { net, taps, old, params } = scenario();
+    const router = new BayRouter(net, taps, occupancyOf([]), params, never);
+    let routed = 0;
+    for (const [x, y] of [[8, 14], [14, 12], [6, 16], [12, 5], [20, 10]]) {
+      const bay: Bay = { netId: 1, axis: 'x', cells: [-1, 0, 1].map((j) => ({ x: x + j, y })), signs: [1, -1], held: [] };
+      const out = router.route(1, bay, bay.held, old);
+      if (!Array.isArray(out)) continue;
+      routed++;
+      expect(routeKeepsTaps(taps, 1, out), `bay at (${x}, ${y})`).toBe(true);
+    }
+    expect(routed).toBeGreaterThan(0);
   });
 });
 

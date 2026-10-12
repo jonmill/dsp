@@ -151,6 +151,8 @@ export function placeBays(
   data: GameDataIndex,
   params: RouteParams,
   shouldStop: () => boolean,
+  /** What routes a net through a bay; the default is a `BayRouter` over `netlist` (a test puts its own in). */
+  reroute?: Pick<BayRouter, 'route'>,
 ): BayOutcome {
   const def = sprayCoaterDef(data);
   if (!def) return { failed: 'GameData has no spray coater' };
@@ -185,7 +187,7 @@ export function placeBays(
     for (const p of nodes) holder.delete(key(p.x, p.y, p.z));
   };
   for (const r of routes) hold(r.nodes, r.netId);
-  const rerouter = new BayRouter(netlist, taps, occ, params, shouldStop);
+  const rerouter = reroute ?? new BayRouter(netlist, taps, occ, params, shouldStop);
   const bays: Bay[] = [];
 
   for (const net of sprayed) {
@@ -238,7 +240,7 @@ export function placeBays(
           }
           const out = rerouter.route(net.id, cand.bay, closed, nodes);
           if (out === 'stopped') return { stopped: true };
-          if (!out) continue;
+          if (!out || !routeKeepsTaps(taps, net.id, out)) continue;
           release(nodes);
           current.set(net.id, out);
           hold(out, net.id);
@@ -255,6 +257,12 @@ export function placeBays(
     for (const h of placed.held) holder.set(key(h.x, h.y, h.z), net.id);
   }
   return { routes: routes.map((r) => ({ netId: r.netId, nodes: current.get(r.netId) ?? r.nodes })), bays };
+}
+
+/** Whether `nodes` pass every tap point of net `netId` on the ground: a route that lost one cannot be assembled. */
+export function routeKeepsTaps(taps: TapAssignment, netId: number, nodes: readonly GridPoint[]): boolean {
+  const ground = new Set(nodes.filter((p) => p.z === 0).map((p) => flat(p.x, p.y)));
+  return taps.taps.every((t) => t.netId !== netId || ground.has(flat(t.point.x, t.point.y)));
 }
 
 /** Everything the search for the places of one net's bay shares. */

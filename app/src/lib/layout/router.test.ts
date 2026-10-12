@@ -1191,6 +1191,69 @@ describe('BayRouter: a sprayed net routed once more through its bay (Task 28)', 
     expect(beltViolations([{ netId: 1, nodes: r.out }, ...r.routed.routes.filter((x) => x.netId === 2)], [])).toEqual([]);
   });
 
+  /** The ground nodes along the polyline through `corners`, one per lattice point. */
+  const walk = (corners: [number, number][]): GridPoint[] => {
+    const out: GridPoint[] = [{ x: corners[0][0], y: corners[0][1], z: 0 }];
+    for (const [x, y] of corners.slice(1)) {
+      let p = out[out.length - 1];
+      while (p.x !== x || p.y !== y) {
+        p = { x: p.x + Math.sign(x - p.x), y: p.y + (p.x === x ? Math.sign(y - p.y) : 0), z: 0 };
+        out.push(p);
+      }
+    }
+    return out;
+  };
+  const tapsOf = (specs: Spec[], netId: number): GridPoint[] => build(specs).taps.taps.filter((t) => t.netId === netId).map((t) => ({ x: t.point.x, y: t.point.y, z: 0 }));
+
+  it('keeps every tap of the net when the route it had visits the consumers in another order than the plan: the whole net is routed, not the stretch', () => {
+    // P (3,8) makes, A (8,12) and B (14,8) take. The plan goes to the nearer, A, first; the route it had goes along y = 8 to B and then
+    // round to A. Routing P -> bay -> A only, and keeping the rest, would drop B.
+    const spec: Spec[] = [
+      {
+        id: 1,
+        taps: [
+          { x: 3, y: 8, axis: 'x', dir: 'out' },
+          { x: 8, y: 12, axis: 'x', dir: 'in' },
+          { x: 14, y: 8, axis: 'x', dir: 'in' },
+        ],
+      },
+    ];
+    const old = walk([[2, 8], [16, 8], [16, 12], [7, 12]]);
+    const { net, taps } = build(spec);
+    for (const n of net.nets) n.sprayed = true;
+    const bay = bayOn(1, 8, 16);
+    const out = new BayRouter(net, taps, occupancyOf([]), params(), never).route(1, bay, bay.held, old);
+    if (!Array.isArray(out)) throw new Error('no route');
+    for (const t of tapsOf(spec, 1)) expect(at(out, t.x, t.y), `tap (${t.x}, ${t.y})`).toBeGreaterThanOrEqual(0);
+    expect(throughBay(out, 8, 16)).not.toBe(0);
+    expect(adjacentRun(out)).toBe(true);
+  });
+
+  it('routes only the stretch, and keeps the rest of the route, when it holds no other tap (the control of the test above)', () => {
+    const spec: Spec[] = [
+      {
+        id: 1,
+        taps: [
+          { x: 3, y: 8, axis: 'x', dir: 'out' },
+          { x: 8, y: 12, axis: 'x', dir: 'in' },
+        ],
+      },
+    ];
+    const old = walk([[2, 8], [10, 8], [10, 12], [7, 12]]);
+    const { net, taps } = build(spec);
+    for (const n of net.nets) n.sprayed = true;
+    const bay = bayOn(1, 8, 16);
+    const out = new BayRouter(net, taps, occupancyOf([]), params(), never).route(1, bay, bay.held, old);
+    if (!Array.isArray(out)) throw new Error('no route');
+    expect(throughBay(out, 8, 16)).not.toBe(0);
+    for (const t of tapsOf(spec, 1)) expect(at(out, t.x, t.y)).toBeGreaterThanOrEqual(0);
+    // from the exit node of P and up to the entry of A the route is new; before and after, it is the one it had
+    expect(out.slice(0, at(old, 3, 8) + 2)).toEqual(old.slice(0, at(old, 3, 8) + 2));
+    const entryA = at(old, 9, 12);
+    expect(out.slice(-(old.length - entryA))).toEqual(old.slice(entryA));
+    expect(out.length).toBeGreaterThan(old.length);
+  });
+
   it('is undefined when the bay cannot be reached or is under a building', () => {
     const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 14, y: 12, axis: 'x', dir: 'in' }] }];
     const block: PlacedBuilding[] = [{ id: 1, itemId: ASSEMBLER, x: 9, y: 5, z: 0, yaw: 0 }];

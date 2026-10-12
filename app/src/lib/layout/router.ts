@@ -1274,7 +1274,7 @@ class Router {
     if (!base) return undefined;
     this.fixed ??= new Uint8Array(this.cells);
 
-    const part = this.stretchThrough(base, bay, old);
+    const part = this.stretchThrough(net, base, bay, old);
     if (part) {
       this.fixed.fill(0);
       this.closeCells(closed);
@@ -1307,9 +1307,9 @@ class Router {
    * The stops of the stretch of `old` between the last run that holds a producer (or the port the belt starts at) and the next
    * stop, a run: those two, passed the way `old` passes them, with `bay` between; and the nodes of `old` it replaces (the
    * first node of the first stop's approach to the last node of the second's exit). Undefined when `old` does not pass them
-   * as a plan would.
+   * as a plan would, or when another tap of the net lies in the stretch.
    */
-  private stretchThrough(base: StopPlan, bay: Bay, old: readonly GridPoint[]): { stops: Stop[]; from: number; to: number } | undefined {
+  private stretchThrough(net: BeltNet, base: StopPlan, bay: Bay, old: readonly GridPoint[]): { stops: Stop[]; from: number; to: number } | undefined {
     const at = bayAfter(base.stops, base.group);
     const first = base.stops[at];
     const last = base.stops[at + 1];
@@ -1352,6 +1352,14 @@ class Router {
       return undefined;
     }
     if (from >= tail.before) return undefined;
+    // The stretch is routed again with the two stops and the bay only: any other tap of the net inside it (`old` visits the
+    // consumers in another order than the plan, or a producer after the one the plan ends with) would be dropped.
+    const stopCells = new Set([...(head.kind === 'run' ? head.cells : []), ...tail.stop.cells].map((c) => `${c.x},${c.y}`));
+    for (const t of this.taps.taps) {
+      if (t.netId !== net.id || stopCells.has(`${t.point.x},${t.point.y}`)) continue;
+      const at = indexOf(t.point);
+      if (at > from && at < tail.after) return undefined;
+    }
     return { stops: [head, bayStop(bay), tail.stop], from, to: tail.after };
   }
 
