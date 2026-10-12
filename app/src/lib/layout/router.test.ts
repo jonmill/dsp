@@ -3,8 +3,8 @@ import type { GridPoint, PlacedBuilding } from '../geometry';
 import { checkGeometry } from '../validate/geometry-checks';
 import { LayoutKit } from '../validate/testkit';
 import type { BeltNet, Netlist } from './netlist';
-import { COATER_LEAD, routeFeed, routeNets } from './router';
-import type { FeedOption, RouteParams, RoutedNet } from './router';
+import { BayRouter, routeFeed, routeNets } from './router';
+import type { Bay, FeedOption, RouteParams, RoutedNet } from './router';
 import type { AssignedTap, TapAssignment } from './taps';
 import { ASSEMBLER, data, effects, ILS, occupancyOf, PLS, synthNetlist } from './testkit';
 
@@ -77,6 +77,8 @@ function routeOf(res: { routes: RoutedNet[] }, netId: number): GridPoint[] {
   return r.nodes;
 }
 
+/** Each node is a flat step or a lift from the one before. */
+const adjacentRun = (nodes: GridPoint[]): boolean => nodes.every((p, i) => i === 0 || adjacent4(nodes[i - 1], p) || (p.x === nodes[i - 1].x && p.y === nodes[i - 1].y && Math.abs(p.z - nodes[i - 1].z) === 1));
 const adjacent4 = (a: GridPoint, b: GridPoint): boolean => a.z === b.z && Math.abs(a.x - b.x) + Math.abs(a.y - b.y) === 1;
 const at = (nodes: GridPoint[], x: number, y: number, z = 0): number =>
   nodes.findIndex((p) => p.x === x && p.y === y && p.z === z);
@@ -1099,83 +1101,111 @@ describe('the proliferator feed (Task 28)', () => {
   });
 });
 
-describe('room for a coater on a sprayed net (Task 28)', () => {
-  /** The nets of `specs` marked sprayed and routed with the room for a coater asked for (`lead`). */
-  const sprayedRoute = (specs: Spec[], obstacles: PlacedBuilding[] = [], over: Partial<RouteParams> = {}) => {
+describe('BayRouter: a sprayed net routed once more through its bay (Task 28)', () => {
+  /** A bay on the row `y` with its middle at `x`: three cells along axis x, the cells at z 1 the coater's body needs. */
+  const bayOn = (netId: number, x: number, y: number, signs: (1 | -1)[] = [1, -1]): Bay => ({
+    netId,
+    axis: 'x',
+    cells: [-1, 0, 1].map((j) => ({ x: x + j, y })),
+    signs,
+    held: [-2, -1, 0, 1, 2].map((j) => ({ x: x + j, y, z: 1 })),
+  });
+  /** The nets of `specs` marked sprayed and routed as the item nets are, then net `netId` through `bay` with the cells of the others closed. */
+  const bayed = (specs: Spec[], netId: number, bay: Bay, obstacles: PlacedBuilding[] = [], stop = never) => {
     const { net, taps } = build(specs);
     for (const n of net.nets) n.sprayed = true;
-    return routeNets(net, taps, occupancyOf(obstacles), params({ lead: COATER_LEAD, ...over }), never);
+    const occ = occupancyOf(obstacles);
+    const routed = routeNets(net, taps, occ, params(), never);
+    expect(routed.ok).toBe(true);
+    const old = routeOf(routed, netId);
+    const closed = routed.routes.filter((r) => r.netId !== netId).flatMap((r) => r.nodes);
+    const out = new BayRouter(net, taps, occ, params(), stop).route(netId, bay, [...closed, ...bay.held], old);
+    return { routed, old, closed, out, occ };
   };
-  const straight = (nodes: GridPoint[], from: number, count: number): boolean =>
-    nodes.slice(from, from + count).every((p, i, a) => i === 0 || (p.z === 0 && p.x - a[i - 1].x === a[1].x - a[0].x && p.y - a[i - 1].y === a[1].y - a[0].y));
+  /** The five nodes round a bay with its middle at `x`: in a line on the ground, in the order of `sign`. */
+  const throughBay = (nodes: GridPoint[], x: number, y: number): 1 | -1 | 0 => {
+    const k = nodes.findIndex((p) => p.x === x && p.y === y && p.z === 0);
+    if (k < 2 || k > nodes.length - 3) return 0;
+    for (const sign of [1, -1] as const) {
+      if ([-2, -1, 0, 1, 2].every((j) => nodes[k + j].x === x + sign * j && nodes[k + j].y === y && nodes[k + j].z === 0)) return sign;
+    }
+    return 0;
+  };
 
-  it('a net that starts at a station port keeps straight out of it for five nodes', () => {
-    // the sink is up and to the east: an unsprayed net turns north as soon as the router likes; a sprayed one does not before node 4
+  it('a net that starts at a station port passes its bay, five nodes in a line, before it reaches its consumer', () => {
+    // the sink is up and to the east: without the bay the net turns north as soon as it likes
     const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 14, y: 12, axis: 'x', dir: 'in' }] }];
-    const res = sprayedRoute(spec);
-    expect(res.ok).toBe(true);
-    const nodes = routeOf(res, 1);
-    expect(COATER_LEAD).toBe(4);
-    expect(nodes.slice(0, 5)).toEqual([2, 3, 4, 5, 6].map((x) => ({ x, y: 5, z: 0 })));
+    const { out, old } = bayed(spec, 1, bayOn(1, 6, 9));
+    expect(throughBay(old, 6, 9)).toBe(0);
+    if (!Array.isArray(out)) throw new Error('no route');
+    expect(throughBay(out, 6, 9)).not.toBe(0);
+    expect(at(out, 6, 9)).toBeLessThan(at(out, 14, 12));
+    expect(out[0]).toEqual({ x: 2, y: 5, z: 0 });
+    expect(adjacentRun(out)).toBe(true);
   });
 
-  it('a net that is not sprayed is routed as before: it turns as soon as it likes, and is shorter for it', () => {
-    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 4, y: 12, axis: 'x', dir: 'in' }] }];
-    const { net, taps } = build(spec);
-    const plain = routeOf(routeNets(net, taps, occupancyOf([]), params(), never), 1);
-    const sprayed = routeOf(sprayedRoute(spec), 1);
-    expect(plain.slice(0, 4).every((p) => p.y === 5)).toBe(false); // it turns north before the fourth node
-    expect(plain.length).toBeLessThan(sprayed.length);
-    expect(sprayed.slice(0, 5).map((p) => p.y)).toEqual([5, 5, 5, 5, 5]);
-  });
-
-  it('the stretch is taken whole or not at all: a building in the way of the fifth node, and the net is routed without it', () => {
-    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 14, y: 12, axis: 'x', dir: 'in' }] }];
-    // an assembler whose footprint covers (5, 5) and (6, 5) but leaves the first three cells
-    const wall: PlacedBuilding[] = [{ id: 1, itemId: ASSEMBLER, x: 7, y: 5, z: 0, yaw: 0 }];
-    const res = sprayedRoute(spec, wall);
-    expect(res.ok).toBe(true);
-    const nodes = routeOf(res, 1);
-    expect(nodes[0]).toEqual({ x: 2, y: 5, z: 0 });
-    expect(nodes.slice(0, 5).every((p, i) => i === 0 || (p.x === 2 + i && p.y === 5))).toBe(false); // not five out of the port
-    expect(beltViolations(res.routes, wall)).toEqual([]);
-  });
-
-  it('after the last run that holds a producer the belt keeps straight for the exit node and four more', () => {
-    // producers at (6, 8) and (7, 8) on a row, a consumer further along and up: the belt is passed east along y = 8
+  it('a net with producers passes its bay after the last run that holds a producer and before the first consumer, and keeps the rest of its route', () => {
     const spec: Spec[] = [
       {
         id: 1,
         taps: [
-          { x: 6, y: 8, axis: 'x', dir: 'out' },
-          { x: 7, y: 8, axis: 'x', dir: 'out' },
+          { x: 3, y: 8, axis: 'x', dir: 'out' },
+          { x: 6, y: 12, axis: 'x', dir: 'out' },
           { x: 12, y: 16, axis: 'x', dir: 'in' },
         ],
       },
     ];
-    const res = sprayedRoute(spec);
-    expect(res.ok).toBe(true);
-    const nodes = routeOf(res, 1);
-    const last = at(nodes, 7, 8);
-    expect(last).toBeGreaterThanOrEqual(1);
-    // the exit node (8, 8) and four more, straight on
-    expect(nodes.slice(last + 1, last + 6).map((p) => [p.x, p.y])).toEqual([[8, 8], [9, 8], [10, 8], [11, 8], [12, 8]]);
-    expect(straight(nodes, last - 1, 7)).toBe(true);
+    const { out, old } = bayed(spec, 1, bayOn(1, 9, 14));
+    if (!Array.isArray(out)) throw new Error('no route');
+    expect(throughBay(out, 9, 14)).not.toBe(0);
+    expect(at(out, 6, 12)).toBeLessThan(at(out, 9, 14));
+    expect(at(out, 3, 8)).toBeLessThan(at(out, 9, 14));
+    expect(at(out, 9, 14)).toBeLessThan(at(out, 12, 16));
+    // up to the exit of the last producer run, and from the first consumer on, the route is the one it had
+    const lastProducer = at(old, 6, 12);
+    expect(out.slice(0, lastProducer + 2)).toEqual(old.slice(0, lastProducer + 2));
+    const firstConsumer = at(old, 12, 16);
+    expect(out.slice(-(old.length - firstConsumer))).toEqual(old.slice(firstConsumer));
+    expect(adjacentRun(out)).toBe(true);
   });
 
-  it('a sprayed net is routed as any other unless the room is asked for (lead): the default asks for none', () => {
-    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 4, y: 12, axis: 'x', dir: 'in' }] }];
-    const { net, taps } = build(spec);
-    const plain = routeNets(net, taps, occupancyOf([]), params(), never);
-    for (const n of net.nets) n.sprayed = true;
-    expect(routeNets(net, taps, occupancyOf([]), params(), never)).toEqual(plain);
-    expect(routeNets(net, taps, occupancyOf([]), params({ lead: 0 }), never)).toEqual(plain);
-    expect(routeNets(net, taps, occupancyOf([]), params({ lead: COATER_LEAD }), never).routes).not.toEqual(plain.routes);
+  it('the belt passes the bay in a direction the bay allows', () => {
+    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 14, y: 5, axis: 'x', dir: 'in' }] }];
+    expect(throughBay(bayed(spec, 1, bayOn(1, 8, 5, [1])).out as GridPoint[], 8, 5)).toBe(1);
+    // a belt that comes from the east and goes west through the bay
+    const west: Spec[] = [{ id: 1, source: { x: 18, y: 5, dir: W }, taps: [{ x: 3, y: 5, axis: 'x', dir: 'in' }] }];
+    expect(throughBay(bayed(west, 1, bayOn(1, 10, 5, [-1])).out as GridPoint[], 10, 5)).toBe(-1);
   });
 
-  it('is deterministic', () => {
+  it('keeps off the cells it is told are closed, and off its own cells it keeps', () => {
+    // net 2 runs north along x = 8, across the bay of net 1 on y = 5; the router is told its cells are closed
+    const specs: Spec[] = [
+      { id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 16, y: 5, axis: 'x', dir: 'in' }] },
+      { id: 2, source: { x: 8, y: 2, dir: N }, sink: { x: 8, y: 9, dir: S } },
+    ];
+    const r = bayed(specs, 1, bayOn(1, 11, 5));
+    if (!Array.isArray(r.out)) throw new Error('no route');
+    const mine = new Set(r.out.map((p) => `${p.x},${p.y},${p.z}`));
+    for (const c of r.closed) expect(mine.has(`${c.x},${c.y},${c.z}`), `closed cell ${c.x},${c.y},${c.z}`).toBe(false);
+    expect(throughBay(r.out, 11, 5)).toBe(1);
+    expect(beltViolations([{ netId: 1, nodes: r.out }, ...r.routed.routes.filter((x) => x.netId === 2)], [])).toEqual([]);
+  });
+
+  it('is undefined when the bay cannot be reached or is under a building', () => {
     const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 14, y: 12, axis: 'x', dir: 'in' }] }];
-    expect(sprayedRoute(spec)).toEqual(sprayedRoute(spec));
+    const block: PlacedBuilding[] = [{ id: 1, itemId: ASSEMBLER, x: 9, y: 5, z: 0, yaw: 0 }];
+    expect(bayed(spec, 1, bayOn(1, 9, 5), block).out).toBeUndefined();
+  });
+
+  it('says so when asked to stop (a search checks every few thousand steps), and is deterministic', () => {
+    const spec: Spec[] = [{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 14, y: 12, axis: 'x', dir: 'in' }] }];
+    expect(bayed(spec, 1, bayOn(1, 6, 9)).out).toEqual(bayed(spec, 1, bayOn(1, 6, 9)).out);
+    // across a window of 300 x 300 tiles
+    const { net, taps } = build([{ id: 1, source: { x: 2, y: 5, dir: E }, taps: [{ x: 290, y: 290, axis: 'x', dir: 'in' }] }]);
+    for (const n of net.nets) n.sprayed = true;
+    const wide = params({ bounds: { minX: 0, minY: 0, maxX: 300, maxY: 300 } });
+    const occ = occupancyOf([]);
+    const old = routeOf(routeNets(net, taps, occ, wide, never), 1);
+    expect(new BayRouter(net, taps, occ, wide, () => true).route(1, bayOn(1, 100, 100), bayOn(1, 100, 100).held, old)).toBe('stopped');
   });
 });
-

@@ -8,6 +8,7 @@ import type { SimResult } from '../validate/sim/run';
 import { annealHeat, annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, mayReplaceBest, Reheat, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
 import { VERIFIED_MOTIFS } from './motifs';
+import { buildNetlist } from './netlist';
 import { ASSEMBLER, data, effects, matrixPlan, occupancyOf, planFor, processorPlan, SMELTER } from './testkit';
 
 /** 3 Iron Ingots/s on three smelters from supplied Iron Ore: three machines, one station. Small and quick to solve. */
@@ -400,16 +401,6 @@ describe('ladderRungs (what the fallback ladder tries, in this order)', () => {
       { margin: 3, exact: true },
       { margin: 4, exact: true },
       { margin: 6, exact: true },
-    ]);
-  });
-
-  it('with a proliferator net there are three more, the last chance: the fast router asked to keep room for the coaters', () => {
-    const rungs = ladderRungs(true);
-    expect(rungs.slice(0, 6)).toEqual(ladderRungs());
-    expect(rungs.slice(6)).toEqual([
-      { margin: 3, exact: false, lead: true },
-      { margin: 4, exact: false, lead: true },
-      { margin: 6, exact: false, lead: true },
     ]);
   });
 });
@@ -1180,15 +1171,14 @@ describe('solve with a proliferator (Task 28)', () => {
   /** The geometry and capacity checks, no simulation: quick. */
   const STATIC = { simulate: false };
 
-  it('the last rungs keep room for the coaters: when the six plain rungs are turned down, the seventh is built with it', async () => {
+  it('the ladder is the same six rungs as without a proliferator: the room for the coaters is made at every margin, not asked for at the last', async () => {
     const plan = await processorPlan(1, { tier: 3, mode: 'extra' });
-    // the plain rungs build and pass the static checks; the full validator (scripted) turns the first six down
-    let calls = 0;
+    // the rungs build and pass the static checks; the full validator (scripted) turns all six down
     const reject = { pass: false, violations: [{ code: 'SIM_STALLED' as const, entities: [], message: 'made up' }], checkedAt: '', stage: 'simulation' as const };
-    const validate = ((layout, p, d, fx, o) => (calls++ < 6 ? reject : validateLayout(layout, p, d, fx, o))) as typeof validateLayout;
+    const validate = (() => reject) as unknown as typeof validateLayout;
     const phases: string[] = [];
     const fake = fakeClock(1000);
-    const result = solve(
+    solve(
       plan, data, effects,
       { ...DEFAULT_SOLVE_OPTIONS, ...STATIC, seed: 7, timeBudgetMs: 0, minRunMs: 1e9, now: fake.now },
       (p) => fake.onProgress(p, (q) => phases.push(q.phase)), () => {}, () => false, validate,
@@ -1200,18 +1190,20 @@ describe('solve with a proliferator (Task 28)', () => {
       'ladder: margin 3 (exact routes) rejected',
       'ladder: margin 4 (exact routes) rejected',
       'ladder: margin 6 (exact routes) rejected',
-      'ladder: margin 3 (room for coaters)',
     ]);
-    expect(result.report?.pass).toBe(true);
-    // the room was kept: every sprayed net that starts at a station port runs straight out of it for five nodes
-    const layout = result.layout as Layout;
-    const fromPort = layout.belts.filter((b) => b.source && b.itemId !== 1143);
-    expect(fromPort.length).toBeGreaterThan(0);
-    for (const b of fromPort) {
-      const dx = b.nodes[1].x - b.nodes[0].x;
-      const dy = b.nodes[1].y - b.nodes[0].y;
-      expect(b.nodes.slice(0, 5).every((p, i) => p.z === 0 && p.x === b.nodes[0].x + i * dx && p.y === b.nodes[0].y + i * dy), `belt ${b.id}`).toBe(true);
-    }
+  }, 60_000);
+
+  it('High-Explosive Shell Set with Mk.III has a coating window on every sprayed net at the first rung (it had none at margins 3 and 4)', async () => {
+    const itemId = data.data.items.find((i) => i.name === 'High-Explosive Shell Set')!.id;
+    const raw = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031];
+    const plan = await planFor({ targetItemId: itemId, suppliedItemIds: new Set(raw), proliferator: { tier: 3, mode: 'extra' } });
+    const out = run(plan, { ...STATIC, timeBudgetMs: 0 }, 1000);
+    expect(out.result.failures).toEqual([]);
+    expect(out.progress.map((p) => p.phase).filter((p) => p.startsWith('ladder'))).toEqual(['ladder: margin 3']);
+    const layout = out.result.layout as Layout;
+    const sprayed = buildNetlist(plan, data, effects).nets.filter((n) => n.sprayed);
+    expect(sprayed.length).toBeGreaterThan(5);
+    expect(layout.coaters!.map((c) => c.beltId)).toEqual(sprayed.map((n) => n.id));
   }, 60_000);
 
   it('the ladder\'s first rung lays the network: a coater on every sprayed net, a feed belt of the proliferator, and it passes', async () => {

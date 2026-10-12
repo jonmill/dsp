@@ -67,13 +67,14 @@
 // fifth of the expansions, which at 40 negotiation rounds on 500 nets is the difference between 7 and 30 seconds. With
 // a weight above 1 the first goal found is not always the cheapest, so a route is no longer a shortest one.
 //
-// Room for a coater (Task 28). With `RouteParams.lead` set (`COATER_LEAD`), a net marked `sprayed` gets a straight stretch
-// where a coater can stand: `COATER_LEAD` more
-// straight nodes after the exit node of the last run that holds a producer, or, for a net that starts at a station port,
-// five straight nodes out of the port (the port's own and `COATER_LEAD` after it). The stretch is taken when its cells are
-// free (and, after a run, when the belt does not go on to its sink port there); when they are not, the belt is routed without
-// it (and then may or may not have room for a coater: proliferator.ts finds out), and a net that cannot be routed with it is
-// tried once without.
+// Room for a coater (Task 28). A net marked `sprayed` needs a bay (`Bay`): a straight stretch of ground nodes where its coater
+// stands, between its last producer and its first consumer (for a net that starts at a station port, after the port). The item
+// nets are routed first as any other, and then each sprayed net is routed once more through a bay that proliferator.ts picked
+// for it (`BayRouter`), with every other net's cells closed, so the others keep the routes they converged on and the bay takes
+// the room that is left. The bay is a stop like a tap run: three cells, entered by a flat step and left by one more node, so five
+// nodes in a line, visited after the last run that holds a producer. Doing it net by net, on top of routes that are clear of one
+// another, keeps 40 bays from congesting a placement that routes without them (Planetary Logistics Station with Mk.III
+// proliferator: 41 sprayed nets; routed with all the bays at once, it did not converge at margin 3, 4 or 6).
 //
 // The proliferator feed (Task 28). `routeNets` leaves the net marked `proliferator` alone: it has no taps, and where it
 // goes depends on where the coaters stand, which depends on the routes of the other nets. `routeFeed` routes it afterwards,
@@ -87,6 +88,7 @@ import type { GridPoint } from '../geometry';
 import { MinHeap } from './heap';
 import type { BeltNet, Netlist } from './netlist';
 import type { Occupancy } from './occupancy';
+import { FEED_PORT_CELLS } from './taps';
 import type { AssignedStationPort, AssignedTap, TapAssignment } from './taps';
 
 export interface RouteParams {
@@ -116,17 +118,25 @@ export interface RouteParams {
    * converge later. Omitted: never.
    */
   hopeless?: { afterRounds: number; perNet: number };
-  /**
-   * Room for a coater: the straight nodes a net marked `sprayed` is asked to keep to (see the file comment; `COATER_LEAD` is
-   * the usual value). Default 0: no room asked for, and every net is routed as it was before the proliferator network.
-   */
-  lead?: number;
   /** Extra cost of a node per level above the ground (default `ELEVATION_COST`). */
   elevationCost?: number;
   /** The A* heuristic's weight; above 1 trades route length for speed (default `HEURISTIC_WEIGHT`). */
   heuristicWeight?: number;
   /** The search window in tiles; every tap point and port point has to lie inside it (placement bounds + 6). */
   bounds: { minX: number; minY: number; maxX: number; maxY: number };
+}
+/**
+ * Where the coater of a net stands (Task 28): three cells in a row on the ground, `cells` in ascending order along `axis`,
+ * that the net's belt passes in one of `signs` (+1 ascending). The belt enters by a flat step into the first cell and goes
+ * on one node past the last, so the five nodes are in a line, with the coater on the middle one. `held` are the cells at z 1
+ * that the coater's body and the feed's approach to its top passage need: no net's belt may cross them.
+ */
+export interface Bay {
+  netId: number;
+  axis: 'x' | 'y';
+  cells: { x: number; y: number }[];
+  signs: (1 | -1)[];
+  held: GridPoint[];
 }
 export interface RoutedNet {
   netId: number;
@@ -244,6 +254,7 @@ const MAX_BODY_DROPS = 12;
 
 const headingOf = (dx: number, dy: number): number => (dx > 0 ? 0 : dy > 0 ? 1 : dx < 0 ? 2 : 3);
 const manhattan = (ax: number, ay: number, bx: number, by: number): number => Math.abs(ax - bx) + Math.abs(ay - by);
+const sameNode = (a: GridPoint, b: GridPoint): boolean => a.x === b.x && a.y === b.y && a.z === b.z;
 
 // ---------------------------------------------------------------------------------------------
 // Stops
@@ -267,8 +278,6 @@ interface RunStop {
   signs: (1 | -1)[];
   /** The lowest machine id among the run's taps of split consumers (see `stopsOf`), if it has one. */
   splitId?: number;
-  /** Straight nodes the belt keeps to after the run's exit node, room for a coater (see the file comment). */
-  lead?: number;
 }
 interface PortStop {
   kind: 'start' | 'end';
@@ -276,8 +285,6 @@ interface PortStop {
   y: number;
   /** Heading index of the port facing. */
   facing: number;
-  /** For a 'start': the belt keeps straight out of the port for this many nodes after the first (the port's own). */
-  lead?: number;
 }
 /** The top passage of one coater of the feed: any of its options will do, and the search takes the cheapest. */
 interface TopStop {
@@ -292,31 +299,22 @@ interface StopPlan {
   stops: Stop[];
   /** Per stop: the group of runs it may be reordered within (producers, mixed runs, consumers); -1: fixed in place. */
   group: number[];
-  /** The room for a coater the plan asks for (`COATER_LEAD`, or 0). */
-  lead: number;
 }
 
-/** Straight nodes a sprayed net's belt keeps to for a coater (see the file comment). */
-export const COATER_LEAD = 4;
-
-/**
- * The stops with the lead on the one it follows: the last that holds a producer (a producers-only or mixed run), else the
- * port the belt starts at; no other stop carries one. Stops that change are copied.
- */
-function withLead(stops: Stop[], group: number[], lead: number): Stop[] {
+/** The index of the stop a net's bay follows: the last that holds a producer (a producers-only or mixed run), else the port the belt starts at; -1: none. */
+function bayAfter(stops: readonly Stop[], group: readonly number[]): number {
   let at = -1;
   stops.forEach((_, i) => {
     if (group[i] === 0 || group[i] === 1) at = i;
   });
-  if (at < 0) at = stops.findIndex((x) => x.kind === 'start');
-  return stops.map((stop, i) => {
-    if (stop.kind !== 'run' && stop.kind !== 'start') return stop;
-    const wanted = i === at && lead > 0 ? lead : undefined;
-    if (stop.lead === wanted) return stop;
-    return { ...stop, lead: wanted };
-  });
+  return at >= 0 ? at : stops.findIndex((x) => x.kind === 'start');
 }
 
+/** The bay as a stop: a run of three cells that holds no tap. */
+function bayStop(bay: Bay): RunStop {
+  const [a, , b] = bay.cells;
+  return { kind: 'run', axis: bay.axis, cells: bay.cells.map((c) => ({ x: c.x, y: c.y })), kinds: bay.cells.map(() => null), center: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }, signs: bay.signs };
+}
 /** No consumer before a producer in `kinds`, in the order they are passed. */
 const producersFirst = (kinds: (TapDir | null)[]): boolean => {
   let seenIn = false;
@@ -446,7 +444,7 @@ function stopsOf(
   taps: AssignedTap[],
   ports: AssignedStationPort[],
   isSplit: (t: AssignedTap) => boolean = () => false,
-  lead = 0,
+  bay?: Bay,
 ): StopPlan | undefined {
   const source = ports.find((p) => p.end === 'source');
   const sink = ports.find((p) => p.end === 'sink');
@@ -519,7 +517,27 @@ function stopsOf(
     if (ordered.length > 0) from = ordered[ordered.length - 1].center;
   }
   if (sink) push({ kind: 'end', x: sink.point.x, y: sink.point.y, facing: headingOf(sink.dir[0], sink.dir[1]) }, -1);
-  return stops.length > 0 ? { stops: withLead(stops, groupOf, lead), group: groupOf, lead } : undefined;
+  if (stops.length === 0) return undefined;
+  if (bay) {
+    const at = bayAfter(stops, groupOf);
+    if (at >= 0) {
+      stops.splice(at + 1, 0, bayStop(bay));
+      groupOf.splice(at + 1, 0, -1);
+    }
+  }
+  return { stops, group: groupOf };
+}
+
+/** For a net: whether a consumer tap of it is of a machine that takes the net's item on another net too (see the file comment). */
+export function splitConsumers(nets: readonly BeltNet[]): (net: BeltNet) => (t: AssignedTap) => boolean {
+  // consumers that take one item on several nets: `${machine}:${item}` -> how many nets
+  const consumedOn = new Map<string, number>();
+  for (const n of nets) {
+    for (const k of new Set(n.taps.filter((t) => t.dir === 'in').map((t) => `${t.machineId}:${t.itemId}`))) {
+      consumedOn.set(k, (consumedOn.get(k) ?? 0) + 1);
+    }
+  }
+  return (net) => (t) => (consumedOn.get(`${t.machineId}:${net.itemId}`) ?? 0) > 1;
 }
 
 /**
@@ -539,9 +557,8 @@ function reorderings(plan: StopPlan, k: number): StopPlan[] {
   const from = plan.group.indexOf(g);
   const to = plan.group.lastIndexOf(g) + 1;
   const make = (order: Stop[]): StopPlan => ({
-    stops: withLead([...plan.stops.slice(0, from), ...order, ...plan.stops.slice(to)], plan.group, plan.lead),
+    stops: [...plan.stops.slice(0, from), ...order, ...plan.stops.slice(to)],
     group: plan.group,
-    lead: plan.lead,
   });
   const members = plan.stops.slice(from, to);
   const seen = new Set<string>([members.map((m) => stopKey(m)).join('|')]);
@@ -657,20 +674,20 @@ class Router {
   private reorders = 0;
   private readonly conflictsPerRound: number[] = [];
 
-  /** The net being routed by `run` is the netlist's without the proliferator feed, which `routeFeed` routes afterwards. */
-  private readonly net: Netlist;
+  /** The nets `run` routes: the netlist's without the proliferator feed, which `routeFeed` routes afterwards. */
+  private readonly nets: BeltNet[];
   /** The feed nets of the netlist (at most one): `run` keeps their port cells clear. */
   private readonly feedNets: BeltNet[];
 
   constructor(
-    net: Netlist,
+    nets: readonly BeltNet[],
     private readonly taps: TapAssignment,
     private readonly occ: Occupancy,
     private readonly p: RouteParams,
     private readonly shouldStop: () => boolean,
   ) {
-    this.feedNets = net.nets.filter((n) => n.proliferator);
-    this.net = this.feedNets.length > 0 ? { ...net, nets: net.nets.filter((n) => !n.proliferator) } : net;
+    this.feedNets = nets.filter((n) => n.proliferator);
+    this.nets = nets.filter((n) => !n.proliferator);
     this.minX = Math.ceil(p.bounds.minX);
     this.minY = Math.ceil(p.bounds.minY);
     this.maxX = Math.floor(p.bounds.maxX);
@@ -938,10 +955,9 @@ class Router {
         const last = cells[cells.length - 1];
         const post = { x: last.x + DX[dir], y: last.y + DY[dir] };
         if (!this.postPlain(post.x, post.y, nextIsEnd)) continue;
-        const extras = nextIsEnd ? [] : this.leadCells(post, dir, stop.lead ?? 0);
-        const tail: GridPoint[] = [...cells.map((c) => ({ x: c.x, y: c.y, z: 0 })), { x: post.x, y: post.y, z: 0 }, ...extras];
+        const tail: GridPoint[] = [...cells.map((c) => ({ x: c.x, y: c.y, z: 0 })), { x: post.x, y: post.y, z: 0 }];
         if (!tail.every((n) => this.inWindow(n.x, n.y))) continue;
-        if (!cells.every((c) => !this.blocked(c.x, c.y, 0, this.cellOf(c.x, c.y, 0)) && this.own[this.cellOf(c.x, c.y, 0)] !== this.ownStamp)) continue;
+        if (!cells.every((c) => !this.blocked(c.x, c.y, 0, this.cellOf(c.x, c.y, 0)) && this.own[this.cellOf(c.x, c.y, 0)] !== this.ownStamp && this.fixed?.[this.cellOf(c.x, c.y, 0)] !== 1)) continue;
         goals.push({ ex: cells[0].x, ey: cells[0].y, dir, phases: ANY_PHASE & ~((1 << PHASE_LIFTED_UP) | (1 << PHASE_LIFTED_DOWN)), tail, tailCost: tail.slice(1).reduce((s, n) => s + this.nodeCost(n), 0) });
       }
     } else {
@@ -956,21 +972,6 @@ class Router {
     return goals;
   }
 
-  /**
-   * The `n` nodes after `from` in heading `dir`, all of them ones the net can use; none when `n` is 0 or any of them cannot be
-   * used (the room for a coater is taken whole or not at all).
-   */
-  private leadCells(from: Cell, dir: number, n: number): GridPoint[] {
-    const out: GridPoint[] = [];
-    for (let i = 1; i <= n; i++) {
-      const x = from.x + i * DX[dir];
-      const y = from.y + i * DY[dir];
-      if (!this.plain(x, y)) return [];
-      out.push({ x, y, z: 0 });
-    }
-    return out;
-  }
-
   /** The starting states of a belt that begins with `stop`: the port and its first step, or a run entered from one node before. */
   private startsOf(stop: Stop, nextIsEnd: boolean): Start[] {
     const starts: Start[] = [];
@@ -980,15 +981,11 @@ class Router {
       const nx = x + DX[stop.facing];
       const ny = y + DY[stop.facing];
       if (!this.inWindow(x, y) || this.blocked(x, y, 0, this.cellOf(x, y, 0)) || !this.plain(nx, ny)) return starts;
-      // room for a coater: the belt keeps straight out of the port for `lead` nodes after the first, where those are free
-      const extras = this.leadCells({ x: nx, y: ny }, stop.facing, Math.max(0, (stop.lead ?? 0) - 1));
       const prefix = [
         { x, y, z: 0 },
         { x: nx, y: ny, z: 0 },
-        ...extras,
       ];
-      const end = prefix[prefix.length - 1];
-      starts.push({ x: end.x, y: end.y, z: 0, dir: stop.facing, phase: Math.min(2, prefix.length - 1), g0: prefix.reduce((s, n) => s + this.nodeCost(n), 0), prefix });
+      starts.push({ x: nx, y: ny, z: 0, dir: stop.facing, phase: 1, g0: prefix.reduce((s, n) => s + this.nodeCost(n), 0), prefix });
     } else if (stop.kind === 'run') {
       for (const sign of stop.signs) {
         const dir = stop.axis === 'x' ? (sign > 0 ? 0 : 2) : sign > 0 ? 1 : 3;
@@ -998,8 +995,7 @@ class Router {
         const post = { x: last.x + DX[dir], y: last.y + DY[dir] };
         if (!this.plain(pre.x, pre.y) || !this.postPlain(post.x, post.y, nextIsEnd)) continue;
         if (!cells.every((c) => this.inWindow(c.x, c.y) && !this.blocked(c.x, c.y, 0, this.cellOf(c.x, c.y, 0)))) continue;
-        const extras = nextIsEnd ? [] : this.leadCells(post, dir, stop.lead ?? 0);
-        const prefix: GridPoint[] = [pre, ...cells, post, ...extras].map((c) => ({ x: c.x, y: c.y, z: 0 }));
+        const prefix: GridPoint[] = [pre, ...cells, post].map((c) => ({ x: c.x, y: c.y, z: 0 }));
         const end = prefix[prefix.length - 1];
         starts.push({ x: end.x, y: end.y, z: 0, dir, phase: 2, g0: prefix.reduce((s, n) => s + this.nodeCost(n), 0), prefix });
       }
@@ -1072,33 +1068,42 @@ class Router {
   // -------------------------------------------------------------------------------------------
   // Negotiation
 
-  run(): RouteResult {
-    const nets = this.net.nets;
-    // consumers that take one item on several nets: `${machine}:${item}` -> how many nets
-    const consumedOn = new Map<string, number>();
-    for (const n of nets) {
-      for (const k of new Set(n.taps.filter((t) => t.dir === 'in').map((t) => `${t.machineId}:${t.itemId}`))) {
-        consumedOn.set(k, (consumedOn.get(k) ?? 0) + 1);
-      }
-    }
-    // the feed's port: the cell outside it and the one after, which its first two nodes will need, are nobody else's
+  private prepared = false;
+  private splitOf: ((net: BeltNet) => (t: AssignedTap) => boolean) | undefined;
+
+  /** Keeps the cells that are nobody else's clear: the feed's port cells, the tap points and the port points of every net. */
+  private prepare(): void {
+    if (this.prepared) return;
+    this.prepared = true;
+    this.splitOf = splitConsumers(this.nets);
+    // the feed's port: the cell outside it and the two after, which its first nodes will need (the belt is on the ground for
+    // two flat steps before it lifts to z 1, and the nodes that cross the other nets' belts come after that), are nobody else's
     for (const f of this.feedNets) {
       for (const q of this.taps.stationPorts) {
         if (q.netId !== f.id) continue;
-        for (const [cx, cy] of [[q.point.x, q.point.y], [q.point.x + q.dir[0], q.point.y + q.dir[1]]]) {
+        for (let i = 0; i < FEED_PORT_CELLS; i++) {
+          const cx = q.point.x + i * q.dir[0];
+          const cy = q.point.y + i * q.dir[1];
           if (this.inWindow(cx, cy)) this.reserved[this.flatOf(cx, cy)] = f.id;
         }
       }
     }
     // reserve tap and port points
-    const planOfNet: (StopPlan | undefined)[] = nets.map((n) => {
-      const taps = this.taps.taps.filter((t) => t.netId === n.id);
-      const ports = this.taps.stationPorts.filter((p) => p.netId === n.id);
-      for (const t of taps) if (this.inWindow(t.point.x, t.point.y)) this.reserved[this.flatOf(t.point.x, t.point.y)] = n.id;
-      for (const q of ports) if (this.inWindow(q.point.x, q.point.y)) this.reserved[this.flatOf(q.point.x, q.point.y)] = n.id;
-      const isSplit = (t: AssignedTap): boolean => (consumedOn.get(`${t.machineId}:${n.itemId}`) ?? 0) > 1;
-      return stopsOf(n.source.kind === 'station', n.sink.kind === 'station', taps, ports, isSplit, n.sprayed ? (this.p.lead ?? 0) : 0);
-    });
+    for (const t of this.taps.taps) if (this.inWindow(t.point.x, t.point.y)) this.reserved[this.flatOf(t.point.x, t.point.y)] = t.netId;
+    for (const q of this.taps.stationPorts) if (this.inWindow(q.point.x, q.point.y)) this.reserved[this.flatOf(q.point.x, q.point.y)] = q.netId;
+  }
+
+  /** The stops of net `n`, with `bay` after the last producer if it has one. */
+  private planOf(n: BeltNet, bay?: Bay): StopPlan | undefined {
+    const taps = this.taps.taps.filter((t) => t.netId === n.id);
+    const ports = this.taps.stationPorts.filter((p) => p.netId === n.id);
+    return stopsOf(n.source.kind === 'station', n.sink.kind === 'station', taps, ports, (this.splitOf as NonNullable<typeof this.splitOf>)(n), bay);
+  }
+
+  run(): RouteResult {
+    const nets = this.nets;
+    this.prepare();
+    const planOfNet: (StopPlan | undefined)[] = nets.map((n) => this.planOf(n));
 
     const order = nets
       .map((n, i) => i)
@@ -1128,14 +1133,6 @@ class Router {
         this.reorders++;
         const again = this.routeNet(next.stops);
         if (typeof again !== 'number') planOfNet[i] = plan = next;
-        outcome = again;
-      }
-      if (typeof outcome === 'number' && plan.lead > 0) {
-        // the room for a coater may be what stops it: once without
-        const bare: StopPlan = { stops: withLead(plan.stops, plan.group, 0), group: plan.group, lead: 0 };
-        this.netSearches++;
-        const again = this.routeNet(bare.stops);
-        if (typeof again !== 'number') planOfNet[i] = bare;
         outcome = again;
       }
       if (typeof outcome === 'number') {
@@ -1261,6 +1258,103 @@ class Router {
     }
   }
 
+  /**
+   * Routes net `netId` once more, through `bay`, with the cells in `closed` (every other net's nodes, the cells above the other
+   * bays) closed to it. `old` is the route it had. First only the stretch between its last producer and its first consumer is
+   * routed again, through the bay, and the rest of `old` is kept (and closed to that stretch); when that cannot be done, the
+   * whole net is, with the bay after its last producer, and when a leg fails the stops of its group are tried in other orders
+   * as in the negotiation. Undefined when it cannot be done. Throws `Aborted`.
+   */
+  routeThroughBay(netId: number, bay: Bay, closed: readonly GridPoint[], old: readonly GridPoint[]): GridPoint[] | undefined {
+    this.prepare();
+    if (this.shouldStop()) throw new Aborted();
+    const net = this.nets.find((n) => n.id === netId);
+    if (!net) return undefined;
+    const base = this.planOf(net);
+    if (!base) return undefined;
+    this.fixed ??= new Uint8Array(this.cells);
+
+    const part = this.stretchThrough(base, bay, old);
+    if (part) {
+      this.fixed.fill(0);
+      this.closeCells(closed);
+      this.closeCells(old.slice(0, part.from));
+      this.closeCells(old.slice(part.to + 1));
+      const out = this.routeNet(part.stops);
+      if (typeof out !== 'number' && sameNode(out[0], old[part.from]) && sameNode(out[out.length - 1], old[part.to])) {
+        return [...old.slice(0, part.from), ...out, ...old.slice(part.to + 1)];
+      }
+    }
+
+    let plan = this.planOf(net, bay);
+    if (!plan) return undefined;
+    this.fixed.fill(0);
+    this.closeCells(closed);
+    let outcome = this.routeNet(plan.stops);
+    let alternatives: StopPlan[] | undefined;
+    for (let attempt = 0; typeof outcome === 'number' && attempt < (this.p.maxReorders ?? MAX_REORDERS); attempt++) {
+      alternatives ??= reorderings(plan, outcome);
+      const next = alternatives.shift();
+      if (!next) break;
+      const again = this.routeNet(next.stops);
+      if (typeof again !== 'number') plan = next;
+      outcome = again;
+    }
+    return typeof outcome === 'number' ? undefined : outcome;
+  }
+
+  /**
+   * The stops of the stretch of `old` between the last run that holds a producer (or the port the belt starts at) and the next
+   * stop, a run: those two, passed the way `old` passes them, with `bay` between; and the nodes of `old` it replaces (the
+   * first node of the first stop's approach to the last node of the second's exit). Undefined when `old` does not pass them
+   * as a plan would.
+   */
+  private stretchThrough(base: StopPlan, bay: Bay, old: readonly GridPoint[]): { stops: Stop[]; from: number; to: number } | undefined {
+    const at = bayAfter(base.stops, base.group);
+    const first = base.stops[at];
+    const last = base.stops[at + 1];
+    if (at < 0 || !last || last.kind !== 'run') return undefined;
+    const indexOf = (c: Cell): number => old.findIndex((p) => p.z === 0 && p.x === c.x && p.y === c.y);
+    /** The run passed the way `old` passes it, and the indexes of the node before it and the one after it. */
+    const passed = (run: RunStop): { stop: RunStop; before: number; after: number } | undefined => {
+      const a = indexOf(run.cells[0]);
+      const b = indexOf(run.cells[run.cells.length - 1]);
+      if (a < 0 || b < 0 || Math.abs(b - a) !== run.cells.length - 1) return undefined;
+      let sign: 1 | -1;
+      if (b !== a) {
+        sign = b > a ? 1 : -1;
+      } else {
+        // a run of one cell: the way the belt goes on from it along the axis
+        const step = a + 1 < old.length ? (run.axis === 'x' ? old[a + 1].x - old[a].x : old[a + 1].y - old[a].y) : 0;
+        if (step === 0) return undefined;
+        sign = step > 0 ? 1 : -1;
+      }
+      if (!run.signs.includes(sign)) return undefined;
+      const entry = Math.min(a, b);
+      const exit = Math.max(a, b);
+      if (entry < 1 || exit + 1 >= old.length) return undefined;
+      return { stop: { ...run, signs: [sign] }, before: entry - 1, after: exit + 1 };
+    };
+    const tail = passed(last);
+    if (!tail) return undefined;
+    let head: Stop;
+    let from: number;
+    if (first.kind === 'start') {
+      if (old.length < 2 || !sameNode(old[0], { x: first.x, y: first.y, z: 0 })) return undefined;
+      head = first;
+      from = 0;
+    } else if (first.kind === 'run') {
+      const run = passed(first);
+      if (!run) return undefined;
+      head = run.stop;
+      from = run.before;
+    } else {
+      return undefined;
+    }
+    if (from >= tail.before) return undefined;
+    return { stops: [head, bayStop(bay), tail.stop], from, to: tail.after };
+  }
+
   /** Routes one net through `stops`, with no rivals; the failing stop's index, or the nodes and the tag of each top passage. */
   routeStops(stops: Stop[]): { nodes: GridPoint[]; chosen: number[] } | number {
     const out = this.routeNet(stops);
@@ -1268,7 +1362,7 @@ class Router {
   }
 
   private result(best: { routes: GridPoint[][]; shared: number; unroutable: number[] }, stopped: boolean): RouteResult {
-    const out: RoutedNet[] = this.net.nets.map((n, i) => ({ netId: n.id, nodes: best.routes[i] }));
+    const out: RoutedNet[] = this.nets.map((n, i) => ({ netId: n.id, nodes: best.routes[i] }));
     const stats: RouteStats = { rounds: this.rounds, netSearches: this.netSearches, netFailures: this.netFailures, reorders: this.reorders, expansions: this.expansions, conflictsPerRound: this.conflictsPerRound };
     if (best.shared === 0 && best.unroutable.length === 0 && !stopped) return { ok: true, routes: out, stats };
     const conflicts = best.shared + best.unroutable.length;
@@ -1291,7 +1385,33 @@ export function routeNets(
   p: RouteParams,
   shouldStop: () => boolean,
 ): RouteResult {
-  return new Router(net, taps, occ, p, shouldStop).run();
+  return new Router(net.nets, taps, occ, p, shouldStop).run();
+}
+
+/**
+ * Routes single nets of `net` once more through a bay (see the file comment), one after the other, each with the cells of the
+ * others closed: for the caller to place the coaters of the sprayed nets after `routeNets` has routed them all. One instance
+ * serves any number of calls.
+ */
+export class BayRouter {
+  private readonly router: Router;
+
+  constructor(net: Netlist, taps: TapAssignment, occ: Occupancy, p: RouteParams, shouldStop: () => boolean) {
+    this.router = new Router(net.nets, taps, occ, p, shouldStop);
+  }
+
+  /**
+   * The nodes of net `netId` routed through `bay` with `closed` cells closed to it, `old` being the route it has (the stretch
+   * round the bay is routed again, the rest kept where it can); undefined when it cannot be; `'stopped'` when asked to stop.
+   */
+  route(netId: number, bay: Bay, closed: readonly GridPoint[], old: readonly GridPoint[]): GridPoint[] | undefined | 'stopped' {
+    try {
+      return this.router.routeThroughBay(netId, bay, closed, old);
+    } catch (err) {
+      if (err instanceof Aborted) return 'stopped';
+      throw err;
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1301,8 +1421,11 @@ export type FeedResult =
   | { ok: true; nodes: GridPoint[]; chosen: number[] }
   | { ok: false; reason: string; stopped: boolean };
 
-/** Orders are tried until one routes: nearest first, then the failing coater first, last, and the order reversed. */
-const MAX_FEED_ORDERS = 4;
+/**
+ * Orders are tried until one routes: nearest first, then the failing coater first, last, and the order reversed, then the failing
+ * coater one place earlier, two, and so on (the coater before it left the belt where it could not go on).
+ */
+const MAX_FEED_ORDERS = 12;
 
 /**
  * Routes the proliferator feed (see the file comment): from the station port `port` through one option of every group of
@@ -1322,7 +1445,7 @@ export function routeFeed(
   if (groups.length === 0 || groups.some((g) => g.length === 0)) {
     return { ok: false, reason: 'a coater has no place to stand', stopped: false };
   }
-  const router = new Router({ nets: [] } as unknown as Netlist, { taps: [], stationPorts: [port] }, occ, p, shouldStop);
+  const router = new Router([], { taps: [], stationPorts: [port] }, occ, p, shouldStop);
   router.closeCells(taken);
   const start: Stop = { kind: 'start', x: port.point.x, y: port.point.y, facing: headingOf(port.dir[0], port.dir[1]) };
 
@@ -1370,7 +1493,8 @@ export function routeFeed(
     if (failed < 0) break;
     const g = order[failed];
     const rest = order.filter((x) => x !== g);
-    const next = [[g, ...rest], [...rest, g], [...order].reverse()].map((o) => o.join(',')).find((k) => !tried.has(k));
+    const earlier = Array.from({ length: failed }, (_, j) => [...rest.slice(0, failed - 1 - j), g, ...rest.slice(failed - 1 - j)]);
+    const next = [[g, ...rest], [...rest, g], [...order].reverse(), ...earlier].map((o) => o.join(',')).find((k) => !tried.has(k));
     if (next === undefined) break;
     order = next.split(',').map(Number);
   }

@@ -91,8 +91,12 @@ export interface TapAssignment {
 
 /** What a cost unit of "the port faces away from the net" is worth, in tiles of distance. */
 const PORT_BACKWARD_PENALTY = 6;
-/** What each cell short of the room a coater wants out of a port costs, in tiles of distance (a coater can still stand elsewhere). */
-const LEAD_PENALTY = 3;
+/**
+ * The cells straight out of the proliferator feed's station port that are the feed's alone (the port's first lattice point and
+ * the ones after it): it is on the ground for two flat steps before it lifts to z 1 to pass over the other nets' belts, which the
+ * item nets routed first would otherwise have walled in.
+ */
+export const FEED_PORT_CELLS = 3;
 /** Bonus (in facing-score units, which run from -1 to 1) for a slot beside one already chosen for the same tap. */
 const CONTIGUITY_BONUS = 0.75;
 /** Scores closer than this are equal. */
@@ -156,8 +160,6 @@ class Assigner {
     private readonly effects: TechEffects,
     /** Assign the most demanding taps first instead of in netlist order. */
     private readonly byDemand = false,
-    /** Room for a coater that the router will ask of a sprayed net out of its port (`RouteParams.lead`); 0: none. */
-    private readonly lead = 0,
   ) {
     this.reach = data.data.constants.sorterMaxReachMeters;
     // the slots the internal sorters of motifs use are theirs: a slot takes one sorter
@@ -305,15 +307,6 @@ class Assigner {
   // -------------------------------------------------------------------------------------------
   // Station ports
 
-  /** How many of the cells out of a port that the router will keep straight for a sprayed net's coater (`lead`, after the first two) are not free. */
-  private leadShortfall(net: BeltNet, end: 'source' | 'sink', info: SlotInfo): number {
-    if (!net.sprayed || end !== 'source' || this.lead === 0) return 0;
-    const { x, y } = info.firstOutside;
-    let free = 0;
-    for (let i = 2; i <= this.lead && !this.blocked(x + i * info.dir[0], y + i * info.dir[1]); i++) free++;
-    return this.lead - 1 - free;
-  }
-
   private assignPorts(): void {
     interface Want {
       net: BeltNet;
@@ -349,8 +342,9 @@ class Assigner {
           for (const info of usable) {
             if (taken.has(info.index)) continue;
             const { x, y } = info.firstOutside;
+            if (want.net.proliferator && this.blocked(x + (FEED_PORT_CELLS - 1) * info.dir[0], y + (FEED_PORT_CELLS - 1) * info.dir[1])) continue;
             const forward = (g.x - x) * info.dir[0] + (g.y - y) * info.dir[1];
-            const cost = manhattan(x, y, g.x, g.y) + (forward < 0 ? PORT_BACKWARD_PENALTY : 0) + this.leadShortfall(want.net, want.end, info) * LEAD_PENALTY;
+            const cost = manhattan(x, y, g.x, g.y) + (forward < 0 ? PORT_BACKWARD_PENALTY : 0);
             if (!best || cost < best.cost - SCORE_EPS) best = { want, info, cost };
           }
         }
@@ -367,17 +361,7 @@ class Assigner {
         done.add(want);
         taken.add(info.index);
         const { x, y } = info.firstOutside;
-        this.claim(want.net.id, 'port', x, y);
-        this.claim(want.net.id, 'port', x + info.dir[0], y + info.dir[1]);
-        // the room a coater wants out of the port (the router keeps straight there where it is free): no tap takes it
-        if (want.net.sprayed && want.end === 'source') {
-          for (let i = 2; i <= this.lead; i++) {
-            const lx = x + i * info.dir[0];
-            const ly = y + i * info.dir[1];
-            if (this.blocked(lx, ly)) break;
-            this.claim(want.net.id, 'port', lx, ly);
-          }
-        }
+        for (let i = 0; i < (want.net.proliferator ? FEED_PORT_CELLS : 2); i++) this.claim(want.net.id, 'port', x + i * info.dir[0], y + i * info.dir[1]);
         this.ports.push({
           netId: want.net.id,
           stationBuildingId: station.id,
@@ -566,16 +550,12 @@ export function assignTaps(
   occ: Occupancy,
   data: GameDataIndex,
   effects: TechEffects,
-  /**
-   * `repass: false` assigns in netlist order only, with no second pass in order of demand (see the file comment). `lead` is the
-   * room for a coater the router will be asked for (`RouteParams.lead`): ports of sprayed nets are chosen for it and no tap
-   * takes it (default 0: ports and taps as before the proliferator network).
-   */
-  options: { repass?: boolean; lead?: number } = {},
+  /** `repass: false` assigns in netlist order only, with no second pass in order of demand (see the file comment). */
+  options: { repass?: boolean } = {},
 ): TapAssignment | { failed: string } {
   const attempt = (byDemand: boolean): TapAssignment | { failed: string } => {
     try {
-      return new Assigner(net, placement, occ, data, effects, byDemand, options.lead ?? 0).run();
+      return new Assigner(net, placement, occ, data, effects, byDemand).run();
     } catch (err) {
       if (err instanceof Failure) return { failed: err.message };
       throw err;

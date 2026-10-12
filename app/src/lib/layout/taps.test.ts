@@ -7,7 +7,7 @@ import { netStack } from './netlist';
 import type { Netlist } from './netlist';
 import { constructivePlacement, placementBuildingIdOf, stationBuildingId } from './placement';
 import type { Placement } from './placement';
-import { COATER_LEAD, defaultRouteParams, routeNets } from './router';
+import { defaultRouteParams, routeNets } from './router';
 import { assignTaps } from './taps';
 import type { AssignedTap, TapAssignment } from './taps';
 import {
@@ -724,32 +724,5 @@ describe('assignTaps: the proliferator net (Task 28)', () => {
     const port = ok(assignTaps(net, placement, occupancyOf(placement.buildings), data, effects)).stationPorts.find((p) => p.netId === feed.id);
     // the machines stand east of the column of stations
     expect(port?.dir).toEqual([1, 0]);
-  });
-
-  it('keeps every tap off the room a sprayed net\'s coater wants out of its port (the five nodes straight out of it)', async () => {
-    const net = await processorNetlist(1, { tier: 3, mode: 'extra' });
-    const placement = constructivePlacement(net, data, 3);
-    const occ = occupancyOf(placement.buildings);
-    const res = ok(assignTaps(net, placement, occ, data, effects, { lead: COATER_LEAD }));
-    const sources = res.stationPorts.filter((p) => p.end === 'source' && net.nets.find((n) => n.id === p.netId)?.sprayed);
-    expect(sources.length).toBeGreaterThan(0);
-    for (const p of sources) {
-      for (let i = 0; i <= 4; i++) {
-        const x = p.point.x + i * p.dir[0];
-        const y = p.point.y + i * p.dir[1];
-        const other = res.taps.find((t) => t.netId !== p.netId && needed(t).includes(key(x, y)));
-        expect(other, `net ${p.netId}: cell ${i} out of its port (${x}, ${y}) is a tap of net ${other?.netId}`).toBeUndefined();
-      }
-    }
-  });
-
-  it('asks for no room unless told to: lead 0 is the default, and the room is only held for sprayed nets that start at a port', async () => {
-    const net = await processorNetlist(1, { tier: 3, mode: 'extra' });
-    const placement = constructivePlacement(net, data, 3);
-    const occ = occupancyOf(placement.buildings);
-    expect(ok(assignTaps(net, placement, occ, data, effects, { lead: 0 }))).toEqual(ok(assignTaps(net, placement, occ, data, effects)));
-    // a netlist with nothing sprayed is assigned the same whatever the room asked for
-    const unsprayed = { ...net, nets: net.nets.map((n) => ({ ...n, sprayed: undefined })) };
-    expect(ok(assignTaps(unsprayed, placement, occ, data, effects, { lead: COATER_LEAD }))).toEqual(ok(assignTaps(unsprayed, placement, occ, data, effects)));
   });
 });

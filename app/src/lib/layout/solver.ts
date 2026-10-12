@@ -1,8 +1,8 @@
 // The solver: the pipeline of Tasks 20-23 run as an anytime search (Task 24).
 //
 // Pipeline. One candidate is a placement taken through tap assignment, routing (elevation on), power nodes and
-// assembly (with a proliferator: spray coaters on the sprayed nets and the feed belt through their top passages, placed
-// between the routing and the power nodes, proliferator.ts), then the validator's static checks (`validateLayout` with `simulate: false`: geometry, then the rate
+// assembly (with a proliferator: a bay for the spray coater of every sprayed net, which is routed through it, and the feed belt
+// through the coaters' top passages, placed between the routing and the power nodes, proliferator.ts), then the validator's static checks (`validateLayout` with `simulate: false`: geometry, then the rate
 // capacity). Only a candidate that would become the new best goes on to the full validator with the tick simulation,
 // which is what costs time.
 //
@@ -19,7 +19,7 @@
 // between two routings of one placement, and three layouts of one kind can fail together (Conveyor Belt MK.II).
 //
 // Improvement loop. Until a stop condition holds: pick a margin from {1, 2} ({1, 2, 3} with a proliferator net, whose
-// coaters and feed want the room of a wider placement), anneal the placement of the best layout
+// feed wants the room of a wider placement), anneal the placement of the best layout
 // (or, if that was made at a smaller margin than this one, the constructive placement at this margin: an annealed
 // placement is only collision free at the margin it was annealed at) with a new seed, then build a candidate from it.
 // Margins 0-2 often leave nets unrouted; a failed candidate is normal, is counted and the loop goes on. A candidate
@@ -82,10 +82,10 @@ import type { Netlist } from './netlist';
 import { obbsBounds, Occupancy } from './occupancy';
 import { annealPlacement, constructivePlacement, DEFAULT_PLACEMENT_WEIGHTS, placementCost } from './placement';
 import type { Placement } from './placement';
-import { placePowerNodes, powerTargets, sorterGeometry } from './power';
-import { feedProliferator } from './proliferator';
+import { placePowerNodes, powerTargets } from './power';
+import { feedProliferator, placeBays } from './proliferator';
 import { Rng } from './rng';
-import { COATER_LEAD, defaultRouteParams, routeNets } from './router';
+import { defaultRouteParams, routeNets } from './router';
 import type { RouteParams } from './router';
 import { assignTaps } from './taps';
 
@@ -144,15 +144,10 @@ export const DEFAULT_SOLVE_OPTIONS: SolveOptions = {
 /** The fallback ladder's margins. */
 const LADDER_MARGINS = [3, 4, 6] as const;
 
-/**
- * One rung of the fallback ladder: a constructive placement at `margin`, routed by the fast router or the exact one. `lead`
- * (Task 28, only for a plan with a proliferator net): the router is asked to keep the room a coater wants on the sprayed nets
- * (`RouteParams.lead`).
- */
+/** One rung of the fallback ladder: a constructive placement at `margin`, routed by the fast router or the exact one. */
 export interface Rung {
   margin: number;
   exact: boolean;
-  lead?: true;
 }
 
 /**
@@ -161,15 +156,11 @@ export interface Rung {
  * and the tap assignment that the ladder had before Task 27). The simulated output of a layout that has no slack in the
  * plan swings by 10 % from one routing of the same placement to another, and a ladder of three layouts of one kind can
  * fail them all (Conveyor Belt MK.II); the exact rungs are another chance that costs nothing when the first three pass.
- * `sprayed`: the plan has a proliferator net, see `Rung.lead`.
+ * A plan with a proliferator net has the same rungs: once the nets are routed, each sprayed net is routed once more through
+ * a bay for its coater (`placeBays`), at any margin.
  */
-export function ladderRungs(sprayed = false): Rung[] {
-  const rungs: Rung[] = [false, true].flatMap((exact) => LADDER_MARGINS.map((margin) => ({ margin, exact })));
-  // A plan with a proliferator net has three more rungs, the last chance: the router asked to keep room for the coaters. They
-  // come last because they cost footprint and, on a large plan, routing time (the room is rigid), where the plain rungs
-  // find a place for the coaters in a placement as wide as these.
-  if (sprayed) rungs.push(...LADDER_MARGINS.map((margin): Rung => ({ margin, exact: false, lead: true })));
-  return rungs;
+export function ladderRungs(): Rung[] {
+  return [false, true].flatMap((exact) => LADDER_MARGINS.map((margin) => ({ margin, exact })));
 }
 
 /** The router's settings of an exact rung: A* without a weight and no rerouting of a failed net. */
@@ -177,12 +168,11 @@ const EXACT_ROUTE: Partial<RouteParams> = { heuristicWeight: 1, maxReorders: 0, 
 /** The improvement loop's margins. */
 const IMPROVE_MARGINS = [1, 2] as const;
 /**
- * ...and with a proliferator net: a spray coater wants a straight run of five ground nodes between the producers and the first
- * consumer of its net, and a feed belt wants cells at z 1 beside it, which a placement annealed at margin 1 or 2 rarely leaves.
- * Of 15 Processor placements (the constructive one and 14 annealed ones) with Mk.III, 0 at margin 2 and 2 at margin 3 had room
- * for all eight coaters; with the router asked to keep room (`RouteParams.lead`, which the loop does), 2 at margin 2 and 10 at
- * margin 3. Margin 3 is the ladder's first rung, so the loop can improve on it; the picker's record keeps the margins that fail
- * from costing time.
+ * ...and with a proliferator net: the feed belt wants cells at z 1 beside the coaters, which a placement annealed at margin 1
+ * rarely leaves. Of 15 Processor placements (the constructive one and 14 annealed ones) with Mk.III, each sprayed net gets
+ * its bay (`placeBays`) and the layout passes the static checks in 15 at margin 2 and 13 at margin 3, and in 1 at margin 1,
+ * where 10 do not route at all (as without a proliferator). Margin 3 is the ladder's first rung, so the loop can improve on it;
+ * the picker's record keeps the margins that fail from costing time.
  */
 const IMPROVE_MARGINS_SPRAYED = [1, 2, 3] as const;
 /**
@@ -606,8 +596,7 @@ export function* solveSteps(
   /**
    * A placement of `netlist` taken through taps, routes and power to a layout that passes the static checks. `route`
    * overrides the router's defaults (the improvement loop's candidates give up a stuck negotiation early); `exact`
-   * assigns the taps in netlist order only (an exact rung of the ladder); `lead` asks the router for the room a coater wants
-   * on the sprayed nets (`RouteParams.lead`, `COATER_LEAD`).
+   * assigns the taps in netlist order only (an exact rung of the ladder).
    */
   const build = (
     netlist: Netlist,
@@ -615,24 +604,27 @@ export function* solveSteps(
     stop: () => boolean,
     route: Partial<RouteParams> = {},
     exact = false,
-    lead = 0,
   ): Built => {
     const occ = new Occupancy(data);
     for (const b of placement.buildings) occ.addBuilding(b);
-    const taps = assignTaps(netlist, placement, occ, data, effects, { repass: !exact, lead });
+    const taps = assignTaps(netlist, placement, occ, data, effects, { repass: !exact });
     if ('failed' in taps) return { failures: [`tap assignment failed: ${taps.failed}`] };
-    const routeParams = defaultRouteParams(occ, lead > 0 ? { ...route, lead } : route);
+    const routeParams = defaultRouteParams(occ, route);
     const routed = routeNets(netlist, taps, occ, routeParams, stop);
     if (!routed.ok) {
       if (stop()) return { stopped: true };
       return { failures: [`routing left ${routed.conflicts} conflicts; nets without a route: ${routed.unroutable.join(', ') || 'none'}`] };
     }
-    // the proliferator network (Task 28): coaters on the sprayed nets, and the feed belt through their top passages
+    // the proliferator network (Task 28): a bay for the coater of every sprayed net, which is routed through it, and the feed belt
+    // through the top passages of the coaters
     let routes = routed.routes;
     let coaters: SprayCoater[] = [];
     if (netlist.nets.some((n) => n.proliferator)) {
-      const itemsOnly = assembleLayout(netlist, placement, taps, routes, [], plan, data);
-      const fed = feedProliferator(netlist, taps, routes, occ, sorterGeometry(itemsOnly, data).cells, routeParams, data, stop);
+      const bayed = placeBays(netlist, taps, placement, routes, occ, data, routeParams, stop);
+      if ('stopped' in bayed) return { stopped: true };
+      if ('failed' in bayed) return { failures: [bayed.failed] };
+      routes = bayed.routes;
+      const fed = feedProliferator(netlist, taps, routes, bayed.bays, occ, routeParams, data, stop);
       if ('stopped' in fed) return { stopped: true };
       if ('failed' in fed) return { failures: [fed.failed] };
       routes = [...routes, fed.route];
@@ -657,10 +649,9 @@ export function* solveSteps(
     stop: () => boolean,
     route: Partial<RouteParams> = {},
     exact = false,
-    lead = 0,
   ): Built => {
     try {
-      return build(netlist, placement, stop, route, exact, lead);
+      return build(netlist, placement, stop, route, exact);
     } catch (err) {
       return { failures: [`internal error: ${err instanceof Error ? err.message : String(err)}`] };
     }
@@ -708,7 +699,7 @@ export function* solveSteps(
   // --- fallback ladder
   progress('start');
   const sprayed = net.nets.some((n) => n.proliferator);
-  const rungs = ladderRungs(sprayed);
+  const rungs = ladderRungs();
   /** The first layout that passed only over the doubled window; kept until the rungs end or the user stops (see `validateGated`). */
   let provisional: { best: Best; tag: string } | null = null;
   /** Takes the parked layout, if the ladder found no plain pass: it is the layout the ladder found, whichever way it ends. */
@@ -722,15 +713,14 @@ export function* solveSteps(
     // the exact rungs are a second chance for a ladder that found nothing: a layout over the doubled window is enough
     if (provisional && i === LADDER_MARGINS.length) break;
     const { margin } = rung;
-    const tag = rung.exact ? `margin ${margin} (exact routes)` : rung.lead ? `margin ${margin} (room for coaters)` : `margin ${margin}`;
+    const tag = rung.exact ? `margin ${margin} (exact routes)` : `margin ${margin}`;
     yield;
     if (shouldStop()) {
       takeProvisional();
       return result('user');
     }
     const placed: MarginPlacement = { placement: constructive(margin), margin };
-    // the rungs that keep room for the coaters are a last chance, not the guarantee: a routing that is stuck is given up early
-    const built = tryBuild(net, placed.placement, shouldStop, rung.exact ? EXACT_ROUTE : rung.lead ? IMPROVE_ROUTE : {}, rung.exact, rung.lead ? COATER_LEAD : 0);
+    const built = tryBuild(net, placed.placement, shouldStop, rung.exact ? EXACT_ROUTE : {}, rung.exact);
     attempts++;
     if ('stopped' in built) {
       takeProvisional();
@@ -775,8 +765,6 @@ export function* solveSteps(
   // Each chain has its own record of margins and its own temperature, so that the ordinary chain does exactly the same
   // whether the motif chains run or not.
   const improveMargins = sprayed ? IMPROVE_MARGINS_SPRAYED : IMPROVE_MARGINS;
-  /** The candidates of the improvement loop ask the router for the room a coater wants: their placements are tight. */
-  const improveLead = sprayed ? COATER_LEAD : 0;
   const marginPicker = new MarginPicker(improveMargins);
   const reheat = new Reheat();
   let itersPerMs = DEFAULT_ITERS_PER_MS;
@@ -848,7 +836,7 @@ export function* solveSteps(
     }
 
     const placed: MarginPlacement = { placement: annealed, margin };
-    const built = tryBuild(net, annealed, improveStop, IMPROVE_ROUTE, false, improveLead);
+    const built = tryBuild(net, annealed, improveStop, IMPROVE_ROUTE, false);
     if ('stopped' in built) {
       progress(`improve: margin ${margin} stopped`);
       return;

@@ -1,218 +1,177 @@
 import { describe, expect, it } from 'vitest';
+import { planProduction } from '../calc';
 import { coaterBuildings, coaterPlacementProblem } from '../geometry';
-import type { GridPoint, PlacedBuilding } from '../geometry';
-import { validateLayout } from '../validate';
+import type { GridPoint } from '../geometry';
+import { MAX_WARMUP_TICKS, runSimulation, validateLayout } from '../validate';
 import { assembleLayout } from './assemble';
-import type { BeltNet, Netlist } from './netlist';
-import { coaterOptions, feedProliferator } from './proliferator';
-import type { Place } from './proliferator';
+import { buildNetlist } from './netlist';
+import type { Netlist } from './netlist';
+import { feedProliferator, placeBays } from './proliferator';
 import { COATER_ID_OFFSET, coaterIdOf, constructivePlacement } from './placement';
-import { placePowerNodes, powerTargets, sorterGeometry } from './power';
-import { COATER_LEAD, defaultRouteParams, routeNets } from './router';
+import { placePowerNodes, powerTargets } from './power';
+import { defaultRouteParams, routeNets } from './router';
+import type { Bay } from './router';
 import { assignTaps } from './taps';
-import type { AssignedTap, TapAssignment } from './taps';
-import { ASSEMBLER, data, effects, occupancyOf, processorNetlist, processorPlan } from './testkit';
+import type { TapAssignment } from './taps';
+import { data, effects, everything, occupancyOf, processorNetlist, processorPlan } from './testkit';
 
 const never = () => false;
-const COATER = 2313;
 
-/** A straight east-west row of ground nodes along y = 10 from x = 0, `n` of them. */
-const row = (n: number, y = 10): GridPoint[] => Array.from({ length: n }, (_, i) => ({ x: i, y, z: 0 }));
+/** Items that come from the ground, the sea or the air: supplied, never planned. */
+const RAW_ITEMS = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031];
 
-const netOf = (over: Partial<BeltNet> = {}): BeltNet => ({
-  id: 3,
-  itemId: 1301,
-  tierItemId: 2003,
-  rate: 1,
-  source: { kind: 'taps' },
-  sink: { kind: 'deadEnd' },
-  taps: [],
-  sprayed: true,
-  ...over,
-});
+const key = (x: number, y: number): string => `${x},${y}`;
 
-/** Taps of net 3 at the given nodes of `nodes`: `out` ones are producers, `in` ones consumers. */
-const tapsAt = (nodes: GridPoint[], at: { i: number; dir: 'in' | 'out' }[]): TapAssignment => ({
-  taps: at.map(
-    ({ i, dir }, n): AssignedTap => ({ netId: 3, machineId: n + 1, slot: 0, span: 1, point: { x: nodes[i].x, y: nodes[i].y }, axis: 'x', dir, sorterIndex: 0, rate: 1 }),
-  ),
-  stationPorts: [],
-});
+/** The pipeline up to the feed: placement, taps, routes, bays (the sprayed nets routed through them). */
+function pipelineOf(plan: Awaited<ReturnType<typeof processorPlan>>, net: Netlist, margin: number) {
+  const placement = constructivePlacement(net, data, margin);
+  const occ = occupancyOf(placement.buildings);
+  const taps = assignTaps(net, placement, occ, data, effects);
+  if ('failed' in taps) throw new Error(taps.failed);
+  const params = defaultRouteParams(occ);
+  const routed = routeNets(net, taps, occ, params, never);
+  if (!routed.ok) throw new Error(`routing left ${routed.conflicts} conflicts`);
+  const bayed = placeBays(net, taps, placement, routed.routes, occ, data, params, never);
+  if (!('bays' in bayed)) throw new Error(JSON.stringify(bayed));
+  return { plan, net, placement, occ, taps, params, bays: bayed.bays, plain: routed.routes, routed: { routes: bayed.routes } };
+}
 
-const options = (
-  nodes: GridPoint[],
-  at: { i: number; dir: 'in' | 'out' }[],
-  over: { occ?: PlacedBuilding[]; sorterCells?: string[]; used?: string[] } = {},
-) => {
-  const places: Place[] = [];
-  const found = coaterOptions(
-    netOf(),
-    nodes,
-    tapsAt(nodes, at),
-    occupancyOf(over.occ ?? []),
-    new Set(over.sorterCells ?? []),
-    new Set(over.used ?? []),
-    COATER,
-    places,
+async function processorPipeline(margin: number) {
+  const plan = await processorPlan(1, { tier: 3, mode: 'extra' });
+  return pipelineOf(plan, await processorNetlist(1, { tier: 3, mode: 'extra' }), margin);
+}
+
+/** 1 High-Explosive Shell Set/s with proliferator `tier` (extra products) on the first facility that can make it. */
+async function shellSetPipeline(margin: number, tier: 1 | 2 | 3 = 3) {
+  const itemId = data.data.items.find((i) => i.name === 'High-Explosive Shell Set')!.id;
+  const result = await planProduction(
+    {
+      targetItemId: itemId,
+      quantity: { kind: 'rate', perSecond: 1 },
+      finalFacilityItemId: 2303,
+      unlockedTechs: everything,
+      suppliedItemIds: new Set(RAW_ITEMS),
+      facilityOverrides: {},
+      recipeOverrides: {},
+      proliferator: { tier, mode: 'extra' },
+      stationKind: 'planetary',
+    },
+    data,
+    effects,
   );
-  return { found, places };
-};
+  if (!result.ok) throw new Error(result.error.message);
+  return pipelineOf(result.plan, buildNetlist(result.plan, data, effects), margin);
+}
 
-describe('coaterOptions: where a coater can stand on a net', () => {
-  it('on a straight row between the last producer and the first consumer, turned either way round', () => {
-    const nodes = row(20);
-    const { found, places } = options(nodes, [{ i: 2, dir: 'out' }, { i: 17, dir: 'in' }]);
-    expect(found.length).toBeGreaterThan(10);
-    // with the flow (east, 90): the top passage over the node before it; against the flow (270): over the node after
-    const withFlow = places.filter((p) => p.yaw === 90);
-    const against = places.filter((p) => p.yaw === 270);
-    expect(withFlow.length).toBeGreaterThan(0);
-    expect(against.length).toBeGreaterThan(0);
-    for (const o of found) {
-      const place = places[o.tag];
-      const expectTop = place.yaw === 90 ? place.node - 1 : place.node + 1;
-      expect([o.x, o.y]).toEqual([nodes[expectTop].x, nodes[expectTop].y]);
-      // crosses the row at a right angle: north or south
-      expect(o.dirs.sort()).toEqual([1, 3]);
-      expect(o.through.sort()).toEqual([1, 3]);
-      expect(coaterPlacementProblem({ id: 3, tierItemId: 2003, itemId: 1301, nodes, plannedRate: 1 }, place.node, place.yaw)).toBeUndefined();
+describe('placeBays: the room for a coater, made on every sprayed net', () => {
+  it('gives every sprayed net a bay of three cells in a row, and the other nets none', async () => {
+    const p = await processorPipeline(3);
+    const sprayed = p.net.nets.filter((n) => n.sprayed);
+    expect(sprayed.length).toBeGreaterThan(3);
+    expect(p.bays.map((b) => b.netId)).toEqual(sprayed.map((n) => n.id));
+    for (const b of p.bays) {
+      const [a, m, c] = b.cells;
+      expect(b.cells).toHaveLength(3);
+      const [ux, uy] = b.axis === 'x' ? [1, 0] : [0, 1];
+      expect([m.x - a.x, m.y - a.y, c.x - m.x, c.y - m.y]).toEqual([ux, uy, ux, uy]);
+      expect(b.signs.length).toBeGreaterThan(0);
+      // the cells above the five nodes, and beside the nodes either side of the middle one
+      expect(b.held).toHaveLength(9);
+      expect(b.held.every((h) => h.z === 1)).toBe(true);
     }
   });
 
-  it('the earliest and the latest place are the ones the taps leave room for', () => {
-    const nodes = row(20);
-    const { places } = options(nodes, [{ i: 5, dir: 'out' }, { i: 15, dir: 'in' }]);
-    const spots = places.map((p) => [p.node, p.yaw]);
-    // with the flow the body reaches 2 nodes back and 1 forward: producers at <= k - 3, consumers at >= k + 2
-    expect(Math.min(...places.filter((p) => p.yaw === 90).map((p) => p.node))).toBe(8);
-    expect(Math.max(...places.filter((p) => p.yaw === 90).map((p) => p.node))).toBe(13);
-    // against it the body reaches 1 node back and 2 forward: producers at <= k - 2, consumers at >= k + 3
-    expect(Math.min(...places.filter((p) => p.yaw === 270).map((p) => p.node))).toBe(7);
-    expect(Math.max(...places.filter((p) => p.yaw === 270).map((p) => p.node))).toBe(12);
-    expect(spots.length).toBe(6 + 6);
-  });
-
-  it('a net with no producers (an import) allows the first nodes: a coater at node 2, the top over node 1, the rear at the port node', () => {
-    const nodes = row(12);
-    const { places } = options(nodes, [{ i: 8, dir: 'in' }]);
-    expect(Math.min(...places.filter((p) => p.yaw === 90).map((p) => p.node))).toBe(1);
-    expect(Math.max(...places.filter((p) => p.yaw === 90).map((p) => p.node))).toBe(6);
-  });
-
-  it('no place when the taps leave no room', () => {
-    const nodes = row(12);
-    expect(options(nodes, [{ i: 4, dir: 'out' }, { i: 6, dir: 'in' }]).found).toEqual([]);
-    // a consumer before the producer: no stretch is after the one and before the other
-    expect(options(nodes, [{ i: 6, dir: 'in' }, { i: 3, dir: 'out' }]).found).toEqual([]);
-  });
-
-  it('no place on a bend: the nodes under the coater and the ones either side of its body are one straight line', () => {
-    const bent: GridPoint[] = [...row(8), ...[1, 2, 3, 4, 5, 6, 7, 8].map((i) => ({ x: 7, y: 10 + i, z: 0 }))];
-    const { places } = options(bent, [{ i: 15, dir: 'in' }]);
-    // the row runs to the corner at node 7 (7, 10); a coater needs nodes k - 2 .. k + 2 on one line, the corner node included
-    expect([...new Set(places.filter((p) => p.node <= 8).map((p) => p.node))].sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5]); // node 5: nodes 3..7
-    // on the column north of the corner the same: nodes 9..13 have a line of five around them, 8 and 14 do not reach the corner / the tap
-    // a coater on node 6 would have the belt leave its body sideways at node 7
-    expect(places.some((p) => p.node === 6 || p.node === 7 || p.node === 8)).toBe(false);
-    expect([...new Set(places.filter((p) => p.node > 8).map((p) => p.node))].sort((a, b) => a - b)).toEqual([9, 10, 11, 12, 13]);
-  });
-
-  it('no place on a lifted stretch', () => {
-    const lifted: GridPoint[] = [...row(8), { x: 7, y: 10, z: 1 }, { x: 8, y: 10, z: 1 }, { x: 9, y: 10, z: 1 }, { x: 10, y: 10, z: 1 }];
-    const { places } = options(lifted, [{ i: 11, dir: 'in' }]);
-    expect(places.every((p) => lifted[p.node].z === 0 && lifted[p.node + 1].z === 0 && lifted[p.node - 1].z === 0)).toBe(true);
-    expect(Math.max(...places.map((p) => p.node))).toBeLessThan(7);
-  });
-
-  it('the cell two behind a coater that is no node of the belt (it starts or ends there) may not be taken by another net', () => {
-    // a belt of 8 nodes along y = 10 from x = 3; a coater on its node 1 (4, 10) turned east has its rear cell at (2, 10)
-    const short = row(8).map((p) => ({ ...p, x: p.x + 3 }));
-    const loose = options(short, [{ i: 7, dir: 'in' }]);
-    expect(loose.places.some((p) => p.yaw === 90 && p.node === 1)).toBe(true);
-    expect(options(short, [{ i: 7, dir: 'in' }], { used: ['2,10,0'] }).places.some((p) => p.yaw === 90 && p.node === 1)).toBe(false);
-    expect(options(short, [{ i: 7, dir: 'in' }], { used: ['2,10,1'] }).places.some((p) => p.yaw === 90 && p.node === 1)).toBe(false);
-    // and a coater on node 2 has the node behind it, (3, 10), under its back: nothing to check there
-    expect(options(short, [{ i: 7, dir: 'in' }], { used: ['2,10,0'] }).places.some((p) => p.yaw === 90 && p.node === 2)).toBe(true);
-  });
-
-  it('keeps off the cells sorters take, and off z 1 cells that another net holds over the body', () => {
-    const nodes = row(20);
-    const plain = options(nodes, [{ i: 19, dir: 'in' }]);
-    // a sorter cell on node 10: no place whose body includes it
-    const sorted = options(nodes, [{ i: 19, dir: 'in' }], { sorterCells: ['10,10'] });
-    expect(sorted.places.length).toBeLessThan(plain.places.length);
-    for (const p of sorted.places) {
-      const reach = p.yaw === 90 ? [p.node - 2, p.node + 1] : [p.node - 1, p.node + 2];
-      expect(10 >= reach[0] && 10 <= reach[1]).toBe(false);
-    }
-    const covered = options(nodes, [{ i: 19, dir: 'in' }], { used: ['10,10,1'] });
-    expect(covered.places.length).toBe(sorted.places.length);
-  });
-
-  it('keeps off buildings: the coater\'s body is held to the building footprint', () => {
-    const nodes = row(20);
-    const asm: PlacedBuilding = { id: 1, itemId: ASSEMBLER, x: 10, y: 11, z: 0, yaw: 0 };
-    const near = options(nodes, [{ i: 19, dir: 'in' }], { occ: [asm] });
-    const far = options(nodes, [{ i: 19, dir: 'in' }]);
-    expect(near.places.length).toBeLessThan(far.places.length);
-  });
-
-  it('needs a free cell beside the top passage to cross: none free, no option; one side free, one direction', () => {
-    const nodes = row(20);
-    // a wall of buildings along the row at z 1: north of it
-    const wall: PlacedBuilding[] = [{ id: 1, itemId: ASSEMBLER, x: 10, y: 12, z: 0, yaw: 0 }];
-    const { found } = options(nodes, [{ i: 19, dir: 'in' }], { occ: wall });
-    // a top passage right under the assembler has no free cell north of it: it can only be entered from the south
-    const under = found.filter((o) => o.x >= 9 && o.x <= 11);
-    for (const o of under) expect(o.dirs).toEqual([1]); // north is blocked: only a belt coming from the south, heading north
-    // through needs the cell after as well
-    const used = options(nodes, [{ i: 19, dir: 'in' }], { used: ['5,9,1'] });
-    const at5 = used.found.filter((o) => o.x === 5);
-    for (const o of at5) {
-      expect(o.dirs).toContain(3);
-      expect(o.through).not.toContain(1);
+  it('routes every sprayed net through its bay, five nodes in a line, and leaves the routes of the other nets as they were', async () => {
+    const p = await processorPipeline(3);
+    for (const route of p.routed.routes) {
+      const bay = p.bays.find((b) => b.netId === route.netId);
+      const before = p.plain.find((r) => r.netId === route.netId);
+      if (!bay) {
+        expect(route.nodes).toEqual(before?.nodes);
+        continue;
+      }
+      const mid = bay.cells[1];
+      const k = route.nodes.findIndex((n) => n.z === 0 && n.x === mid.x && n.y === mid.y);
+      expect(k, `net ${route.netId}`).toBeGreaterThanOrEqual(2);
+      const dx = route.nodes[k + 1].x - route.nodes[k].x;
+      const dy = route.nodes[k + 1].y - route.nodes[k].y;
+      for (let j = -2; j <= 2; j++) expect(route.nodes[k + j], `net ${route.netId} node ${j}`).toEqual({ x: mid.x + j * dx, y: mid.y + j * dy, z: 0 });
     }
   });
 
-  it('offers at most 64 places however long the row, spread along it, the first and last among them', () => {
-    const nodes = row(160);
-    const { found, places } = options(nodes, [{ i: 159, dir: 'in' }]);
-    expect(found).toHaveLength(64);
-    const nodesUsed = found.map((o) => places[o.tag].node);
-    expect(nodesUsed[0]).toBe(1);
-    expect(nodesUsed[nodesUsed.length - 1]).toBeGreaterThan(150);
-    expect(nodesUsed).toEqual([...nodesUsed].sort((a, b) => a - b));
+  it('keeps every bay clear of the taps, the nodes they need beside them, the station ports, buildings and other bays, and no two nets share a cell', async () => {
+    const p = await processorPipeline(3);
+    const forbidden = new Set<string>();
+    for (const t of p.taps.taps) {
+      const [ux, uy] = t.axis === 'x' ? [1, 0] : [0, 1];
+      for (const j of [-1, 0, 1]) forbidden.add(key(t.point.x + j * ux, t.point.y + j * uy));
+    }
+    for (const q of p.taps.stationPorts) {
+      forbidden.add(key(q.point.x, q.point.y));
+      forbidden.add(key(q.point.x + q.dir[0], q.point.y + q.dir[1]));
+    }
+    const seen = new Set<string>();
+    for (const b of p.bays) {
+      const [ux, uy] = b.axis === 'x' ? [1, 0] : [0, 1];
+      const mid = b.cells[1];
+      for (const j of [-2, -1, 0, 1, 2]) {
+        const x = mid.x + j * ux;
+        const y = mid.y + j * uy;
+        expect(forbidden.has(key(x, y)), `bay of net ${b.netId}: (${x}, ${y}) is a tap's or a port's`).toBe(false);
+        expect(p.occ.blockedForBelt(x, y, 0), `bay of net ${b.netId}: (${x}, ${y}) is under a building`).toBe(false);
+        expect(seen.has(key(x, y)), `bay of net ${b.netId}: (${x}, ${y}) is in another bay`).toBe(false);
+        seen.add(key(x, y));
+      }
+    }
+    // the routes are clear of one another, and nothing crosses a bay's body at z 1
+    const cells = new Map<string, number>();
+    for (const r of p.routed.routes) {
+      for (const n of r.nodes) {
+        const k3 = `${n.x},${n.y},${n.z}`;
+        expect(cells.get(k3) ?? r.netId, `cell ${k3}`).toBe(r.netId);
+        cells.set(k3, r.netId);
+      }
+    }
+    for (const b of p.bays) for (const h of b.held) expect(cells.has(`${h.x},${h.y},${h.z}`), `bay of net ${b.netId}: (${h.x}, ${h.y}) at z 1`).toBe(false);
   });
 
-  it('the body cells are the three beside the top passage at z 1, the top passage is not one of them', () => {
-    const nodes = row(20);
-    const { found, places } = options(nodes, [{ i: 19, dir: 'in' }]);
-    const o = found.find((f) => places[f.tag].node === 8 && places[f.tag].yaw === 90) as (typeof found)[number];
-    // coater on (8, 10) turned east: top over (7, 10); body (6, 10), (8, 10), (9, 10) at z 1
-    expect([o.x, o.y]).toEqual([7, 10]);
-    expect(o.body.map((b) => [b.x, b.y, b.z]).sort()).toEqual([[6, 10, 1], [8, 10, 1], [9, 10, 1]]);
+  it('is deterministic, and makes none when no net is sprayed', async () => {
+    const a = await processorPipeline(3);
+    const b = await processorPipeline(3);
+    expect(b.bays).toEqual(a.bays);
+    expect(b.routed.routes).toEqual(a.routed.routes);
+    const plain = await processorNetlist(1);
+    const placement = constructivePlacement(plain, data, 3);
+    const occ = occupancyOf(placement.buildings);
+    const taps = assignTaps(plain, placement, occ, data, effects) as TapAssignment;
+    const params = defaultRouteParams(occ);
+    const routed = routeNets(plain, taps, occ, params, never);
+    expect(placeBays(plain, taps, placement, routed.routes, occ, data, params, never)).toEqual({ routes: routed.routes, bays: [] });
+  });
+
+  it('says why when the routing window has no room for a bay, and stops when asked to', async () => {
+    const net = await processorNetlist(1, { tier: 3, mode: 'extra' });
+    const placement = constructivePlacement(net, data, 3);
+    const occ = occupancyOf(placement.buildings);
+    const taps = assignTaps(net, placement, occ, data, effects) as TapAssignment;
+    const params = defaultRouteParams(occ);
+    const routed = routeNets(net, taps, occ, params, never);
+    if (!routed.ok) throw new Error('routing');
+    const cramped = { ...params, bounds: { minX: 0, minY: 0, maxX: 6, maxY: 6 } };
+    expect(placeBays(net, taps, placement, routed.routes, occ, data, cramped, never)).toMatchObject({
+      failed: expect.stringMatching(/^no place for the spray coater of net \d+ \(item \d+\)/),
+    });
+    expect(placeBays(net, taps, placement, routed.routes, occ, data, params, () => true)).toEqual({ stopped: true });
+    expect(placeBays(net, taps, placement, routed.routes.map((r) => ({ ...r, nodes: [] })), occ, data, params, never)).toMatchObject({
+      failed: expect.stringMatching(/^net \d+ \(item \d+\) has no route to put a spray coater on$/),
+    });
   });
 });
 
 describe('feedProliferator on the Mk.III Processor plan', () => {
-  async function pipeline(margin: number, lead = 0) {
-    const plan = await processorPlan(1, { tier: 3, mode: 'extra' });
-    const net = await processorNetlist(1, { tier: 3, mode: 'extra' });
-    const placement = constructivePlacement(net, data, margin);
-    const occ = occupancyOf(placement.buildings);
-    const taps = assignTaps(net, placement, occ, data, effects, { lead });
-    if ('failed' in taps) throw new Error(taps.failed);
-    const params = defaultRouteParams(occ, { lead });
-    const routed = routeNets(net, taps, occ, params, never);
-    if (!routed.ok) throw new Error('routing');
-    const items = assembleLayout(net, placement, taps, routed.routes, [], plan, data);
-    const cells = sorterGeometry(items, data).cells;
-    return { plan, net, placement, occ, taps, params, routed, cells };
-  }
-
-  it.each([0, COATER_LEAD])('puts one coater on every sprayed net and one feed through all their top passages, and the layout passes the static checks (room asked for: %i)', async (lead) => {
-    const p = await pipeline(3, lead);
-    const fed = feedProliferator(p.net, p.taps, p.routed.routes, p.occ, p.cells, p.params, data, never);
+  it.each([3, 4])('puts one coater on the bay of every sprayed net and one feed through all their top passages, and the layout passes the static checks (margin %i)', async (margin) => {
+    const p = await processorPipeline(margin);
+    const fed = feedProliferator(p.net, p.taps, p.routed.routes, p.bays, p.occ, p.params, data, never);
     if (!('coaters' in fed)) throw new Error(JSON.stringify(fed));
     const sprayed = p.net.nets.filter((n) => n.sprayed);
     expect(fed.coaters.map((c) => c.beltId)).toEqual(sprayed.map((n) => n.id));
@@ -235,52 +194,91 @@ describe('feedProliferator on the Mk.III Processor plan', () => {
     expect(fed.route.nodes[fed.route.nodes.length - 1].z).toBe(1);
   });
 
-  it.each([0, COATER_LEAD])('every coater stands after the last producer of its net and before the first consumer, clear of the taps (room asked for: %i)', async (lead) => {
-    const p = await pipeline(4, lead);
-    const fed = feedProliferator(p.net, p.taps, p.routed.routes, p.occ, p.cells, p.params, data, never);
+  it('every coater stands on the middle of its net\'s bay, after the last producer and before the first consumer, clear of the taps', async () => {
+    const p = await processorPipeline(4);
+    const fed = feedProliferator(p.net, p.taps, p.routed.routes, p.bays, p.occ, p.params, data, never);
     if (!('coaters' in fed)) throw new Error(JSON.stringify(fed));
     for (const c of fed.coaters) {
       const nodes = p.routed.routes.find((r) => r.netId === c.beltId)?.nodes as GridPoint[];
-      const idx = (t: AssignedTap) => nodes.findIndex((n) => n.z === 0 && n.x === t.point.x && n.y === t.point.y);
+      const bay = p.bays.find((b) => b.netId === c.beltId) as Bay;
+      expect(nodes[c.node]).toMatchObject({ x: bay.cells[1].x, y: bay.cells[1].y, z: 0 });
+      // the placement rule of the validator, on the route as routed
+      expect(coaterPlacementProblem({ id: c.beltId, tierItemId: 2003, itemId: 1301, nodes, plannedRate: 1 }, c.node, c.yaw)).toBeUndefined();
+      const index = (t: TapAssignment['taps'][number]) => nodes.findIndex((n) => n.z === 0 && n.x === t.point.x && n.y === t.point.y);
       const mine = p.taps.taps.filter((t) => t.netId === c.beltId);
-      const outs = mine.filter((t) => t.dir === 'out').map(idx);
-      const ins = mine.filter((t) => t.dir === 'in').map(idx);
-      const zone = c.yaw === 0 || c.yaw === 90 ? [c.node - 2, c.node + 1] : [c.node - 1, c.node + 2];
       // turned with the flow or against it: whichever, the body's stretch is clear of every tap
       const flow = Math.atan2(nodes[c.node + 1].x - nodes[c.node].x, nodes[c.node + 1].y - nodes[c.node].y);
       const withFlow = Math.abs(((c.yaw * Math.PI) / 180 - flow + Math.PI * 3) % (2 * Math.PI) - Math.PI) < 0.01;
       const [lo, hi] = withFlow ? [c.node - 2, c.node + 1] : [c.node - 1, c.node + 2];
-      expect(zone.length).toBe(2);
-      for (const i of outs) expect(i, `producer of net ${c.beltId}`).toBeLessThan(lo);
-      for (const i of ins) expect(i, `consumer of net ${c.beltId}`).toBeGreaterThan(hi);
+      for (const t of mine.filter((x) => x.dir === 'out')) expect(index(t), `producer of net ${c.beltId}`).toBeLessThan(lo);
+      for (const t of mine.filter((x) => x.dir === 'in')) expect(index(t), `consumer of net ${c.beltId}`).toBeGreaterThan(hi);
     }
   });
 
-  it('fails with a reason, not a throw: no feed net, no port for it, no data, and no place on a net', async () => {
-    const p = await pipeline(3);
-    const run = (net: Netlist, taps: TapAssignment, cells = p.cells) => feedProliferator(net, taps, p.routed.routes, p.occ, cells, p.params, data, never);
+  it('fails with a reason, not a throw: no feed net, no port for it, no bay for a net, a route that misses its bay', async () => {
+    const p = await processorPipeline(3);
+    const run = (net: Netlist, taps: TapAssignment, bays = p.bays, routes = p.routed.routes) => feedProliferator(net, taps, routes, bays, p.occ, p.params, data, never);
     expect(run({ ...p.net, nets: p.net.nets.filter((n) => !n.proliferator) }, p.taps)).toEqual({ failed: 'the netlist has no proliferator net' });
     const feedId = p.net.nets.find((n) => n.proliferator)?.id;
     expect(run(p.net, { ...p.taps, stationPorts: p.taps.stationPorts.filter((x) => x.netId !== feedId) })).toEqual({
       failed: `the proliferator net ${feedId} has no station port`,
     });
-    // every cell taken by a sorter: no coater has room
-    const all = new Set(p.routed.routes.flatMap((r) => r.nodes.map((n) => `${n.x},${n.y}`)));
-    const none = run(p.net, p.taps, all);
-    expect(none).toMatchObject({ failed: expect.stringMatching(/^no place for a spray coater on net \d+ \(item \d+\)/) });
+    expect(run(p.net, p.taps, p.bays.slice(1))).toMatchObject({ failed: expect.stringMatching(/^net \d+ \(item \d+\) has no bay for a spray coater$/) });
+    // a bay somewhere the route does not go
+    const first = p.bays[0];
+    const moved: Bay = { ...first, cells: first.cells.map((c) => ({ x: c.x + 1000, y: c.y })) };
+    expect(run(p.net, p.taps, [moved, ...p.bays.slice(1)])).toMatchObject({ failed: expect.stringMatching(/^the route of net \d+ does not pass the middle of its bay/) });
+    // a net without a route
+    expect(run(p.net, p.taps, p.bays, p.routed.routes.map((r) => (r.netId === first.netId ? { ...r, nodes: [] } : r)))).toMatchObject({
+      failed: expect.stringMatching(/^net \d+ has no route to put a spray coater on$/),
+    });
   });
 
   it('stops when asked to', async () => {
-    const p = await pipeline(3);
-    expect(feedProliferator(p.net, p.taps, p.routed.routes, p.occ, p.cells, p.params, data, () => true)).toEqual({ stopped: true });
+    const p = await processorPipeline(3);
+    expect(feedProliferator(p.net, p.taps, p.routed.routes, p.bays, p.occ, p.params, data, () => true)).toEqual({ stopped: true });
   });
 
   it('is deterministic, and the coater ids are in the range placement.ts documents', async () => {
-    const p = await pipeline(3);
-    const a = feedProliferator(p.net, p.taps, p.routed.routes, p.occ, p.cells, p.params, data, never);
-    const b = feedProliferator(p.net, p.taps, p.routed.routes, p.occ, p.cells, p.params, data, never);
+    const p = await processorPipeline(3);
+    const a = feedProliferator(p.net, p.taps, p.routed.routes, p.bays, p.occ, p.params, data, never);
+    const b = feedProliferator(p.net, p.taps, p.routed.routes, p.bays, p.occ, p.params, data, never);
     expect(a).toEqual(b);
     if ('coaters' in a) for (const c of a.coaters) expect(c.id).toBe(coaterIdOf(c.beltId));
     expect(COATER_ID_OFFSET).toBeGreaterThan(1000 + 100_000);
   });
+});
+
+describe('a coating window on every sprayed net, whatever the placement', () => {
+  // High-Explosive Shell Set has its producers and consumers on opposite sides of lifts and bends (producers of a net at nodes
+  // 1 and 12, its consumers from node 28): with the coater looked for on the routed net, margins 3 and 4 had no stretch for it.
+  it.each([3, 4, 6])('High-Explosive Shell Set with Mk.III: every sprayed net gets its coater and the feed reaches them all (margin %i)', async (margin) => {
+    const p = await shellSetPipeline(margin);
+    const fed = feedProliferator(p.net, p.taps, p.routed.routes, p.bays, p.occ, p.params, data, never);
+    if (!('coaters' in fed)) throw new Error(JSON.stringify(fed));
+    expect(fed.coaters.map((c) => c.beltId)).toEqual(p.net.nets.filter((n) => n.sprayed).map((n) => n.id));
+  });
+});
+
+describe('a start-up is not a shortfall (High-Explosive Shell Set)', () => {
+  // Its Refined Oil is sized to 98 %. Sulfuric Acid takes oil from Plastic while its belt (232 cargo) fills at 0.06 cargo/s, which takes
+  // 80 game minutes; the 20 minutes the adaptive warm-up used to be capped at read 94-96 % of a layout that makes 102 % once it is full.
+  it('with Mk.I proliferator at margin 4 the plain validation passes, after a warm-up longer than the cap of a plan that fills at once', async () => {
+    const p = await shellSetPipeline(4, 1);
+    const fed = feedProliferator(p.net, p.taps, p.routed.routes, p.bays, p.occ, p.params, data, never);
+    if (!('coaters' in fed)) throw new Error(JSON.stringify(fed));
+    const routes = [...p.routed.routes, fed.route];
+    const bare = assembleLayout(p.net, p.placement, p.taps, routes, [], p.plan, data, fed.coaters);
+    for (const c of coaterBuildings(bare, data)) p.occ.addBuilding(c);
+    const targets = powerTargets(bare, data);
+    const poles = placePowerNodes(bare.buildings, targets.consumerPoints, targets.blockedPoints, p.occ, data, effects);
+    const layout = assembleLayout(p.net, p.placement, p.taps, routes, poles ?? [], p.plan, data, fed.coaters);
+
+    const short = runSimulation(layout, p.plan, data, effects, { warmupTicks: MAX_WARMUP_TICKS });
+    expect(short.measuredTargetRate).toBeLessThan(0.99);
+    const report = validateLayout(layout, p.plan, data, effects);
+    expect(report.violations.map((v) => `${v.code}: ${v.message}`)).toEqual([]);
+    expect(report.sim!.warmupTicksUsed).toBeGreaterThan(MAX_WARMUP_TICKS);
+    expect(report.sim!.measuredTargetRate).toBeGreaterThanOrEqual(0.99);
+  }, 60_000);
 });

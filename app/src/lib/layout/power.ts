@@ -399,24 +399,31 @@ export function sorterGeometry(layout: Layout, data: GameDataIndex): { midpoints
   for (const s of layout.sorters) {
     const { pick, drop } = sorterEnds(s, layout, data, index);
     midpoints.push({ x: (pick.x + drop.x) / 2, y: (pick.y + drop.y) / 2 });
-    cells.add(cell(Math.round(pick.x), Math.round(pick.y)));
-    cells.add(cell(Math.round(drop.x), Math.round(drop.y)));
-
-    const dx = drop.x - pick.x;
-    const dy = drop.y - pick.y;
-    const alongX = Math.abs(dx) >= Math.abs(dy);
-    const a0 = alongX ? pick.x : pick.y;
-    const a1 = alongX ? drop.x : drop.y;
-    if (Math.abs(a1 - a0) < TOL) continue;
-    const lo = Math.min(a0, a1);
-    const hi = Math.max(a0, a1);
-    for (let v = Math.floor(lo + TOL) + 1; v < hi - TOL; v++) {
-      const t = (v - a0) / (a1 - a0);
-      const lateral = Math.round(alongX ? pick.y + t * dy : pick.x + t * dx);
-      cells.add(alongX ? cell(v, lateral) : cell(lateral, v));
-    }
+    for (const c of sorterEndCells(pick, drop)) cells.add(c);
   }
   return { midpoints, cells };
+}
+
+/**
+ * The lattice cells a sorter with ends `pick` and `drop` takes, as "x,y" keys: its two ends rounded to the lattice and the
+ * lattice points strictly between them along the longer plan axis, as the validator's SORTER_IN_BUILDING walks them.
+ */
+export function sorterEndCells(pick: { x: number; y: number }, drop: { x: number; y: number }): string[] {
+  const cells = [cell(Math.round(pick.x), Math.round(pick.y)), cell(Math.round(drop.x), Math.round(drop.y))];
+  const dx = drop.x - pick.x;
+  const dy = drop.y - pick.y;
+  const alongX = Math.abs(dx) >= Math.abs(dy);
+  const a0 = alongX ? pick.x : pick.y;
+  const a1 = alongX ? drop.x : drop.y;
+  if (Math.abs(a1 - a0) < TOL) return cells;
+  const lo = Math.min(a0, a1);
+  const hi = Math.max(a0, a1);
+  for (let v = Math.floor(lo + TOL) + 1; v < hi - TOL; v++) {
+    const t = (v - a0) / (a1 - a0);
+    const lateral = Math.round(alongX ? pick.y + t * dy : pick.x + t * dx);
+    cells.push(alongX ? cell(v, lateral) : cell(lateral, v));
+  }
+  return cells;
 }
 
 /**
