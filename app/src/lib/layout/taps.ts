@@ -16,6 +16,12 @@
 // sorter reaches over (those between the slot and T) must not lie inside a building (SORTER_IN_BUILDING); a belt may
 // run there.
 //
+// The sorter's own ends. The validator holds every sorter to 1 m <= the distance between its ends <= the reach and
+// to an alignment with its slot (SORTER_SPAN, SORTER_SKEW). A slot set back in its building, with the first lattice
+// point outside close by, makes a span-1 sorter shorter than 1 m (the Miniature Particle Collider's side slots).
+// `sorterTapEnds` gives the ends of a tap and `sorterEndsValid` is the validator's own predicate: a span that fails
+// it is not offered, and the tap goes on to the next span or slot.
+//
 // Skew poses. A slot or port that does not face along an axis is left out, the building's other poses still work
 // (`slotInfos` throws for the whole building, so each pose is tried alone, as the validator does).
 //
@@ -27,7 +33,7 @@
 // greedily by cost: the distance from the port's first lattice point outside to the net's tap centroid, plus a
 // penalty when the port faces away from it.
 import type { Building, GameDataIndex, TechEffects } from '../data';
-import { buildingDef, pointInOBBs, portInfos, slotInfos, sorterTapPoint } from '../geometry';
+import { buildingDef, pointInOBBs, portInfos, slotInfos, sorterEndsValid, sorterTapEnds, sorterTapPoint } from '../geometry';
 import type { OBB2, PlacedBuilding, SlotInfo } from '../geometry';
 import { sorterRate } from '../validate/capacity';
 import { netStack } from './netlist';
@@ -125,6 +131,8 @@ class Assigner {
   private readonly centers = new Map<number, { x: number; y: number }>();
   private readonly ports: AssignedStationPort[] = [];
   private readonly taps: AssignedTap[] = [];
+  /** The longest a sorter may be, in metres. */
+  private readonly reach: number;
 
   constructor(
     private readonly net: Netlist,
@@ -133,6 +141,7 @@ class Assigner {
     private readonly data: GameDataIndex,
     private readonly effects: TechEffects,
   ) {
+    this.reach = data.data.constants.sorterMaxReachMeters;
     for (const b of placement.buildings) this.byId.set(b.id, b);
     this.boxes = placement.buildings.map((b) => {
       const obbs = occ.obbsOf(b);
@@ -355,6 +364,9 @@ class Assigner {
       if (this.insideBuilding(slot.firstOutside.x + k * slot.dir[0], slot.firstOutside.y + k * slot.dir[1])) return undefined;
     }
     const point = sorterTapPoint(slot, span);
+    // the sorter the validator would see: its ends have to be a legal distance apart and aligned with the slot
+    const ends = sorterTapEnds(slot, point, dir);
+    if (!sorterEndsValid({ ...ends, facings: [slot.dir], toBelt: true }, this.reach)) return undefined;
     const axis = slot.dir[0] !== 0 ? 'y' : 'x';
     for (const k of [-1, 0, 1]) {
       const x = point.x + (axis === 'x' ? k : 0);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { buildingDef, buildingOBBs, pointInOBBs, portInfos, slotInfos, sorterTapPoint } from '../geometry';
-import type { PlacedBuilding } from '../geometry';
+import { buildingDef, buildingOBBs, LEVEL, pointInOBBs, portInfos, slotInfos, sorterEndsValid, sorterTapEnds, sorterTapPoint, TILE } from '../geometry';
+import type { PlacedBuilding, Yaw } from '../geometry';
 import { sorterRate } from '../validate/capacity';
 import { fixtureData, patchBuilding } from '../validate/testkit';
 import { netStack } from './netlist';
@@ -23,6 +23,7 @@ import {
 
 const REFINERY = 2308;
 const SMELTER = 2302;
+const COLLIDER = 2310;
 
 /** One machine of `itemId` at the origin, in a placement that holds only it. */
 function lone(itemId: number): { buildings: PlacedBuilding[]; placement: Placement } {
@@ -395,5 +396,86 @@ describe('assignTaps slot rules', () => {
     const res = assignTaps(net, { buildings: [station, m], cost: 0 }, occupancyOf([station, m]), data, effects);
     expect(res).toHaveProperty('failed');
     expect((res as { failed: string }).failed).toMatch(/port/);
+  });
+});
+
+describe('assignTaps sorter ends (the validator\'s SORTER_SPAN and SORTER_SKEW rules)', () => {
+  const REACH = data.data.constants.sorterMaxReachMeters;
+  const at = (itemId: number, x: number, y: number, yaw: Yaw): { buildings: PlacedBuilding[]; placement: Placement } => {
+    const b: PlacedBuilding = { id: placementBuildingIdOf(1), itemId, x, y, z: 0, yaw, recipeId: 100, role: 'stage:0' };
+    return { buildings: [b], placement: { buildings: [b], cost: 0 } };
+  };
+  const tapNet = (building: number, dir: 'in' | 'out', rate: number): Netlist =>
+    synthNetlist([{ building, count: 1 }], [], [{ taps: [{ machineId: 1, itemId: 1001, dir, rate, sorters: 1 }], rate }], 2011);
+
+  /** The sorter's length in metres, worked out from the slot and the tap point alone (not through the shared predicate). */
+  function lengthOf(t: AssignedTap, b: PlacedBuilding): number {
+    const slot = slotInfos(b, buildingDef(data, b.itemId))[t.slot];
+    const along = t.axis === 'y' ? t.point.x - slot.pos.x : t.point.y - slot.pos.y; // across the belt: the facing direction
+    return Math.hypot(along * TILE, slot.pos.z * LEVEL); // the belt end sits at the slot's own lateral coordinate, on the ground
+  }
+
+  const validAtSpanOne = (b: PlacedBuilding, slot: number): boolean => {
+    const s = slotInfos(b, buildingDef(data, b.itemId))[slot];
+    return sorterEndsValid({ ...sorterTapEnds(s, sorterTapPoint(s, 1), 'out'), facings: [s.dir], toBelt: true }, REACH);
+  };
+
+  it('a Miniature Particle Collider never gets a sorter shorter than 1 m, at any yaw and lattice offset', () => {
+    let configsWithShortSpanOne = 0;
+    for (const yaw of [0, 90, 180, 270] as Yaw[]) {
+      for (const [x, y] of [[0, 0], [0.25, 0.25], [0.5, 0], [0, 0.5], [0.5, 0.5], [0.75, 0.1], [0.1, 0.9], [0.7, 0.7]]) {
+        const { buildings, placement } = at(COLLIDER, x, y, yaw);
+        const b = buildings[0];
+        if (Array.from({ length: 9 }, (_, i) => i).some((i) => !validAtSpanOne(b, i))) configsWithShortSpanOne++;
+        for (const dir of ['out', 'in'] as const) {
+          // 4 Mk.I sorters at span 1 (the 9 slots at span 2 still carry 6.75 / s)
+          const res = ok(assignTaps(tapNet(COLLIDER, dir, 6), placement, occupancyOf(buildings), data, effects));
+          for (const t of res.taps) {
+            const label = `yaw ${yaw} at (${x}, ${y}) ${dir} slot ${t.slot} span ${t.span}`;
+            expect(lengthOf(t, b), label).toBeGreaterThanOrEqual(1 - 1e-9);
+            const slot = slotInfos(b, buildingDef(data, COLLIDER))[t.slot];
+            expect(sorterEndsValid({ ...sorterTapEnds(slot, t.point, t.dir), facings: [slot.dir], toBelt: true }, REACH), label).toBe(true);
+          }
+        }
+      }
+    }
+    // the premise: the collider has placements where a span-1 sorter on some slot would be too short
+    expect(configsWithShortSpanOne).toBeGreaterThan(0);
+  });
+
+  it('a collider tap whose span 1 is too short takes span 2 on the same slot (origin, yaw 0: the east slots 3-5)', () => {
+    const { buildings, placement } = at(COLLIDER, 0, 0, 0);
+    const infos = slotInfos(buildings[0], buildingDef(data, COLLIDER));
+    // premise: the east face is 0.618 tile from the first lattice point outside, so a span-1 sorter is 0.777 m long
+    for (const i of [3, 4, 5]) expect(infos[i].firstOutside.x - infos[i].pos.x).toBeCloseTo(0.618, 2);
+    // only the east slots are left: the other faces' tap points are blocked
+    const blocked = infos.flatMap((s) => (s.index >= 3 && s.index <= 5 ? [] : [1, 2, 3].map((span) => sorterTapPoint(s, span as 1 | 2 | 3))));
+    const res = ok(assignTaps(tapNet(COLLIDER, 'out', 1), placement, new BlockingOccupancy(buildings, blocked), data, effects));
+    expect(res.taps.length).toBeGreaterThan(0);
+    for (const t of res.taps) {
+      expect(t.slot).toBeGreaterThanOrEqual(3);
+      expect(t.slot).toBeLessThanOrEqual(5);
+      expect(t.span, `slot ${t.slot}`).toBeGreaterThanOrEqual(2);
+    }
+    expect(res.taps.reduce((sum, t) => sum + t.rate, 0)).toBeCloseTo(1, 9);
+  });
+
+  it('fails with the usual message when the only choices left would make a sorter the validator rejects', () => {
+    const { buildings, placement } = at(COLLIDER, 0, 0, 0);
+    const infos = slotInfos(buildings[0], buildingDef(data, COLLIDER));
+    // the east slots keep their span-1 tap points (too short) and lose spans 2 and 3; the other faces lose all
+    const blocked = infos.flatMap((s) => {
+      const spans = s.index >= 3 && s.index <= 5 ? [2, 3] : [1, 2, 3];
+      return spans.map((span) => sorterTapPoint(s, span as 1 | 2 | 3));
+    });
+    const res = assignTaps(tapNet(COLLIDER, 'out', 1), placement, new BlockingOccupancy(buildings, blocked), data, effects);
+    expect(res).toHaveProperty('failed');
+    expect((res as { failed: string }).failed).toMatch(/no usable sorter slot/);
+  });
+
+  it('leaves an assembler as before: span 1 on every slot it needs', () => {
+    const { buildings, placement } = at(ASSEMBLER, 0, 0, 0);
+    const res = ok(assignTaps(tapNet(ASSEMBLER, 'out', 4), placement, occupancyOf(buildings), data, effects));
+    expect(res.taps.every((t) => t.span === 1)).toBe(true);
   });
 });

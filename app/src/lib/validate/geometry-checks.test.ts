@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'vitest';
 import type { Building, Pose } from '../data';
-import { TILE } from '../geometry';
+import { buildingDef, LayoutIndex, slotInfos, sorterEnds, sorterEndsValid, TILE } from '../geometry';
 import type { GridPoint, Layout } from '../geometry';
 import { checkGeometry } from './geometry-checks';
 import {
@@ -19,8 +19,44 @@ import {
 import type { P } from './testkit';
 import type { Violation, ViolationCode } from './types';
 
-const check = (kit: LayoutKit, layout: Layout = kit.layout()): Violation[] =>
-  checkGeometry(layout, kit.data, kit.effects);
+/**
+ * The shared sorter-ends predicate (`sorterEndsValid`, which the solver's tap assignment uses too) must give the
+ * validator's own verdict on the distance part of rule 8 and on rule 10, for every sorter of every layout these tests
+ * check. Sorters the validator does not judge (an end it cannot resolve or place) are left out.
+ */
+function expectSharedPredicateAgrees(kit: LayoutKit, layout: Layout, violations: Violation[]): void {
+  const index = new LayoutIndex(layout);
+  const reach = kit.data.data.constants.sorterMaxReachMeters;
+  const about = (v: Violation, id: number): boolean => v.entities.some((e) => e.kind === 'sorter' && e.id === id);
+  for (const s of layout.sorters) {
+    if (violations.some((v) => (v.code === 'SORTER_SLOT_INVALID' || v.code === 'SORTER_TO_STATION') && about(v, s.id))) continue;
+    let ends: ReturnType<typeof sorterEnds>;
+    const facings: [number, number][] = [];
+    let toBelt = false;
+    try {
+      ends = sorterEnds(s, layout, kit.data, index);
+      for (const e of [s.pick, s.drop]) {
+        if (e.kind === 'belt') toBelt = true;
+        else {
+          const b = index.building(e.buildingId, 'test');
+          facings.push(slotInfos(b, buildingDef(kit.data, b.itemId))[e.slot].dir);
+        }
+      }
+    } catch {
+      continue; // ends that cannot be placed, or a slot that does not face along an axis: not judged by these rules
+    }
+    const rejected = violations.some(
+      (v) => about(v, s.id) && (v.code === 'SORTER_SKEW' || (v.code === 'SORTER_SPAN' && / m apart,/.test(v.message))),
+    );
+    expect(sorterEndsValid({ ...ends, facings, toBelt }, reach), `sorter ${s.id}: ${violations.map((v) => v.message).join(' | ')}`).toBe(!rejected);
+  }
+}
+
+const check = (kit: LayoutKit, layout: Layout = kit.layout()): Violation[] => {
+  const violations = checkGeometry(layout, kit.data, kit.effects);
+  expectSharedPredicateAgrees(kit, layout, violations);
+  return violations;
+};
 
 /** A tesla tower close to the origin region, out of the way of the small layouts below. */
 const powered = (kit: LayoutKit, x = -2, y = -3) => kit.tesla(x, y);

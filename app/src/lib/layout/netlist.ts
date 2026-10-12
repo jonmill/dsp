@@ -21,8 +21,9 @@
 // axis: it takes the consumers inside the window and the producers whose span overlaps it, so every sub-net's supply
 // equals its demand. A producer whose span crosses a cut would get a tap, and a planned share, in each sub-net, and
 // output sorters cannot enforce a share: one grabs everything and the other net starves. A consumer split the same way
-// shares its input between two belts. So windows are made as wide as the capacity allows, and a cut is placed, in this
-// order of preference, at
+// shares its input between two belts, which its sorters cannot enforce either; the router visits such consumers last
+// on each belt, in machine id order, so that one can only take what reaches the end of the belt (see router.ts). So
+// windows are made as wide as the capacity allows, and a cut is placed, in this order of preference, at
 //  1. the latest producer end that cuts no consumer machine (the station sink is a port on each net it spans, not a
 //     machine, so it may be cut), if the net then also has at most `maxMachinesPerNet` taps;
 //  2. else the latest such point within the capacity alone: the producers stay whole and the net holds more taps than

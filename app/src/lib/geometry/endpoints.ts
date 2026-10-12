@@ -184,6 +184,18 @@ export function sorterTapPoint(slot: SlotInfo, span: 1 | 2 | 3): { x: number; y:
   };
 }
 
+/**
+ * The two ends of a sorter on `slot` that taps a straight belt at the ground lattice point `tap`, without a layout
+ * to look them up in: `sorterEnds` for that tap. The belt runs across the slot's facing through `tap` (the only way
+ * a tap passes the validator's SORTER_BELT_TANGENT), so its end is the slot projected onto that line, at z 0.
+ * `dir` 'in' picks from the belt and drops into the slot, 'out' the reverse.
+ */
+export function sorterTapEnds(slot: SlotInfo, tap: { x: number; y: number }, dir: 'in' | 'out'): { pick: GridPoint; drop: GridPoint } {
+  const axis: [number, number] = [Math.abs(slot.dir[1]), Math.abs(slot.dir[0])];
+  const onBelt = projectOnAxis({ x: tap.x, y: tap.y, z: 0 }, axis, slot.pos);
+  return dir === 'in' ? { pick: onBelt, drop: { ...slot.pos } } : { pick: { ...slot.pos }, drop: onBelt };
+}
+
 // ---------------------------------------------------------------------------------------------
 // Endpoints
 
@@ -221,6 +233,11 @@ function projectOntoBelt(belt: BeltPath, node: number, slot: GridPoint, facing: 
     axis = leaving;
   }
   if (!axis) return { ...at };
+  return projectOnAxis(at, axis, slot);
+}
+
+/** `slot` projected onto the line through `at` along the unit vector `axis`, at the height of `at`. */
+function projectOnAxis(at: GridPoint, axis: readonly [number, number], slot: GridPoint): GridPoint {
   const along = (slot.x - at.x) * axis[0] + (slot.y - at.y) * axis[1];
   return { x: at.x + along * axis[0], y: at.y + along * axis[1], z: at.z };
 }

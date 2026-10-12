@@ -15,6 +15,18 @@ export {
   slotInfos,
   slotPosition,
   sorterEnds,
+  sorterTapEnds,
   sorterTapPoint,
 } from './endpoints';
 export type { SlotInfo } from './endpoints';
+export {
+  MIN_SORTER_LENGTH_M,
+  SKEW_LIMIT_BELT_DEG,
+  SKEW_LIMIT_BUILDING_DEG,
+  sorterEndsProblem,
+  sorterEndsValid,
+  sorterLengthMeters,
+  sorterReachProblem,
+  sorterSkewProblem,
+} from './sorter-rules';
+export type { ReachProblem, SkewProblem, SorterEnds, SorterEndsProblem } from './sorter-rules';

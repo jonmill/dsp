@@ -9,8 +9,8 @@
 // consumer upstream of a producer is never fed by it. A run is a set of taps of the net on one row at most two nodes
 // apart, which one straight pass serves (a run with producers and consumers is passed producers first). The
 // producers are ordered by nearest neighbour from the source (or, for a belt that starts at its first tap, from the
-// producer farthest from where the belt ends), the consumers likewise from the last producer. Each stop is a goal
-// that a leg of A* ends at:
+// producer farthest from where the belt ends), the consumers likewise from the last producer, except the split
+// consumers (below). Each stop is a goal that a leg of A* ends at:
 //  - a tap run is entered along its axis by a flat step into its first tap, run through, and left by one more
 //    straight node, so every tap has a node before and after it on the same line at z 0 (SORTER_BELT_TANGENT, and no
 //    height change beside it). Either direction along the axis may be taken unless a run needs producers first. A
@@ -29,6 +29,16 @@
 // run, never past maxLevel or below 0). So a lift always has two flat steps in one heading before it and two after
 // it (BELT_BAD_RAMP), a belt may not end within two nodes of one, and a turn never comes right after a lift. Moves
 // that would end a belt in a state the validator rejects (a lift not yet followed by two flat steps) are not goals.
+//
+// Split consumers. A consumer machine that takes one item from two nets (the netlist cuts a consumer that straddles a
+// cut of the rate axis) cannot be made to take its planned share from each: its two sorters fill one input buffer, and
+// whichever finds items first takes more. Upstream on a belt it takes everything it needs from that belt, starves the
+// consumers behind it, and leaves the other belt backed up so that its producers block; with no slack in the plan (every
+// machine of a stage at full rate) the lost items are not made up, and the target fell to 0.95 of its rate (Planetary
+// Shield Generator, 11 split consumers). A machine at the very end of a dead-end belt can only take what reaches it,
+// the planned share, so the split consumers go last, after the other consumers, and among themselves in machine id order,
+// which is the order of the rate axis the netlist cut (the straddler of a cut comes before the straddler of the next).
+// Planetary Shield Generator then reaches its rate (1.000, where nearest-neighbour order gave 0.947).
 //
 // Cost and negotiation. A cell costs 1 + 0.5 z + presentFactor * (other nets on it) + history. Every net is routed
 // once, in order of tap count; then the nets that share a cell, and those still without a route, are ripped up and
@@ -136,6 +146,8 @@ interface RunStop {
   center: Cell;
   /** The directions along the axis (+1 ascending, -1 descending) the belt may pass the run in. */
   signs: (1 | -1)[];
+  /** The lowest machine id among the run's taps of split consumers (see `stopsOf`), if it has one. */
+  splitId?: number;
 }
 interface PortStop {
   kind: 'start' | 'end';
@@ -175,8 +187,20 @@ function signsOf(kinds: (TapDir | null)[]): (1 | -1)[] {
   return [1, -1];
 }
 
+/** A tap cell: where taps of a net sit, and the lowest machine id of the split consumers (if any) tapping it. */
+interface TapCell {
+  x: number;
+  y: number;
+  axis: 'x' | 'y';
+  dir: TapDir;
+  splitId?: number;
+}
+
+const lowest = (a: number | undefined, b: number | undefined): number | undefined =>
+  a === undefined ? b : b === undefined ? a : Math.min(a, b);
+
 /** The runs of a set of tap cells: cells on one row and axis, at most two apart. */
-function runsOf(cells: Map<number, { x: number; y: number; axis: 'x' | 'y'; dir: TapDir }>): RunStop[] {
+function runsOf(cells: Map<number, TapCell>): RunStop[] {
   const list = [...cells.values()];
   list.sort((a, b) => {
     if (a.axis !== b.axis) return a.axis < b.axis ? -1 : 1;
@@ -206,8 +230,17 @@ function runsOf(cells: Map<number, { x: number; y: number; axis: 'x' | 'y'; dir:
       }
       cur.cells.push({ x: c.x, y: c.y });
       cur.kinds.push(c.dir);
+      cur.splitId = lowest(cur.splitId, c.splitId);
     } else {
-      cur = { kind: 'run', axis: c.axis, cells: [{ x: c.x, y: c.y }], kinds: [c.dir], center: { x: c.x, y: c.y }, signs: [1, -1] };
+      cur = {
+        kind: 'run',
+        axis: c.axis,
+        cells: [{ x: c.x, y: c.y }],
+        kinds: [c.dir],
+        center: { x: c.x, y: c.y },
+        signs: [1, -1],
+        splitId: c.splitId,
+      };
       runs.push(cur);
     }
   }
@@ -245,14 +278,16 @@ function nearestFirst(pool: RunStop[], from: Cell): RunStop[] {
 /**
  * The stops of a net in visiting order, or undefined when it has nothing to connect. Producers always come before
  * consumers, whatever it costs: the belt carries the producers' items downstream only. So: the source port, the
- * runs of producers, the runs with both (their producers first, see `signsOf`), the runs of consumers, the sink port;
- * each group by nearest neighbour from the one before.
+ * runs of producers, the runs with both (their producers first, see `signsOf`), the runs of consumers, the runs of
+ * split consumers (`isSplit`: the machine also consumes this item on another net; see the file comment), the sink port;
+ * each group by nearest neighbour from the one before, but the split consumers by machine id.
  */
 function stopsOf(
   hasSource: boolean,
   hasSink: boolean,
   taps: AssignedTap[],
   ports: AssignedStationPort[],
+  isSplit: (t: AssignedTap) => boolean = () => false,
 ): Stop[] | undefined {
   const source = ports.find((p) => p.end === 'source');
   const sink = ports.find((p) => p.end === 'sink');
@@ -260,20 +295,23 @@ function stopsOf(
 
   // one map of tap cells, so taps side by side join into one run whoever produces or consumes; a cell with a producer
   // on it is a producer cell
-  const cellsByKey = new Map<number, { x: number; y: number; axis: 'x' | 'y'; dir: TapDir }>();
+  const cellsByKey = new Map<number, TapCell>();
   const key = (x: number, y: number) => x * 1_000_003 + y;
   for (const t of taps) {
     const k = key(t.point.x, t.point.y);
     const known = cellsByKey.get(k);
-    cellsByKey.set(k, { ...t.point, axis: t.axis, dir: t.dir === 'out' || known?.dir === 'out' ? 'out' : 'in' });
+    const splitId = t.dir === 'in' && isSplit(t) ? lowest(known?.splitId, t.machineId) : known?.splitId;
+    cellsByKey.set(k, { ...t.point, axis: t.axis, dir: t.dir === 'out' || known?.dir === 'out' ? 'out' : 'in', splitId });
   }
   const allRuns = runsOf(cellsByKey);
   if (!source && allRuns.length === 0) return undefined;
   const has = (r: RunStop, d: TapDir): boolean => r.kinds.includes(d);
-  const groups = [
-    allRuns.filter((r) => !has(r, 'in')),
-    allRuns.filter((r) => has(r, 'in') && has(r, 'out')),
-    allRuns.filter((r) => !has(r, 'out')),
+  const consumerRuns = allRuns.filter((r) => !has(r, 'out'));
+  const groups: { runs: RunStop[]; byId?: boolean }[] = [
+    { runs: allRuns.filter((r) => !has(r, 'in')) },
+    { runs: allRuns.filter((r) => has(r, 'in') && has(r, 'out')) },
+    { runs: consumerRuns.filter((r) => r.splitId === undefined) },
+    { runs: consumerRuns.filter((r) => r.splitId !== undefined).sort((a, b) => (a.splitId as number) - (b.splitId as number)), byId: true },
   ];
 
   const stops: Stop[] = [];
@@ -282,10 +320,14 @@ function stopsOf(
     stops.push({ kind: 'start', x: source.point.x, y: source.point.y, facing: headingOf(source.dir[0], source.dir[1]) });
     from = source.point;
   }
-  for (const group of groups) {
+  for (const { runs: group, byId } of groups) {
     let pool = group;
     if (pool.length === 0) continue;
-    if (!from) {
+    if (!from && byId) {
+      stops.push(pool[0]);
+      from = pool[0].center;
+      pool = pool.slice(1);
+    } else if (!from) {
       // the belt starts here: at the run farthest from where the belt goes on
       const anchor: Cell = sink
         ? sink.point
@@ -307,7 +349,7 @@ function stopsOf(
       stops.push(head);
       from = head.center;
     }
-    const ordered = nearestFirst(pool, from);
+    const ordered = byId ? pool : nearestFirst(pool, from);
     stops.push(...ordered);
     if (ordered.length > 0) from = ordered[ordered.length - 1].center;
   }
@@ -746,13 +788,21 @@ class Router {
 
   run(): RouteResult {
     const nets = this.net.nets;
+    // consumers that take one item on several nets: `${machine}:${item}` -> how many nets
+    const consumedOn = new Map<string, number>();
+    for (const n of nets) {
+      for (const k of new Set(n.taps.filter((t) => t.dir === 'in').map((t) => `${t.machineId}:${t.itemId}`))) {
+        consumedOn.set(k, (consumedOn.get(k) ?? 0) + 1);
+      }
+    }
     // reserve tap and port points
     const stopsOfNet: (Stop[] | undefined)[] = nets.map((n) => {
       const taps = this.taps.taps.filter((t) => t.netId === n.id);
       const ports = this.taps.stationPorts.filter((p) => p.netId === n.id);
       for (const t of taps) if (this.inWindow(t.point.x, t.point.y)) this.reserved[this.flatOf(t.point.x, t.point.y)] = n.id;
       for (const q of ports) if (this.inWindow(q.point.x, q.point.y)) this.reserved[this.flatOf(q.point.x, q.point.y)] = n.id;
-      return stopsOf(n.source.kind === 'station', n.sink.kind === 'station', taps, ports);
+      const isSplit = (t: AssignedTap): boolean => (consumedOn.get(`${t.machineId}:${n.itemId}`) ?? 0) > 1;
+      return stopsOf(n.source.kind === 'station', n.sink.kind === 'station', taps, ports, isSplit);
     });
 
     const order = nets

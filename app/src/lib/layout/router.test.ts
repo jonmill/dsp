@@ -557,3 +557,68 @@ describe('routeNets: regressions', () => {
     });
   });
 });
+
+describe('split consumers (a machine that takes one item on two nets)', () => {
+  /** One net of item 1001: `out` machines and `in` machines, each at its tap cell (all taps run along x). */
+  const netOf = (taps: { machineId: number; dir: 'in' | 'out'; x: number; y: number }[]): Partial<BeltNet> => ({
+    itemId: 1001,
+    source: { kind: 'taps' },
+    sink: { kind: 'deadEnd' },
+    taps: taps.map((t) => ({ machineId: t.machineId, itemId: 1001, dir: t.dir, rate: 1, sorters: 1 })),
+  });
+  const assigned = (netId: number, t: { machineId: number; dir: 'in' | 'out'; x: number; y: number }): AssignedTap => ({
+    netId,
+    machineId: t.machineId,
+    slot: 0,
+    span: 1,
+    point: { x: t.x, y: t.y },
+    axis: 'x',
+    dir: t.dir,
+    sorterIndex: 0,
+    rate: 1,
+  });
+
+  // Machines 3 and 4 take the item on both nets. By nearest neighbour from the producer, 4 comes first on each net,
+  // then 3, then the plain consumers; the split consumers have to come after the plain ones, in id order.
+  const net1 = [
+    { machineId: 1, dir: 'out', x: 2, y: 3 },
+    { machineId: 4, dir: 'in', x: 4, y: 5 },
+    { machineId: 3, dir: 'in', x: 7, y: 6 },
+    { machineId: 5, dir: 'in', x: 11, y: 3 },
+    { machineId: 6, dir: 'in', x: 15, y: 3 },
+  ] as const;
+  const net2 = [
+    { machineId: 2, dir: 'out', x: 2, y: 12 },
+    { machineId: 4, dir: 'in', x: 4, y: 14 },
+    { machineId: 3, dir: 'in', x: 7, y: 15 },
+    { machineId: 7, dir: 'in', x: 11, y: 12 },
+    { machineId: 8, dir: 'in', x: 15, y: 12 },
+  ] as const;
+
+  const routes = (specs: (typeof net1 | typeof net2)[], over: Partial<RouteParams> = {}) => {
+    const net = synthNetlist([{ building: ASSEMBLER, count: 12 }], [], specs.map((s) => netOf([...s])));
+    const taps = specs.flatMap((s, i) => s.map((t) => assigned(i + 1, t)));
+    return routeNets(net, { taps, stationPorts: [] }, occupancyOf([]), params(over), never);
+  };
+
+  it('are visited after the plain consumers, in machine id order', () => {
+    const res = routes([net1, net2]);
+    expect(res.ok).toBe(true);
+    [net1, net2].forEach((spec, i) => {
+      const nodes = routeOf(res, i + 1);
+      const order = [...spec]
+        .sort((a, b) => at(nodes, a.x, a.y) - at(nodes, b.x, b.y))
+        .map((t) => t.machineId);
+      expect(order, `net ${i + 1}`).toEqual([spec[0].machineId, spec[3].machineId, spec[4].machineId, 3, 4]);
+    });
+  });
+
+  it('are not special on a net of their own: one net with the same machines keeps the nearest-neighbour order', () => {
+    // the machines take the item on this net only, so nothing is split
+    const res = routes([net1]);
+    expect(res.ok).toBe(true);
+    const nodes = routeOf(res, 1);
+    const order = [...net1].sort((a, b) => at(nodes, a.x, a.y) - at(nodes, b.x, b.y)).map((t) => t.machineId);
+    expect(order).toEqual([1, 4, 3, 5, 6]);
+  });
+});

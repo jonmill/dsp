@@ -7,6 +7,8 @@ import {
   BELT_HALF_WIDTH_TILES,
   LEVEL,
   LayoutIndex,
+  MIN_SORTER_LENGTH_M,
+  SKEW_LIMIT_BELT_DEG,
   TILE,
   buildingDef,
   buildingOBBs,
@@ -16,6 +18,8 @@ import {
   prefabToGrid,
   slotInfos,
   sorterEnds,
+  sorterReachProblem,
+  sorterSkewProblem,
   sorterTapPoint,
 } from '../geometry';
 import type { BeltPath, GridPoint, Layout, OBB2, PlacedBuilding, SlotInfo, Sorter } from '../geometry';
@@ -52,11 +56,6 @@ const RULE_ORDER: ViolationCode[] = [
 
 /** Positions closer than this are the same position. */
 const TOL = 1e-6;
-/** Sorter skew limits in degrees: building to building, and with a belt end (MX §3.5, `TooSkew`). */
-const SKEW_LIMIT_BUILDING_DEG = 14;
-const SKEW_LIMIT_BELT_DEG = 11;
-/** Two ends closer than this are a failed placement (MX §3.5). */
-const MIN_SORTER_LENGTH_M = 1;
 /** Lattice points examined between the ends of one sorter; a sorter in reach spans at most 5, this only bounds bad input. */
 const MAX_LATTICE_WALK = 16;
 /** Flat steps a lift needs on each side (MX §2.4). */
@@ -794,59 +793,50 @@ class GeometryChecker {
 
   // mirrors: BuildTool_Inserter.CheckBuildConditions
   /**
-   * Rule 8, distance part: 1 m <= 3D distance between the ends <= `sorterMaxReachMeters`. Returns false when the
-   * ends are too far apart.
+   * Rule 8, distance part: 1 m <= 3D distance between the ends <= `sorterMaxReachMeters` (`sorterReachProblem`, which
+   * the solver's tap assignment asks too). Returns false when the ends are too far apart.
    */
   private checkReach(ctx: SorterCtx, pos: { pick: GridPoint; drop: GridPoint }): boolean {
     const { s } = ctx;
-    const d = metres(pos.drop.x - pos.pick.x, pos.drop.y - pos.pick.y, pos.drop.z - pos.pick.z);
     const reach = this.data.data.constants.sorterMaxReachMeters;
-    if (d > reach + 1e-9) {
-      this.emit('SORTER_SPAN', [sorter(s.id)], `sorter ${s.id}: its ends are ${num(d)} m apart, farther than the ${num(reach)} m reach`, MIRROR_INSERTER);
-    } else if (d < MIN_SORTER_LENGTH_M - 1e-9) {
-      this.emit('SORTER_SPAN', [sorter(s.id)], `sorter ${s.id}: its ends are ${num(d)} m apart, closer than the ${MIN_SORTER_LENGTH_M} m minimum`, MIRROR_INSERTER);
+    const problem = sorterReachProblem(pos.pick, pos.drop, reach);
+    if (problem?.kind === 'too-far') {
+      this.emit('SORTER_SPAN', [sorter(s.id)], `sorter ${s.id}: its ends are ${num(problem.meters)} m apart, farther than the ${num(reach)} m reach`, MIRROR_INSERTER);
+    } else if (problem?.kind === 'too-close') {
+      this.emit('SORTER_SPAN', [sorter(s.id)], `sorter ${s.id}: its ends are ${num(problem.meters)} m apart, closer than the ${MIN_SORTER_LENGTH_M} m minimum`, MIRROR_INSERTER);
     }
-    return !(d > reach + 1e-9);
+    return problem?.kind !== 'too-far';
   }
 
   // mirrors: BuildTool_Inserter.CheckBuildConditions
   /**
    * Rule 10. The pick-to-drop direction must align with the facing of each building slot (or its reverse) within
-   * 14 degrees (building to building) or 11 degrees (a belt end).
+   * 14 degrees (building to building) or 11 degrees (a belt end): `sorterSkewProblem`.
    */
   private checkSkew(ctx: SorterCtx, pos: { pick: GridPoint; drop: GridPoint }): void {
     const { s } = ctx;
     const slotEnds = ctx.ends.filter((e) => e.slot);
     if (slotEnds.length === 0) return;
-    const limit = ctx.ends.some((e) => e.belt) ? SKEW_LIMIT_BELT_DEG : SKEW_LIMIT_BUILDING_DEG;
-    const dx = pos.drop.x - pos.pick.x;
-    const dy = pos.drop.y - pos.pick.y;
-    const len = Math.hypot(dx, dy);
-    if (len < 1e-9) {
+    const problem = sorterSkewProblem(
+      pos.pick,
+      pos.drop,
+      slotEnds.map((e) => e.slot!.dir),
+      ctx.ends.some((e) => e.belt),
+    );
+    if (problem?.kind === 'no-direction') {
       this.emit(
         'SORTER_SKEW',
         [sorter(s.id)],
-        `sorter ${s.id}: its ends are at one point in the plan (no horizontal direction), so it cannot face along a slot (limit ${limit} degrees)`,
+        `sorter ${s.id}: its ends are at one point in the plan (no horizontal direction), so it cannot face along a slot (limit ${problem.limitDeg} degrees)`,
         MIRROR_INSERTER,
       );
-      return;
-    }
-    let worst = 0;
-    let worstEnd = slotEnds[0];
-    for (const end of slotEnds) {
-      const cos = Math.min(1, Math.abs(dx * end.slot!.dir[0] + dy * end.slot!.dir[1]) / len);
-      const angle = (Math.acos(cos) * 180) / Math.PI;
-      if (angle > worst) {
-        worst = angle;
-        worstEnd = end;
-      }
-    }
-    if (worst > limit + 1e-9) {
+    } else if (problem?.kind === 'skew') {
+      const worstEnd = slotEnds[problem.facing];
       this.emit(
         'SORTER_SKEW',
         [sorter(s.id)],
-        `sorter ${s.id}: its direction is ${worst.toFixed(1)} degrees off the facing of slot ${worstEnd.slotIndex} of ` +
-          `${label(worstEnd.building!)}; the limit is ${limit} degrees`,
+        `sorter ${s.id}: its direction is ${problem.degrees.toFixed(1)} degrees off the facing of slot ${worstEnd.slotIndex} of ` +
+          `${label(worstEnd.building!)}; the limit is ${problem.limitDeg} degrees`,
         MIRROR_INSERTER,
       );
     }
