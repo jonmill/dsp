@@ -46,16 +46,17 @@ export interface SimOptions {
    * `MAX_WARMUP_TICKS` or more is no cap) if the target has not reached its rate by then: the run ends with a
    * `WarmupNotSettled` and nothing is measured. A run
    * that does settle before the cap warms up for exactly as long as it would without it and measures the same, so a
-   * layout it passes is one that the run without the cap passes too. Ignored when `warmupTicks` is given.
+   * layout it passes is one that the run without the cap passes too. The warm-up that `acceptable` asks for never goes
+   * beyond it either. Ignored when `warmupTicks` is given.
    */
   warmupCapTicks?: number;
   /**
-   * Whether a result needs no more waiting (for `validateLayout`: that it passes). Asked after each measurement of an
-   * adaptive warm-up. When it says no and a belt or a machine's product buffer was still filling over the window (it
-   * gained 1 % of its capacity per 36000 ticks and was not full when the window began), the run warms up on, 36000 ticks at a
-   * time while one still fills, and measures again when it has run a quarter more ticks than it had (or nothing fills any
-   * more), up to `MAX_FILL_WARMUP_TICKS` in all: a start-up that is still going on has not been judged. Omitted: the first
-   * measurement stands. Ignored when `warmupTicks` is given.
+   * Whether a result needs no more waiting (for `validateLayout`: that it passes). Asked once, after the measurement that
+   * follows the adaptive warm-up. When it says no and the block is still filling, the run warms up on (no verdict in between)
+   * until it is not or `MAX_FILL_WARMUP_TICKS` (or `warmupCapTicks`, if less) is reached, and then measures again as it did
+   * the first time: that measurement is the result. A block is still filling if the total of what its belts and machines
+   * hold grew in each of the last two windows of 36000 ticks by more than its jitter allows (see `stillFilling`). Omitted: the
+   * first measurement stands. Ignored when `warmupTicks` is given.
    */
   acceptable?: (result: SimResult) => boolean;
 }
@@ -143,25 +144,27 @@ const WARMUP_WINDOW_TICKS = 3600;
  */
 export const MAX_WARMUP_TICKS = 72000;
 /**
- * The longest a run with `SimOptions.acceptable` warms up (1250 game minutes, 21 hours). A producer with slack fills the belt
- * of its product at its surplus, and a stage that shares a scarce input with it runs short meanwhile. A proliferated
- * High-Explosive Shell Set sized to 98 % of its Refined Oil starves the Plastic stage for 80 game minutes while the Sulfuric Acid
- * belt (232 cargo, 0.06 cargo/s of surplus) fills, and then reads 103 % (the first 20 game minutes read 95 % of a layout that is
- * right). A proliferated Quantum Chip, whose machines upstream on a shared belt run flat out and starve the ones behind, so
- * that the nets of the first fill at 4 cargo a minute, reads 96 % at 5 game hours, 100 % at 14 and 102 % at 21.
+ * The longest a run with `SimOptions.acceptable` warms up (1250 game minutes, 21 hours), whatever is still filling. A producer
+ * with slack fills the belt of its product at its surplus, and a stage that shares a scarce input with it runs short meanwhile:
+ * a proliferated High-Explosive Shell Set sized to 98 % of its Refined Oil starves the Plastic stage for 80 game minutes while the
+ * Sulfuric Acid belt (232 cargo, 0.06 cargo/s of surplus) fills, and then reads 103 %; the first 20 game minutes read 95 % of a
+ * layout that is right.
  */
 export const MAX_FILL_WARMUP_TICKS = 4_500_000;
-/** Ticks a run with `SimOptions.acceptable` warms up on for at a time while a stock still fills (10 game minutes). */
-const FILL_STEP_TICKS = 36000;
+/** The total of what the belts and machines hold is sampled this often (10 game seconds), by a run with `acceptable`. */
+const STORED_SAMPLE_TICKS = 600;
 /**
- * A stock (a belt, or the product buffer of a machine) still fills if it gained this share of its capacity per
- * `FILL_STEP_TICKS` over a stretch of ticks...
+ * The windows `stillFilling` compares are this long (10, 40 and 160 game minutes), or half of what the run has been so far if
+ * that is less: a fill that is slow beside the jitter of the total shows in a longer window, in which the jitter, that does not
+ * grow with the length, is smaller beside the growth, that does.
  */
-const FILL_GAIN = 0.01;
-/** ...and held less than this share of its capacity when the stretch began (the stretch that fills it up is still a start-up). */
-const FILL_FULL = 0.97;
-/** A run that waits for a stock to fill measures again each time it has run this share more ticks than at the last measurement. */
-const FILL_MEASURE_GROWTH = 0.25;
+const FILL_WINDOW_TICKS = [36000, 144000, 576000] as const;
+/** A run with `acceptable` that waits for a start-up to end looks again after this many ticks (10 game minutes). */
+const FILL_STEP_TICKS = 36000;
+/** A window counts as having filled if the total grew by more than this many times the jitter of the total (what a straight line fitted to the window leaves over)... */
+const FILL_SIGMAS = 1.5;
+/** ...and by at least this much (cargo and items): the smallest plans swing by 5, a fill of fewer than 10 in 10 game minutes is none that matters. */
+const FILL_MIN = 10;
 /** `SimOptions.shouldAbort` is asked this often (10 game seconds). */
 export const ABORT_CHECK_TICKS = 600;
 /** Two consecutive warm-up windows that each make this share of the provisioned rate end the adaptive warm-up. */
@@ -280,11 +283,21 @@ export function runSimulation(
   const targetItem = plan.request.targetItemId;
 
   const shouldAbort = opts.shouldAbort;
+  // A run that may warm up longer follows what the belts and machines hold: the total at the end of every sample.
+  const beltSims = [...world.belts.values()];
+  const storedNow = (): number => {
+    let sum = 0;
+    for (const b of beltSims) sum += b.cargoCount();
+    for (const m of machines.list) sum += m.machine.stored();
+    return sum;
+  };
+  const stored: number[] | undefined = opts.acceptable && opts.warmupTicks === undefined ? [] : undefined;
   /** `n` ticks, asking `shouldAbort` now and then. */
   const runTicks = (n: number): void => {
     for (let t = 0; t < n; t++) {
       if (shouldAbort && t % ABORT_CHECK_TICKS === 0 && shouldAbort()) throw new SimulationAborted();
       world.tick();
+      if (stored && world.ticks % STORED_SAMPLE_TICKS === 0) stored.push(storedNow());
     }
   };
 
@@ -313,22 +326,12 @@ export function runSimulation(
     }
     if (!settled && opts.warmupCapTicks !== undefined && opts.warmupCapTicks < MAX_WARMUP_TICKS) throw new WarmupNotSettled(warmupTicksUsed);
   }
-  // What can fill during a start-up: the belts, and the product buffers of the machines (a smelter holds 100 items).
-  const stocks: { level: () => number; capacity: number }[] = [
-    ...[...world.belts.values()].map((b) => ({ level: () => b.cargoCount(), capacity: b.capacity() })),
-    ...machines.list.map((m) => ({ level: () => m.machine.outputLevel(), capacity: m.machine.outputCapacity() })),
-  ];
-  const levels = (): number[] => stocks.map((s) => s.level());
-  /** Whether any stock gained `FILL_GAIN` of its capacity per `FILL_STEP_TICKS` in the `ticks` since it held `before`, not being full then. */
-  const filledSince = (before: readonly number[], ticks: number): boolean =>
-    stocks.some((stock, i) => before[i] < FILL_FULL * stock.capacity && stock.level() - before[i] >= FILL_GAIN * stock.capacity * (ticks / FILL_STEP_TICKS));
   /** Measure `measureTicks` more ticks: the counters start from zero, the block from the state it is in. */
-  const measure = (): { result: SimResult; filling: boolean } => {
+  const measure = (): SimResult => {
     for (const m of machines.list) m.machine.resetStats();
     const coatersAtStart = coaters.map((c) => ({ sprayed: c.sprayedItems, taken: c.proliferatorTaken }));
     const receivedAtStart = new Map<number, number>();
     for (const id of [targetItem, ...exportItems]) receivedAtStart.set(id, received(id));
-    const fillAtStart = levels();
     sumTick = 0;
     sumIdleTick = 0;
     streak = 0;
@@ -336,7 +339,6 @@ export function runSimulation(
     measuring = true;
     runTicks(measureTicks);
     measuring = false;
-    const filling = filledSince(fillAtStart, measureTicks);
 
     const rate = (itemId: number): number => (received(itemId) - (receivedAtStart.get(itemId) ?? 0)) / measureSeconds;
     const machineStats: MachineStat[] = machines.list.map((m) => ({
@@ -365,49 +367,82 @@ export function runSimulation(
     });
 
     return {
-      filling,
-      result: {
-        measuredTargetRate: rate(targetItem),
-        measuredExports: exportItems.map((itemId) => ({ itemId, perSecond: rate(itemId) })),
-        machineStats,
-        stageStats,
-        coaters: { count: coaters.length, sprayedItems, proliferatorPerSecond: proliferatorTaken / measureSeconds },
-        deadlocked: expectsOutput && longestStreak >= DEADLOCK_TICKS,
-        power: {
-          steadyW: (sumTick / measureTicks) * tps,
-          idleW: (sumIdleTick / measureTicks) * tps,
-          peakW: peakTick * tps + stationChargeW,
-          stationChargeW,
-        },
-        measureSeconds,
-        warmupTicksUsed,
-        warnings,
+      measuredTargetRate: rate(targetItem),
+      measuredExports: exportItems.map((itemId) => ({ itemId, perSecond: rate(itemId) })),
+      machineStats,
+      stageStats,
+      coaters: { count: coaters.length, sprayedItems, proliferatorPerSecond: proliferatorTaken / measureSeconds },
+      deadlocked: expectsOutput && longestStreak >= DEADLOCK_TICKS,
+      power: {
+        steadyW: (sumTick / measureTicks) * tps,
+        idleW: (sumIdleTick / measureTicks) * tps,
+        peakW: peakTick * tps + stationChargeW,
+        stationChargeW,
       },
+      measureSeconds,
+      warmupTicksUsed,
+      warnings,
     };
   };
 
   let measured = measure();
   const acceptable = opts.acceptable;
-  if (acceptable && opts.warmupTicks === undefined) {
-    // A start-up still going on (a stock filling) has not been judged: warm up on while something fills, measure again, and so
-    // on until the result is acceptable, nothing fills any more or the limit is reached. The ticks of a window that is judged
-    // short were warm-up as far as the next one is concerned.
-    while (measured.filling && !acceptable(measured.result) && warmupTicksUsed + measureTicks + FILL_STEP_TICKS <= MAX_FILL_WARMUP_TICKS) {
-      warmupTicksUsed += measureTicks;
-      // until nothing fills any more, but measured again when a quarter more has been run than before: a block that is right
-      // by then is not waited for to the end, and the windows measured are few
-      const until = warmupTicksUsed + Math.max(FILL_STEP_TICKS, FILL_MEASURE_GROWTH * warmupTicksUsed);
-      let going = true;
-      while (going && warmupTicksUsed < until && warmupTicksUsed + FILL_STEP_TICKS + measureTicks <= MAX_FILL_WARMUP_TICKS) {
-        const before = levels();
+  if (stored && acceptable && !acceptable(measured)) {
+    // A start-up still going on has not been judged. The window just measured was warm-up as far as the next one is concerned;
+    // the run warms up on, a window at a time, while the total stored in belts and machines keeps growing and the limit allows,
+    // and then measures as it did the first time. That measurement is the result: no window in between is looked at.
+    const limit = Math.min(MAX_FILL_WARMUP_TICKS, opts.warmupCapTicks ?? Infinity);
+    let used = warmupTicksUsed + measureTicks;
+    if (stillFilling(stored) && used + FILL_STEP_TICKS <= limit) {
+      do {
         runTicks(FILL_STEP_TICKS);
-        warmupTicksUsed += FILL_STEP_TICKS;
-        going = filledSince(before, FILL_STEP_TICKS);
-      }
+        used += FILL_STEP_TICKS;
+      } while (stillFilling(stored) && used + FILL_STEP_TICKS <= limit);
+      warmupTicksUsed = used;
       measured = measure();
     }
   }
-  return measured.result;
+  return measured;
+}
+
+/**
+ * Whether a start-up is still going on, from `stored`, the total of what belts and machines hold sampled every
+ * `STORED_SAMPLE_TICKS`: it is if, for one of the `FILL_WINDOW_TICKS`, the total grew in each of the last two windows of that
+ * length (or half of what there is, if that is less) by more than `FILL_SIGMAS` times its jitter and `FILL_MIN`. The jitter is
+ * what a straight line fitted to the total over the last window leaves over: a block that has settled swings about its level by a
+ * few cargo (a Processor line by 2, a Quantum Chip plan by 60-90) and a window that grew by no more than that proves nothing. (The
+ * fast fill of the first minutes bends the total in the window before the last, which it would otherwise count as jitter.)
+ */
+export function stillFilling(stored: readonly number[]): boolean {
+  const last = stored.length - 1;
+  const seen = new Set<number>();
+  for (const ticks of FILL_WINDOW_TICKS) {
+    const w = Math.min(ticks / STORED_SAMPLE_TICKS, Math.floor(last / 2));
+    if (w < 4 || seen.has(w)) continue;
+    seen.add(w);
+    const needs = Math.max(FILL_MIN, FILL_SIGMAS * lineResidual(stored, last - w, last));
+    if (stored[last] - stored[last - w] > needs && stored[last - w] - stored[last - 2 * w] > needs) return true;
+  }
+  return false;
+}
+
+/** The standard deviation of `values[from..to]` about the least-squares straight line through them. */
+function lineResidual(values: readonly number[], from: number, to: number): number {
+  const n = to - from + 1;
+  let mean = 0;
+  for (let i = from; i <= to; i++) mean += values[i];
+  mean /= n;
+  const centre = (n - 1) / 2;
+  let sxx = 0;
+  let sxy = 0;
+  for (let i = 0; i < n; i++) {
+    sxx += (i - centre) ** 2;
+    sxy += (i - centre) * (values[from + i] - mean);
+  }
+  const slope = sxy / sxx;
+  let sumSquares = 0;
+  for (let i = 0; i < n; i++) sumSquares += (values[from + i] - mean - slope * (i - centre)) ** 2;
+  return Math.sqrt(sumSquares / Math.max(1, n - 2));
 }
 
 /** One tick's power demand, in J/tick, and the part of it that is idle draw. Reports to the world as it is added. */

@@ -57,7 +57,6 @@ describe('BeltSim movement', () => {
         belt.tryInsertAtHead(cargo());
       }
       expect(belt.cargoCount()).toBe(Math.floor(length / 10));
-      expect(belt.capacity()).toBe(belt.cargoCount()); // a packed belt holds what it can
       const cells = belt.cargoCells();
       for (let i = 1; i < cells.length; i++) expect(cells[i] - cells[i - 1]).toBe(10);
       expect(cells[cells.length - 1]).toBe(length - 10);

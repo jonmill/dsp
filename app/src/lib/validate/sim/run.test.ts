@@ -3,7 +3,7 @@ import { GameDataIndex } from '../../data';
 import type { Layout } from '../../geometry';
 import { checkSimulation } from '../report';
 import { codesOf, fixtureData, fixtureEffects, ITEM, LayoutKit, line, only, onNode, onSlot, planOf, refineryLayout, smelterRowLayout, stationConfig, stationPairLayout } from '../testkit';
-import { ABORT_CHECK_TICKS, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, runSimulation, SimulationAborted, WarmupNotSettled } from './run';
+import { ABORT_CHECK_TICKS, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, runSimulation, SimulationAborted, stillFilling, WarmupNotSettled } from './run';
 import type { SimResult } from './run';
 
 const TPS = 60;
@@ -192,8 +192,8 @@ describe('runSimulation: a start-up that is still going on', () => {
   /**
    * Six smelters take all 6 ore/s of a Mk.I belt. A decoy upstream of them makes 0.12 ingots/s into a dead-end belt of
    * `storeNodes` nodes (2 cargo each) and takes 0.12 ore/s from the six until the store is full: they make 98 % of the
-   * plan in the meantime, 100 % after. A 200-node store fills in 3300 s (200000 ticks); a 2000-node one does not within
-   * the longest warm-up.
+   * plan in the meantime, 100 % after. A 200-node store fills in 3300 s (200000 ticks), its smelter's own 100 items a little
+   * later; a 2000-node one does not within the longest warm-up.
    */
   function decoyRow(storeNodes: number): { layout: Layout; plan: Parameters<typeof runSimulation>[1]; data: GameDataIndex } {
     const raw = structuredClone(fixtureData.data);
@@ -207,8 +207,10 @@ describe('runSimulation: a start-up that is still going on', () => {
   }
   const passes = (sim: SimResult, row: ReturnType<typeof decoyRow>): boolean =>
     checkSimulation(sim, row.layout, row.plan, row.data).length === 0;
+  const plainAt = (row: ReturnType<typeof decoyRow>, warmupTicks: number): SimResult =>
+    runSimulation(row.layout, row.plan, row.data, fixtureEffects, { warmupTicks });
 
-  it('is measured as it is when nobody asks: the 20-minute warm-up ends with the belt still filling, and the plan reads short', () => {
+  it('is measured as it is when nobody asks: the 20-minute warm-up ends with the store still filling, and the plan reads short', () => {
     const row = decoyRow(200);
     const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, {});
     expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
@@ -216,46 +218,93 @@ describe('runSimulation: a start-up that is still going on', () => {
     expect(passes(sim, row)).toBe(false);
   });
 
-  it('warms up on while a belt fills and the result is not acceptable, then measures the finished start-up', () => {
+  it('a failing result of a block that is still filling is not the verdict: it warms up until the stored total stops growing and measures as a plain run does', () => {
     const row = decoyRow(200);
-    const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: (r) => passes(r, row) });
-    expect(sim.warmupTicksUsed).toBeGreaterThan(200000);
+    const verdicts: SimResult[] = [];
+    const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: (r) => (verdicts.push(r), passes(r, row)) });
+    expect(verdicts).toHaveLength(1); // asked about the first measurement only
+    expect(passes(verdicts[0], row)).toBe(false);
+    expect(sim.warmupTicksUsed).toBeGreaterThan(200000); // the store is full at 3300 s
     expect(sim.warmupTicksUsed).toBeLessThan(MAX_FILL_WARMUP_TICKS);
-    expect(sim.measuredTargetRate).toBeGreaterThan(5.99);
     expect(passes(sim, row)).toBe(true);
-  });
+    expect(sim.measuredTargetRate).toBeGreaterThan(5.99);
+    // the result is what a plain run measures after that warm-up: no window in between was looked at
+    expect(sim).toEqual(plainAt(row, sim.warmupTicksUsed));
+  }, 60_000);
 
-  it('is asked after the 20-minute warm-up: a yes leaves the first measurement alone, a no waits and asks again, and a later yes ends it', () => {
+  it('a result that passes is left alone, and so is an explicit warm-up', () => {
     const row = decoyRow(200);
     let asked = 0;
     const yes = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: () => (asked++, true) });
     expect(asked).toBe(1);
     expect(yes.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
-    // a no, and a yes the second time: it stops where it asked, a quarter more than the 90000 ticks run by then
-    asked = 0;
-    const later = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: () => ++asked >= 2 });
-    expect(asked).toBe(2);
-    expect(later.warmupTicksUsed).toBeGreaterThan(MAX_WARMUP_TICKS + 18000);
-    expect(later.warmupTicksUsed).toBeLessThan(MAX_WARMUP_TICKS + 18000 + 1.25 * 90000);
-    const settled = smelterRowLayout(3);
-    expect(simulate(settled, { acceptable: () => false })).toEqual(simulate(settled, {})); // nothing fills, so there is nothing to wait for
-  });
-
-  it('stops waiting when nothing fills any more, whatever the verdict, and never passes MAX_FILL_WARMUP_TICKS', () => {
-    const row = decoyRow(200);
-    const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: () => false });
-    expect(sim.warmupTicksUsed).toBeGreaterThan(200000); // the store is full at 3300 s
-    expect(sim.warmupTicksUsed).toBeLessThanOrEqual(MAX_FILL_WARMUP_TICKS);
-    expect(sim.measuredTargetRate).toBeGreaterThan(5.99); // the last window began with the store full
-  });
-
-  it('does not extend an explicit warm-up, and does not wait without a verdict to wait for', () => {
-    const row = decoyRow(200);
     const fixed = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { warmupTicks: 7200, acceptable: () => false });
     expect(fixed.warmupTicksUsed).toBe(7200);
-    const plain = runSimulation(row.layout, row.plan, row.data, fixtureEffects, {});
-    expect(plain.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
   });
+
+  it('a settled block that fails does not extend: its total stored does not grow by more than its jitter, so the normal warm-up stands', () => {
+    const row = smelterRowLayout(3);
+    row.plan.exports = [{ itemId: 1101, perSecond: 5 }]; // the row makes 3/s and has settled by the second window
+    const plain = simulate(row, {});
+    expect(plain.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
+    let asked = 0;
+    const started = performance.now();
+    const asking = simulate(row, { acceptable: () => (asked++, false) });
+    expect(asked).toBe(1);
+    expect(asking).toEqual(plain);
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+
+  it('stillFilling: growth in both of the last two windows beyond the jitter, and not a swing, a step or a level', () => {
+    const ramp = (n: number, per: number, noise = 0): number[] => Array.from({ length: n }, (_, i) => 100 + per * i + (i % 2 === 0 ? noise : -noise));
+    expect(stillFilling(ramp(130, 1))).toBe(true); // +60 per window of 60 samples, no jitter
+    expect(stillFilling(ramp(130, 0))).toBe(false); // a level
+    expect(stillFilling(ramp(130, 0, 5))).toBe(false); // jitter alone
+    expect(stillFilling(ramp(130, 0.02, 5))).toBe(false); // growth of 1 per window under jitter of 5
+    expect(stillFilling(ramp(130, 0.5, 5))).toBe(true); // growth of 30 per window over jitter of 5
+    // one window of growth and then a level (a step), or a swing up and down
+    expect(stillFilling([...Array(65).fill(100), ...Array(65).fill(300)])).toBe(false);
+    expect(stillFilling(Array.from({ length: 130 }, (_, i) => 100 + 50 * Math.sin((i * Math.PI) / 60)))).toBe(false);
+    // a fill that is slow beside the jitter shows only in a longer window: +3 per 100 samples under swings of 3, over 1900 samples
+    const slow = Array.from({ length: 1900 }, (_, i) => 100 + 0.03 * i + 3 * Math.sin(i * 1.7));
+    expect(stillFilling(slow.slice(0, 125))).toBe(false); // the first 12 game hours show 2, under the swing
+    expect(stillFilling(slow)).toBe(true); // two windows of 576000 ticks show 29 each
+    expect(stillFilling(Array.from({ length: 1900 }, (_, i) => 100 + 3 * Math.sin(i * 1.7)))).toBe(false); // the same swing without the fill
+    // too little history to compare two windows
+    expect(stillFilling(ramp(5, 10))).toBe(false);
+    expect(stillFilling([])).toBe(false);
+  });
+
+  it('never goes past warmupCapTicks, however much is still filling; without a cap it does', () => {
+    const row = decoyRow(200);
+    const uncapped = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: (r) => passes(r, row) });
+    expect(uncapped.warmupTicksUsed).toBeGreaterThan(150000);
+    // a cap of MAX_WARMUP_TICKS or more is no cap for the adaptive warm-up (it does not give up), but the extension keeps to it
+    const capped = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { warmupCapTicks: 150000, acceptable: (r) => passes(r, row) });
+    expect(capped.warmupTicksUsed).toBeLessThanOrEqual(150000);
+    expect(capped.warmupTicksUsed).toBeGreaterThan(MAX_WARMUP_TICKS);
+    expect(passes(capped, row)).toBe(false); // still short of the store: it was not allowed to wait
+    expect(capped).toEqual(plainAt(row, capped.warmupTicksUsed));
+    const tight = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { warmupCapTicks: MAX_WARMUP_TICKS, acceptable: (r) => passes(r, row) });
+    expect(tight.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
+  }, 60_000);
+
+  it('is not fooled by a rate that swings about the gate: only the one measurement after the warm-up is the verdict', () => {
+    // four smelters in step on a 30 s recipe: a 45 s window holds one or two batches of each, 0.089/s or 0.178/s of a plan of 0.133/s
+    const raw = structuredClone(fixtureData.data);
+    raw.recipes.find((r) => r.id === 1)!.timeTicks = 1800;
+    const slow = new GameDataIndex(raw);
+    const row = smelterRowLayout(4);
+    row.plan.exports = [{ itemId: 1101, perSecond: 4 / 30 }];
+    row.plan.actualTargetRate = 4 / 30;
+    row.plan.stages[0].craftsPerSecond = 4 / 30;
+    const windows = [1, 2, 3, 4, 5, 6].map((i) => runSimulation(row.kit.layout(), row.plan, slow, fixtureEffects, { warmupTicks: 7200 + 700 * i, measureTicks: 2700 }).measuredTargetRate);
+    expect(Math.max(...windows)).toBeGreaterThan(Math.min(...windows) + 0.05); // it does swing
+    let asked = 0;
+    const sim = runSimulation(row.kit.layout(), row.plan, slow, fixtureEffects, { measureTicks: 2700, acceptable: () => (asked++, false) });
+    expect(asked).toBe(1);
+    expect(sim).toEqual(runSimulation(row.kit.layout(), row.plan, slow, fixtureEffects, { measureTicks: 2700 }));
+  }, 60_000);
 });
 
 describe('runSimulation: deadlock', () => {

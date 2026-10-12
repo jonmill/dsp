@@ -200,17 +200,11 @@ export class MachineSim implements InsertTarget, PickSource {
     return i < 0 ? 0 : this.producedCount[i];
   }
 
-  /** All the products waiting in the buffer. */
-  outputLevel(): number {
+  /** Everything waiting in the buffers: ingredients and products. */
+  stored(): number {
     let sum = 0;
+    for (let i = 0; i < this.servedCount.length; i++) sum += this.servedCount[i];
     for (let j = 0; j < this.producedCount.length; j++) sum += this.producedCount[j];
-    return sum;
-  }
-
-  /** The most products the buffer holds: what a finished craft is let in above (`blockAbove`) and the craft itself. */
-  outputCapacity(): number {
-    let sum = 0;
-    for (let j = 0; j < this.blockAbove.length; j++) sum += this.blockAbove[j] + this.outCounts[j];
     return sum;
   }
 

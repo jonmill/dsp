@@ -64,11 +64,6 @@ export class BeltSim {
     return this.count;
   }
 
-  /** The most cargo the belt holds: its cells over the cargo length. */
-  capacity(): number {
-    return Math.floor(this.length / CARGO_LENGTH);
-  }
-
   /** First cell of the cargo nearest the rear, or -1 on an empty belt. */
   leadCell(): number {
     return this.count === 0 ? -1 : this.pos[this.count - 1];

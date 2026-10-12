@@ -194,17 +194,19 @@ describe('MachineSim output blocking', () => {
     expect(m.state).toBe('blocked');
   });
 
-  it('reports how much product it holds and how much it can: what a start-up fills', () => {
+  it('reports everything it holds in its buffers, ingredients and products: what a start-up fills', () => {
+    const m = machineOf(ASM_MK2, RECIPE.gear);
+    const [ingredient] = m.ingredientItems();
+    expect(m.stored()).toBe(0);
+    serve(m, ingredient, 3);
+    expect(m.stored()).toBe(3);
+    run(m, 2000, { drain: false });
+    expect(m.stored()).toBe(m.produced(GEAR) + m.served(ingredient));
+    expect(m.stored()).toBeGreaterThanOrEqual(10);
     const smelter = machineOf(SMELTER, RECIPE.ingot);
-    expect([smelter.outputLevel(), smelter.outputCapacity()]).toEqual([0, 100]);
     run(smelter, 7000, { drain: false });
-    expect(smelter.outputLevel()).toBe(100);
-    // an assembler holds 10 crafts of gears, 1 gear a craft; a refinery 20 crafts of each of its two products
-    const assembler = machineOf(ASM_MK2, RECIPE.gear);
-    expect([assembler.outputLevel(), assembler.outputCapacity()]).toEqual([0, 10]);
-    run(assembler, 2000, { drain: false });
-    expect(assembler.outputLevel()).toBe(assembler.produced(GEAR));
-    expect(machineOf(REFINERY, RECIPE.refine).outputCapacity()).toBe(20 + 40);
+    expect(smelter.produced(INGOT)).toBe(100);
+    expect(smelter.stored()).toBeGreaterThanOrEqual(100);
   });
 
   it('a refinery stops at 20 crafts of any one product: an undrained byproduct stalls it', () => {
