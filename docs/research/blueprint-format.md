@@ -338,9 +338,10 @@ The observed slot values for non-connected buildings are themselves a detail to 
 - a belt chain carries `1,0,0,1,0,0`.
 - a belt that feeds another belt writes the target's input slot in `outputToSlot`: 1 when it joins from behind (the straight
   run), 2 when it joins from the side (a merge). [TESTED] 0.10.34 sample: record 15 continues record 16 with 1, record 23
-  joins it with 2. A corner node that feeds the next belt can also carry 2 (capsule sample record 101), so the slot alone
-  does not prove a merge; it only tells apart the feeders of one target. The importer (`blueprint/import.ts`) and the
-  builder (`blueprint/build.ts`) use it that way.
+  joins it with 2. A lone feeder can carry 2 as well: record 101 of the capsule sample enters record 215 straight from behind
+  (101 at (15, 22), 215 at (15, 21) heading south) and nothing else feeds 215, yet it writes 2, so the slot alone does not prove
+  a merge; it only tells apart the feeders of one target. The importer (`blueprint/import.ts`) and the builder
+  (`blueprint/build.ts`) use it that way.
 
 Copy the source values exactly. When generating new buildings, use these patterns.
 
