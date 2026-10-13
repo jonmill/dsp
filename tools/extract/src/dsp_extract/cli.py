@@ -64,7 +64,8 @@ EXIT_CODES_HELP = """\
 exit codes:
   0  GameData written (some buildings may use approximate geometry; the summary says how many)
   2  Dyson Sphere Program not found (also what argparse uses for a command line usage error)
-  3  extraction failed and no GameData written (including too many unreadable buildings, see --allow-partial);
+  3  extraction failed and no GameData written (including too many unreadable buildings, see --allow-partial, or any
+     unreadable belt, sorter, logistics station, production building or lab, which --allow-partial does not allow);
      also --strict with report errors, or a crash after the data was written
   4  the extracted GameData failed schema validation, nothing written
   5  --check and a mirrored game method changed or went missing
@@ -76,6 +77,17 @@ SCHEMA_RELATIVE = Path("data") / "schema" / "gamedata.schema.json"
 FINGERPRINTS_FILE = "fingerprints.json"
 ACCEPTED_MARKER = ".accepted"  # in local/decompiled: that decompile's run wrote its GameData and fingerprints
 PARTIAL_LIMIT = 0.25  # more unreadable buildings than this share of all buildings: no GameData without --allow-partial
+# The buildings the planner cannot do without, by item id (stable across game versions): the belts, sorters and logistics stations
+# every layout is made of, and every building that runs a recipe (smelters, assemblers, refineries, chemical plants, colliders, labs).
+# A building whose prefab could not be read has no descriptors, so GameData would have it as kind 'other' and the planner could not
+# use it: an unreadable one of these is fatal whatever its share of all buildings, and --allow-partial does not allow it.
+CORE_BUILDING_ITEMS: dict[int, str] = {
+    **{item_id: "belt" for item_id in (2001, 2002, 2003)},
+    **{item_id: "sorter" for item_id in (2011, 2012, 2013, 2014)},
+    **{item_id: "station" for item_id in (2103, 2104)},
+    **{item_id: "production building" for item_id in (2302, 2303, 2304, 2305, 2308, 2309, 2310, 2315, 2317, 2318, 2319)},
+    **{item_id: "lab" for item_id in (2901, 2902)},
+}
 MAX_FAILED_LISTED = 10
 MAX_DIFF_LINES = 30  # per drift entry on the terminal; the report keeps the whole diff
 MAX_APPROXIMATE_LISTED = 10
@@ -415,9 +427,36 @@ def _building_label(item_id: str, record: dict, locale: dict[str, str]) -> str:
     return f"{locale.get(key, key)} ({item_id})"
 
 
+def _core_item(item_id: str) -> str | None:
+    """What the planner needs the building for (`CORE_BUILDING_ITEMS`), or None if it is not a building it cannot do without."""
+    try:
+        return CORE_BUILDING_ITEMS.get(int(item_id))
+    except ValueError:
+        return None
+
+
 def _guard_partial_data(bundle: RawBundle, report: Report, *, allow_partial: bool) -> None:
-    """Refuse to go on when more than `PARTIAL_LIMIT` of the buildings could not be read, unless `allow_partial`."""
+    """
+    Refuse to go on when a core building (`CORE_BUILDING_ITEMS`) could not be read, whatever the share and whether or not
+    `allow_partial`, or when more than `PARTIAL_LIMIT` of the buildings could not be read, unless `allow_partial`.
+    """
     bad = _unreadable_buildings(report)
+    core = [(item_id, record) for item_id, record in bad if _core_item(item_id) is not None]
+    if core:
+        listed = []
+        for item_id, record in core[:MAX_FAILED_LISTED]:
+            problems = record.get("problems") or []
+            reason = f": {problems[0][:200]}" if problems else ""
+            listed.append(f"  - {_building_label(item_id, record, bundle.locale)} ({_core_item(item_id)}){reason}")
+        if len(core) > MAX_FAILED_LISTED:
+            listed.append(f"  ... and {len(core) - MAX_FAILED_LISTED} more (per_building_geometry in the report lists them all)")
+        raise PartialDataError(
+            f"{len(core)} {'building' if len(core) == 1 else 'buildings'} the planner cannot do without could not be read from "
+            "their game prefab (belts, sorters, logistics stations and the buildings that run recipes are needed whole; "
+            "this is fatal whatever share of all buildings it is, and --allow-partial does not allow it):\n"
+            + "\n".join(listed)
+            + "\nFix the cause (see the report)."
+        )
     total = len(bundle.buildings)
     if not bad or total == 0 or len(bad) / total <= PARTIAL_LIMIT:
         return

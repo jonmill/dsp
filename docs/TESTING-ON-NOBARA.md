@@ -131,7 +131,7 @@ What the options do (from `dsp-extract --help`):
 | `--icons` | Exports the item icons to `app/public/icons/` for the app. A failure here only warns. |
 | `--game-dir PATH` | Where the game is, if Steam discovery does not find it. |
 | `--strict` | Exit 3 after writing if the report has any errors (without it, errors in the report do not change the exit code; the summary still lists them). Use it when you want a failing building read to be impossible to miss. |
-| `--allow-partial` | Write the data even if more than 25 % of the buildings could not be read from their prefab. Without it that case exits 3 and writes nothing. Only for a look at the damage; never trust the geometry of such a file. |
+| `--allow-partial` | Write the data even if more than 25 % of the buildings could not be read from their prefab. Without it that case exits 3 and writes nothing. Only for a look at the damage; never trust the geometry of such a file. It does not allow an unreadable belt, sorter, logistics station, production building or lab: any one of those exits 3 and writes nothing, however few buildings are unreadable. |
 | `--no-decompile` | Skip `ilspycmd`. |
 | `--check` | After a game patch, see section 8. |
 | `--out DIR`, `--report PATH` | Where the data and the report go (defaults `data/` and `local/extract-report.json`). |

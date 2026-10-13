@@ -636,17 +636,18 @@ def test_summary_counts_extracted_and_approximate_geometry_and_report_entries(re
 
 def test_buildings_whose_prefab_could_not_be_read_are_called_out(repo, monkeypatch, capsys):
     def lossy(install, report, *, decompiled=None, **kwargs):
-        report.set_building(2304, {"name_key": "组装机2", "status": "failed"})
-        report.set_building(2303, {"name_key": "组装机", "status": "partial"})
-        report.error("building 2304 (组装机2): prefab 'x' unreadable, descriptors and geometry lost: boom")
-        return make_bundle()
+        # two buildings the planner can do without: 2501 failed, 2500 only partial
+        report.set_building(PLAIN_BASE + 1, {"name_key": "组装机1", "status": "failed"})
+        report.set_building(PLAIN_BASE, {"name_key": "组装机0", "status": "partial"})
+        report.error(f"building {PLAIN_BASE + 1} (组装机1): prefab 'x' unreadable, descriptors and geometry lost: boom")
+        return bundle_with_buildings(2)
 
     monkeypatch.setattr(cli, "read_bundle", lossy)
     assert run("--allow-partial") == 0  # 1 of 2 buildings is over the partial-data limit
     out = capsys.readouterr().out
     result = out.split("== dsp-extract result ==")[1]
-    assert "1 building" in result and "could not be read" in result and "2304" in result
-    assert "2303" not in result.split("could not be read")[1].splitlines()[0]  # partial ones are only approximate geometry
+    assert "1 building" in result and "could not be read" in result and str(PLAIN_BASE + 1) in result
+    assert str(PLAIN_BASE) not in result.split("could not be read")[1].splitlines()[0]  # partial ones are only approximate geometry
 
 
 def test_check_that_could_not_compare_anything_says_so(repo, monkeypatch, capsys):
@@ -996,14 +997,19 @@ def test_the_game_extra_is_checked_for_no_decompile_and_inspect_too(repo, monkey
 # ---- the partial-data guard (Review Focus 1) --------------------------------------------------------
 
 
+# The ids of the buildings of the share tests: none of them is one the planner cannot do without (`cli.CORE_BUILDING_ITEMS`), so
+# the share of unreadable ones is what decides.
+PLAIN_BASE = 2500
+
+
 def bundle_with_buildings(count: int) -> RawBundle:
     bundle = make_bundle()
     bundle.items = [bundle.items[0]] + [
-        {"id": 2300 + i, "name": f"组装机{i}", "type": "PRODUCTION", "stackSize": 50, "gridIndex": 2200 + i, "canBuild": True, "modelIndex": 5}
+        {"id": PLAIN_BASE + i, "name": f"组装机{i}", "type": "PRODUCTION", "stackSize": 50, "gridIndex": 2200 + i, "canBuild": True, "modelIndex": 5}
         for i in range(count)
     ]
     bundle.locale = {"铁块": "Iron Ingot", **{f"组装机{i}": f"Assembler {i}" for i in range(count)}}
-    bundle.buildings = [assembler(2300 + i, extracted=True) for i in range(count)]
+    bundle.buildings = [assembler(PLAIN_BASE + i, extracted=True) for i in range(count)]
     return bundle
 
 
@@ -1021,8 +1027,8 @@ def patch_unreadable(monkeypatch, count: int, bad: set[int], *, flag: str = "sta
                 else:
                     record["status"] = "partial"
                     record["unreadable"] = True
-                report.error(f"building {2300 + i}: " + record["problems"][0], item_id=2300 + i)
-            report.set_building(2300 + i, record)
+                report.error(f"building {PLAIN_BASE + i}: " + record["problems"][0], item_id=PLAIN_BASE + i)
+            report.set_building(PLAIN_BASE + i, record)
         return copy.deepcopy(template)
 
     monkeypatch.setattr(cli, "read_bundle", fake)
@@ -1048,7 +1054,7 @@ def test_more_than_a_quarter_unreadable_exits_3_and_writes_no_game_data(repo, mo
     assert "No GameData was written" in err
     assert str(repo / "local" / "extract-report.json") in err
     report = load_report(repo)  # the report is written, with the per-building records
-    assert report["per_building_geometry"]["2300"]["status"] == "failed"
+    assert report["per_building_geometry"][str(PLAIN_BASE)]["status"] == "failed"
     assert any("3 of 8 buildings" in e["message"] for e in report["entries"] if e["level"] == "error")
     assert "output" not in report
 
@@ -1085,12 +1091,12 @@ def test_the_guard_applies_before_a_schema_or_normalize_failure_can_hide_it(repo
     assert "--allow-partial" in capsys.readouterr().err
 
 
-def test_the_guard_works_through_the_real_reader_when_a_prefab_is_missing(repo, monkeypatch, capsys):
+def _real_reader_with_a_missing_prefab(repo, monkeypatch, item_id: int) -> None:
     env = build_game_env()
     for obj in env.objects.values():
         if obj.script == "ItemProtoSet":
             obj.tree["dataArray"].append(
-                {"ID": 2011, "Name": "分拣器", "Type": 5, "StackSize": 50, "GridIndex": 1, "CanBuild": True, "ModelIndex": 41}
+                {"ID": item_id, "Name": "分拣器", "Type": 5, "StackSize": 50, "GridIndex": 1, "CanBuild": True, "ModelIndex": 41}
             )
         if obj.script == "ModelProtoSet":
             obj.tree["dataArray"].append({"ID": 41, "Name": "分拣器", "PrefabPath": "Entities/Prefabs/missing"})
@@ -1098,11 +1104,109 @@ def test_the_guard_works_through_the_real_reader_when_a_prefab_is_missing(repo, 
     monkeypatch.setattr(cli, "locate_game", lambda *a: game)
     monkeypatch.setattr(cli, "read_bundle", lambda inst, report, **kw: unity_reader.read_bundle(inst, report, adapter=env, **kw))
 
+
+def test_the_guard_works_through_the_real_reader_when_a_prefab_is_missing(repo, monkeypatch, capsys):
+    _real_reader_with_a_missing_prefab(repo, monkeypatch, 2201)  # a Tesla Tower: one of the two buildings is 50 %
     assert run() == 3  # one of the two buildings has no prefab
     err = capsys.readouterr().err
-    assert "1 of 2 buildings" in err and "2011" in err and "missing" in err
+    assert "1 of 2 buildings" in err and "2201" in err and "missing" in err
     assert not any(p.name.startswith("dsp-") for p in (repo / "data").iterdir())
-    assert load_report(repo)["per_building_geometry"]["2011"]["unreadable"] is True
+    assert load_report(repo)["per_building_geometry"]["2201"]["unreadable"] is True
+
+
+def test_a_missing_prefab_of_a_sorter_is_fatal_through_the_real_reader_too(repo, monkeypatch, capsys):
+    _real_reader_with_a_missing_prefab(repo, monkeypatch, 2011)
+    assert run() == 3
+    err = capsys.readouterr().err
+    assert "cannot do without" in err and "2011" in err and "sorter" in err and "missing" in err
+    assert not any(p.name.startswith("dsp-") for p in (repo / "data").iterdir())
+
+
+# ---- an unreadable core building is fatal whatever the share (final review, M7) -----------------------------
+
+
+CORE_BUILDINGS = [
+    (2001, "belt"),
+    (2003, "belt"),
+    (2011, "sorter"),
+    (2014, "sorter"),
+    (2103, "station"),
+    (2104, "station"),
+    (2302, "production building"),
+    (2303, "production building"),
+    (2309, "production building"),
+    (2318, "production building"),
+    (2901, "lab"),
+    (2902, "lab"),
+]
+
+
+def patch_unreadable_ids(monkeypatch, bad: set[int], *, plain: int = 39) -> None:
+    """`plain` ordinary buildings, all readable, and the buildings with the ids in `bad`, recorded as unreadable."""
+    template = bundle_with_buildings(plain)
+    ids = [PLAIN_BASE + i for i in range(plain)] + sorted(bad)
+    template.items += [
+        {"id": i, "name": f"核心{i}", "type": "PRODUCTION", "stackSize": 50, "gridIndex": 2200 + i % 100, "canBuild": True, "modelIndex": 5}
+        for i in sorted(bad)
+    ]
+    template.locale.update({f"核心{i}": f"Core {i}" for i in bad})
+    template.buildings += [assembler(i, extracted=True) for i in sorted(bad)]
+
+    def fake(install, report, *, decompiled=None, **kwargs):
+        for i in ids:
+            record = {"name_key": f"核心{i}" if i in bad else f"组装机{i - PLAIN_BASE}", "model_index": 5, "status": "extracted", "problems": []}
+            if i in bad:
+                record["status"] = "failed"
+                record["problems"] = [f"prefab 'Entities/Prefabs/core{i}' unreadable, descriptors and geometry lost: boom {i}"]
+                report.error(f"building {i}: " + record["problems"][0], item_id=i)
+            report.set_building(i, record)
+        return copy.deepcopy(template)
+
+    monkeypatch.setattr(cli, "read_bundle", fake)
+
+
+@pytest.mark.parametrize(("item_id", "what"), CORE_BUILDINGS)
+def test_one_unreadable_core_building_is_fatal_though_it_is_a_tiny_share(repo, monkeypatch, capsys, item_id, what):
+    patch_unreadable_ids(monkeypatch, {item_id})  # 1 of 40: 2.5 %, far under the 25 % limit
+    assert run() == 3
+    assert not output_file(repo).exists()
+    err = capsys.readouterr().err
+    assert f"Core {item_id} ({item_id})" in err and f"boom {item_id}" in err  # which one, and why
+    assert what in err and "planner cannot" in err  # and why it matters
+    assert "No GameData was written" in err
+    assert str(repo / "local" / "extract-report.json") in err
+    report = load_report(repo)
+    assert report["per_building_geometry"][str(item_id)]["status"] == "failed"
+    assert any(str(item_id) in e["message"] for e in report["entries"] if e["level"] == "error")
+
+
+def test_allow_partial_does_not_let_an_unreadable_core_building_through(repo, monkeypatch, capsys):
+    patch_unreadable_ids(monkeypatch, {2303})
+    assert run("--allow-partial") == 3
+    assert not output_file(repo).exists()
+    assert "Core 2303" in capsys.readouterr().err
+
+
+def test_all_the_unreadable_core_buildings_are_listed_with_the_others_after_them(repo, monkeypatch, capsys):
+    patch_unreadable_ids(monkeypatch, {2011, 2103, 2303})
+    assert run() == 3
+    err = capsys.readouterr().err
+    assert "3 buildings" in err
+    assert err.index("Core 2011") < err.index("Core 2103") < err.index("Core 2303")
+
+
+def test_an_unreadable_building_that_is_not_core_is_still_only_a_share_matter(repo, monkeypatch, capsys):
+    patch_unreadable_ids(monkeypatch, {2201})  # a Tesla Tower: 1 of 40
+    assert run() == 0
+    assert output_file(repo).is_file()
+    assert "1 building could not be read" in capsys.readouterr().out
+
+
+def test_a_readable_core_building_is_no_problem(repo, monkeypatch):
+    patch_unreadable_ids(monkeypatch, set())
+    template = bundle_with_buildings(3)
+    template.items += [{"id": 2303, "name": "组装机", "type": "PRODUCTION", "stackSize": 50, "gridIndex": 2203, "canBuild": True, "modelIndex": 5}]
+    assert run() == 0
 
 
 def test_strict_still_fails_after_writing_when_partial_data_was_allowed(repo, monkeypatch):
