@@ -1,6 +1,6 @@
 <script lang="ts">
   import type { SolveResult } from '../lib/layout/solver';
-  import { formatCount, formatDuration } from './format';
+  import { formatCount, formatDuration, noLayoutMessage } from './format';
   import type { AppState } from './state.svelte';
 
   let { app }: { app: AppState } = $props();
@@ -27,6 +27,16 @@
     user: 'Stopped by you.',
     exhausted: 'No valid layout was found.',
   };
+
+  // A solve that ended with no layout says why and what to try, with the size of the plan it was for.
+  const noLayout = $derived.by(() => {
+    const result = solve.status === 'done' ? solve.result : null;
+    const plan = solve.plan;
+    if (!result || result.layout || !plan) return null;
+    const machines = plan.stages.reduce((n, stage) => n + stage.machines, 0);
+    const proliferated = plan.request.proliferator.tier !== 0 && plan.proliferatorPerSecond > 0;
+    return noLayoutMessage(result.stoppedBy, machines, proliferated);
+  });
 
   const blockedReason = $derived(
     app.canSolve
@@ -85,10 +95,14 @@
       </div>
     {:else if solve.status !== 'idle'}
       {#if solve.status === 'done' && solve.result}
-        <p class="outcome">
-          {STOPPED[solve.result.stoppedBy]}
-          {#if solve.result.layout}Best layout covers {formatCount(solve.result.footprint ?? 0)} tiles.{/if}
-        </p>
+        {#if noLayout}
+          <div class="callout warn" role="status">{noLayout}</div>
+        {:else}
+          <p class="outcome">
+            {STOPPED[solve.result.stoppedBy]}
+            {#if solve.result.layout}Best layout covers {formatCount(solve.result.footprint ?? 0)} tiles.{/if}
+          </p>
+        {/if}
       {:else if running && !solve.layout}
         <p class="outcome muted">Looking for a first valid layout...</p>
       {/if}

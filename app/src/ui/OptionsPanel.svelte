@@ -213,9 +213,9 @@
         <span class="muted">minutes</span>
       </label>
       <p class="hint">
-        The budget counts from the moment you press Solve. The first valid layout is always completed, even if that
-        takes longer; after that the solver keeps shrinking it until the budget runs out, or earlier when nothing
-        improves. It does not change the plan.
+        The budget counts from the moment you press Solve. A solve that has no valid layout by then stops with a
+        message (very large plans can take the router longer than any budget); once there is a layout, the solver
+        keeps shrinking it until the budget runs out, or earlier when nothing improves. It does not change the plan.
       </p>
       <label class="check">
         <input

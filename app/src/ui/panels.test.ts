@@ -324,6 +324,30 @@ describe('SolvePanel', () => {
     expect(page).toContain('BELT_OVERLAP: boom');
   });
 
+  it('a solve that ran out of its budget with no layout says so, with the size of the plan and what to try', async () => {
+    const { app, finish } = await appWith();
+    await finish({ layout: null, report: null, footprint: null, stoppedBy: 'budget', failures: ['no valid layout within the time budget of 600 s: the ladder tried 2 of its 6 rungs (601 s)'] });
+    const text = textOf(html(SolvePanel, app));
+    expect(text).toMatch(/No valid layout found within the time budget\. This plan has \d+ machines?\./);
+    expect(text).toContain('A longer time budget (in Options) may help.');
+    expect(text).not.toContain('often cannot be routed yet'); // 3 smelters are not a router problem
+    expect(text).toContain('the ladder tried 2 of its 6 rungs'); // the solver's own reason is still listed
+  });
+
+  it('a plan over the router\'s limit is told it often cannot be routed yet', async () => {
+    let answer!: (result: SolveResult) => void;
+    const startSolve: NonNullable<AppDeps['startSolve']> = () => ({ stop: vi.fn(), done: new Promise<SolveResult>((resolve) => (answer = resolve)) });
+    const app = createAppState(data, { startSolve });
+    app.setTarget(IRON_INGOT);
+    app.setQuantity({ kind: 'rate', perSecond: 1500 }); // about 500 smelters
+    await app.whenSettled();
+    app.startSolve();
+    answer({ layout: null, report: null, footprint: null, attempts: 2, validated: 0, stoppedBy: 'budget', failures: [] });
+    await app.whenSolved();
+    const text = textOf(html(SolvePanel, app));
+    expect(text).toMatch(/No valid layout found within the time budget\. This plan has \d+ machines; plans over ~400 machines \(or ~200 with proliferator\) often cannot be routed yet\. Try a lower rate, or split the build\./);
+  });
+
   it('shows the error of a failed solver', async () => {
     const startSolve: NonNullable<AppDeps['startSolve']> = () => {
       throw new Error('Worker is not defined');

@@ -59,6 +59,36 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
 }
 
+/**
+ * Plans of more machines than this often cannot be routed yet (Task 30b): in the deep ladder sweep the routers failed every rung from 391
+ * machines without a proliferator, and the proliferator feed from 208 with one.
+ */
+export const ROUTER_LIMIT_MACHINES = 400;
+export const ROUTER_LIMIT_MACHINES_PROLIFERATED = 200;
+
+/**
+ * What to tell the user when a solve ended with no layout: why it ended, how big the plan is, and what to try. `stoppedBy` is the solver's
+ * (`budget`: its time budget ran out; `user`: stopped by the user; `exhausted`: every rung failed). A plan over the router's limit is
+ * told so; a smaller one is not.
+ */
+export function noLayoutMessage(stoppedBy: 'budget' | 'user' | 'exhausted' | 'early', machines: number, proliferated: boolean): string {
+  const lead =
+    stoppedBy === 'budget'
+      ? 'No valid layout found within the time budget.'
+      : stoppedBy === 'user'
+        ? 'Stopped before a valid layout was found.'
+        : 'No valid layout was found.';
+  const count = `${formatCount(machines)} machine${machines === 1 ? '' : 's'}`;
+  const big = machines > (proliferated ? ROUTER_LIMIT_MACHINES_PROLIFERATED : ROUTER_LIMIT_MACHINES);
+  if (big) {
+    return (
+      `${lead} This plan has ${count}; plans over ~${ROUTER_LIMIT_MACHINES} machines (or ~${ROUTER_LIMIT_MACHINES_PROLIFERATED} with proliferator) ` +
+      'often cannot be routed yet. Try a lower rate, or split the build.'
+    );
+  }
+  return `${lead} This plan has ${count}.${stoppedBy === 'budget' ? ' A longer time budget (in Options) may help.' : ''} Try a lower rate, or split the build.`;
+}
+
 /** English item name; an id GameData does not know is shown as "item <id>" rather than throwing. */
 export function itemName(index: GameDataIndex, id: number): string {
   try {

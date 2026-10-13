@@ -918,6 +918,98 @@ describe('solve', () => {
     }, 120_000);
   });
 
+  describe('the ladder\'s own budget (Task 30b): a plan the router cannot do must not run for hours', () => {
+    /** No power node is unlocked, so every rung of the ladder fails at once, at the power step: a ladder that takes `step` ms a rung. */
+    const noPoles = { ...effects, availableBuildings: new Set([...effects.availableBuildings].filter((i) => ![2201, 2202, 2212].includes(i))) };
+
+    it('stops between rungs when its budget is used up: no layout, stoppedBy budget, the rungs it tried, and a failure that says why', async () => {
+      const fake = fakeClock(1_000);
+      const phases: string[] = [];
+      const result = solve(
+        await ingotPlan(), data, noPoles,
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, ladderBudgetMs: 2_500, now: fake.now },
+        (p) => fake.onProgress(p, (q) => phases.push(q.phase)), () => {}, () => false,
+      );
+      expect(result.stoppedBy).toBe('budget');
+      expect(result.layout).toBeNull();
+      expect(result.attempts).toBeLessThan(6);
+      expect(result.attempts).toBeGreaterThanOrEqual(1);
+      expect(result.failures.at(-1)).toMatch(/^no valid layout within the time budget of 3 s: the ladder tried \d of its 6 rungs/);
+      expect(result.failures.filter((f) => /power/.test(f)).length).toBeGreaterThan(0); // the rungs' own reasons are still there
+      expect(phases.at(-1)).toBe('done');
+    }, 120_000);
+
+    it('without a ladder budget the same ladder tries all six rungs and ends exhausted, as before', async () => {
+      const fake = fakeClock(1_000);
+      const result = solve(
+        await ingotPlan(), data, noPoles,
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, now: fake.now },
+        (p) => fake.onProgress(p), () => {}, () => false,
+      );
+      expect(result.stoppedBy).toBe('exhausted');
+      expect(result.attempts).toBe(6);
+    }, 120_000);
+
+    it('stops inside a long simulation: the abort the ladder gives its validator turns yes at the budget, and the answer is the budget\'s, not the user\'s', async () => {
+      const fake = fakeClock(1_000);
+      const aborts: boolean[] = [];
+      const validate = ((_layout, _plan, _d, _fx, o) => {
+        // a simulation that takes ten seconds of the fake clock and asks for an abort every second of it
+        for (let second = 0; second < 10; second++) {
+          fake.clock.t += 1_000;
+          const abort = (o as ValidateOptions).shouldAbort!();
+          aborts.push(abort);
+          if (abort) throw new SimulationAborted();
+        }
+        throw new Error('the simulation was never told to stop');
+      }) as typeof validateLayout;
+      const result = solve(
+        await ingotPlan(), data, effects,
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, ladderBudgetMs: 5_000, now: fake.now },
+        (p) => fake.onProgress(p), () => {}, () => false, validate,
+      );
+      expect(result.stoppedBy).toBe('budget');
+      expect(result.layout).toBeNull();
+      expect(aborts.indexOf(true)).toBeGreaterThan(0); // it was told no at first, and yes once the clock passed 5 s
+      expect(aborts.indexOf(true)).toBeLessThanOrEqual(5);
+      expect(result.attempts).toBe(1); // no second rung after the stop
+    }, 120_000);
+
+    it('a user stop is still the user\'s, and a layout found inside the budget is the ladder\'s answer as ever', async () => {
+      const fake = fakeClock(1_000);
+      const stopped = solve(
+        await ingotPlan(), data, effects,
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, ladderBudgetMs: 60_000, now: fake.now },
+        (p) => fake.onProgress(p), () => {}, () => true,
+      );
+      expect(stopped.stoppedBy).toBe('user');
+      expect(stopped.failures).toEqual([]);
+      const clock = fakeClock(1_000);
+      const found = solve(
+        await ingotPlan(), data, effects,
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, ladderBudgetMs: 60_000, now: clock.now },
+        (p) => clock.onProgress(p), () => {}, () => false,
+      );
+      expect(found.layout).not.toBeNull();
+      expect(found.report!.pass).toBe(true);
+    }, 120_000);
+
+    it('keeps the layout that passed over the doubled window when the budget ends the ladder (a stop returns what the ladder found)', async () => {
+      const fake = fakeClock(1_000);
+      const v = scripted([nearMiss(), longerWindowPass]);
+      const result = solve(
+        await ingotPlan(), data, effects,
+        // the first rung (1 s of the fake clock) passes over the doubled window, and the budget is gone before the second begins
+        { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, ladderBudgetMs: 1_500, now: fake.now },
+        (p) => fake.onProgress(p), () => {}, () => false, v.fn,
+      );
+      expect(result.layout).not.toBeNull();
+      expect(result.report).toBe(longerWindowPass);
+      expect(result.stoppedBy).toBe('budget');
+      expect(result.failures.some((f) => /no valid layout within/.test(f))).toBe(false); // there is one
+    }, 120_000);
+  });
+
   it('a plain Processor/s plan on default facilities (a slow chain) is accepted only if plain validateLayout accepts it', async () => {
     // Mk.I assemblers, Re-composing Assemblers and Negentropy Smelters: the chain fills over 10 game minutes. The
     // adaptive warm-up used to stop on a plateau at 0.86 of the rate, and a longer warm-up in the solver accepted what

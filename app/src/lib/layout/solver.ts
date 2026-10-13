@@ -8,7 +8,8 @@
 //
 // Fallback ladder. First the constructive placement at margins 3, 4 and 6, in that order, until one candidate passes
 // the full validator: that layout is emitted at once and is the guarantee. Margins this wide route reliably. The
-// ladder is not cut short by the time budget or the early stop (only by the user, who also ends a simulation under way);
+// ladder is not cut short by the time budget or the early stop (only by the user, who also ends a simulation under way, and by
+// `ladderBudgetMs` if the caller sets one: the app does, so that a plan the router cannot do does not run for hours);
 // when every rung fails the result has no layout, `stoppedBy: 'exhausted'` and every violation message in `failures`.
 // Task 27 added two things. A layout that passes only over the doubled measure window of a near miss (`validateGated`)
 // is kept until the three rungs end and a rung that passes the plain window is preferred to it, though it is no smaller:
@@ -90,8 +91,15 @@ import type { RouteParams } from './router';
 import { assignTaps } from './taps';
 
 export interface SolveOptions {
-  /** Milliseconds the improvement loop may run (the fallback ladder is not bound by it). Default 600000. */
+  /** Milliseconds the improvement loop may run (the fallback ladder is not bound by it: see `ladderBudgetMs`). Default 600000. */
   timeBudgetMs: number;
+  /**
+   * Milliseconds the fallback ladder may run before it has a layout. Past it the ladder stops, even inside a routing or a
+   * simulation, with no layout, `stoppedBy: 'budget'` and the failures so far. Default: none, the ladder is the guarantee and only
+   * the user stops it (the sweeps run it alone with `timeBudgetMs: 1`). The app passes its time budget: a plan of hundreds of
+   * machines can take a router an hour a rung and fail every rung (Task 30b), and the user must not wait for that.
+   */
+  ladderBudgetMs?: number;
   seed: number;
   /** The early stop applies from this much elapsed time. Default 30000. */
   minRunMs: number;
@@ -128,7 +136,10 @@ export interface SolveResult {
   attempts: number;
   validated: number;
   stoppedBy: 'budget' | 'early' | 'user' | 'exhausted';
-  /** Why the ladder's margins failed (all violation messages), and any internal error of the improvement loop. */
+  /**
+   * Why the ladder's margins failed (all violation messages), and any internal error of the improvement loop. When the ladder was
+   * stopped by `ladderBudgetMs` the last message says so.
+   */
   failures: string[];
 }
 
@@ -709,23 +720,32 @@ export function* solveSteps(
     adopt(provisional.best);
     progress(`ladder: ${provisional.tag}, over the longer window`);
   };
+  // the user stops the ladder, and so does its own budget when the caller set one (inside a routing or a simulation too)
+  const ladderStop = (): boolean => shouldStop() || (opts.ladderBudgetMs !== undefined && elapsed() >= opts.ladderBudgetMs);
+  /** Ends the ladder where it stands: the user's stop, or the ladder's budget (which says so in `failures`). */
+  const endLadder = (): SolveResult => {
+    takeProvisional();
+    // a stop that is not the ladder's own budget is the user's (the validator throws its abort only when `ladderStop` said yes)
+    if (shouldStop() || opts.ladderBudgetMs === undefined || elapsed() < opts.ladderBudgetMs) return result('user');
+    if (!keeper.best) {
+      failures.push(
+        `no valid layout within the time budget of ${Math.round((opts.ladderBudgetMs ?? 0) / 1000)} s: the ladder tried ${attempts} of its ` +
+          `${rungs.length} rungs (${Math.round(elapsed() / 1000)} s)`,
+      );
+    }
+    return result('budget');
+  };
   for (const [i, rung] of rungs.entries()) {
     // the exact rungs are a second chance for a ladder that found nothing: a layout over the doubled window is enough
     if (provisional && i === LADDER_MARGINS.length) break;
     const { margin } = rung;
     const tag = rung.exact ? `margin ${margin} (exact routes)` : `margin ${margin}`;
     yield;
-    if (shouldStop()) {
-      takeProvisional();
-      return result('user');
-    }
+    if (ladderStop()) return endLadder();
     const placed: MarginPlacement = { placement: constructive(margin), margin };
-    const built = tryBuild(net, placed.placement, shouldStop, rung.exact ? EXACT_ROUTE : {}, rung.exact);
+    const built = tryBuild(net, placed.placement, ladderStop, rung.exact ? EXACT_ROUTE : {}, rung.exact);
     attempts++;
-    if ('stopped' in built) {
-      takeProvisional();
-      return result('user');
-    }
+    if ('stopped' in built) return endLadder();
     if ('failures' in built) {
       const tagged = built.failures.map((f) => `${tag}: ${f}`);
       failures.push(...tagged);
@@ -734,12 +754,9 @@ export function* solveSteps(
       continue;
     }
     validated++;
-    // the ladder is the guarantee: no warm-up cap, and only the user stops it (the budget does not)
-    const accepted = accept(built, placed, shouldStop);
-    if ('stopped' in accepted) {
-      takeProvisional();
-      return result('user');
-    }
+    // the ladder is the guarantee: no warm-up cap, and only the user stops it (the improvement budget does not; `ladderBudgetMs` does)
+    const accepted = accept(built, placed, ladderStop);
+    if ('stopped' in accepted) return endLadder();
     if ('best' in accepted) {
       if (accepted.best.longerWindow) {
         provisional ??= { best: accepted.best, tag };

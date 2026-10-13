@@ -132,7 +132,10 @@ export interface AppState {
   readonly profiles: Readonly<Record<string, number[]>>;
   /** How rates are displayed; the request always holds items per second. */
   readonly rateUnit: 's' | 'min';
-  /** The time budget of a solve, in minutes from its start; the first valid layout is always completed. */
+  /**
+   * The time budget of a solve, in minutes from its start. The fallback ladder is bound by it too: a solve that has no layout by
+   * then stops, with no layout and the reason (`SolveResult.stoppedBy` 'budget'); one that has a layout stops improving it.
+   */
   readonly solverBudgetMinutes: number;
   /**
    * Let the layout solver use the dense motifs (direct insertion, shared-belt sandwich, lab stacks) that have not been
@@ -531,7 +534,7 @@ export function createAppState(data: GameData, deps: AppDeps = {}): AppState {
         current,
         index,
         effects,
-        { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: budgetMs, seed: DEFAULT_SOLVE_OPTIONS.seed + solveRuns++, useUnverifiedMotifs },
+        { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: budgetMs, ladderBudgetMs: budgetMs, seed: DEFAULT_SOLVE_OPTIONS.seed + solveRuns++, useUnverifiedMotifs },
         {
           onProgress: (progress) => {
             if (mine === solveToken) solveProgress = progress;

@@ -11,6 +11,9 @@ import {
   formatRate,
   geometryBadge,
   itemName,
+  noLayoutMessage,
+  ROUTER_LIMIT_MACHINES,
+  ROUTER_LIMIT_MACHINES_PROLIFERATED,
   techLabel,
 } from './format';
 
@@ -158,5 +161,34 @@ describe('formatDuration', () => {
   it('shows a dash for what is not a duration', () => {
     expect(formatDuration(Number.NaN)).toBe('-');
     expect(formatDuration(-1)).toBe('-');
+  });
+});
+
+describe('noLayoutMessage', () => {
+  it('a budget stop of a plan over the router\'s limit names the machines and the limits, and says what to try', () => {
+    expect(noLayoutMessage('budget', 975, false)).toBe(
+      'No valid layout found within the time budget. This plan has 975 machines; plans over ~400 machines (or ~200 with proliferator) often cannot be routed yet. Try a lower rate, or split the build.',
+    );
+  });
+
+  it('the limit is 200 machines with a proliferator and 400 without', () => {
+    expect(ROUTER_LIMIT_MACHINES).toBe(400);
+    expect(ROUTER_LIMIT_MACHINES_PROLIFERATED).toBe(200);
+    expect(noLayoutMessage('budget', 300, true)).toContain('often cannot be routed yet');
+    expect(noLayoutMessage('budget', 300, false)).not.toContain('often cannot be routed yet');
+    expect(noLayoutMessage('budget', 200, true)).not.toContain('often cannot be routed yet');
+    expect(noLayoutMessage('budget', 401, false)).toContain('often cannot be routed yet');
+  });
+
+  it('a smaller plan is not blamed on the router: its message suggests a longer budget on a budget stop only', () => {
+    expect(noLayoutMessage('budget', 38, false)).toBe(
+      'No valid layout found within the time budget. This plan has 38 machines. A longer time budget (in Options) may help. Try a lower rate, or split the build.',
+    );
+    expect(noLayoutMessage('exhausted', 1, false)).toBe('No valid layout was found. This plan has 1 machine. Try a lower rate, or split the build.');
+  });
+
+  it('says who stopped it', () => {
+    expect(noLayoutMessage('user', 500, false)).toMatch(/^Stopped before a valid layout was found\. This plan has 500 machines;/);
+    expect(noLayoutMessage('exhausted', 500, false)).toMatch(/^No valid layout was found\. /);
   });
 });

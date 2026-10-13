@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { ProductionPlan } from '../calc';
-import { startSolve, STOP_GRACE_MS } from './client';
+import { BUDGET_GRACE_MS, budgetMessage, startSolve, STOP_GRACE_MS } from './client';
 import type { WorkerLike } from './client';
 import { deserializeEffects, deserializePlan, serializeEffects, serializePlan } from './protocol';
 import type { ClientMessage, WireSolveOptions, WorkerMessage } from './protocol';
@@ -136,6 +136,67 @@ describe('worker and client', () => {
     const result: SolveResult = await handle.done;
     expect(terminated).toBe(1);
     expect(result).toEqual({ layout, report, footprint: 9, attempts: 4, validated: 2, stoppedBy: 'user', failures: [] });
+  });
+
+  describe('a solve whose ladder has a budget is bound by it (Task 30b)', () => {
+    afterEach(() => vi.useRealTimers());
+    const silentWorker = () => {
+      let deliver: (m: WorkerMessage) => void = () => {};
+      const posted: ClientMessage[] = [];
+      let terminated = 0;
+      const worker: WorkerLike = {
+        post: (m) => posted.push(m),
+        listen: (onMessage) => {
+          deliver = onMessage;
+        },
+        terminate: () => terminated++,
+      };
+      return { worker, say: (m: WorkerMessage) => deliver(m), posted, terminated: () => terminated };
+    };
+    const BUDGET = { ...OPTS, timeBudgetMs: 60_000, ladderBudgetMs: 60_000 };
+
+    it('terminates a worker that is still on the ladder past the budget and the grace, and answers with no layout, stoppedBy budget, and why', async () => {
+      vi.useFakeTimers();
+      const w = silentWorker();
+      const handle = startSolve(await ingotPlan(), data, effects, BUDGET, {}, () => w.worker);
+      w.say({ type: 'progress', progress: { elapsedMs: 5, attempts: 2, validated: 0, bestFootprint: null, phase: 'ladder: margin 4 failed' } });
+      await vi.advanceTimersByTimeAsync(BUDGET.timeBudgetMs + BUDGET_GRACE_MS - 1);
+      expect(w.terminated()).toBe(0);
+      await vi.advanceTimersByTimeAsync(1);
+      const result = await handle.done;
+      expect(w.terminated()).toBe(1);
+      expect(result).toMatchObject({ layout: null, report: null, footprint: null, attempts: 2, stoppedBy: 'budget' });
+      expect(result.failures).toEqual([budgetMessage(60_000, 'ladder: margin 4 failed')]);
+      expect(result.failures[0]).toMatch(/^no valid layout within the time budget of 60 s/);
+    });
+
+    it('answers with the best layout it was sent when it is past the budget in the improvement loop, and names no failure', async () => {
+      vi.useFakeTimers();
+      const w = silentWorker();
+      const handle = startSolve(await ingotPlan(), data, effects, BUDGET, {}, () => w.worker);
+      const layout = { buildings: [], belts: [], sorters: [], meta: { geometrySource: 'approximate' as const, gameVersion: 'x', planTargetItemId: 1, planTargetRate: 1 } };
+      const report = { pass: true, violations: [], checkedAt: '', stage: 'simulation' as const };
+      w.say({ type: 'improved', layout, report, footprint: 9 });
+      await vi.advanceTimersByTimeAsync(BUDGET.timeBudgetMs + BUDGET_GRACE_MS);
+      const result = await handle.done;
+      expect(result).toMatchObject({ layout, report, footprint: 9, stoppedBy: 'budget', failures: [] });
+    });
+
+    it('does nothing to a worker that answers in time, and nothing at all without a ladder budget (the sweeps\' ladder is the guarantee)', async () => {
+      vi.useFakeTimers();
+      const quick = silentWorker();
+      const done = startSolve(await ingotPlan(), data, effects, BUDGET, {}, () => quick.worker);
+      const result: SolveResult = { layout: null, report: null, footprint: null, attempts: 1, validated: 0, stoppedBy: 'exhausted', failures: ['x'] };
+      quick.say({ type: 'done', result });
+      await expect(done.done).resolves.toEqual(result);
+      await vi.advanceTimersByTimeAsync(BUDGET.timeBudgetMs * 2);
+      expect(quick.terminated()).toBe(1); // once, when it answered
+
+      const unbounded = silentWorker();
+      startSolve(await ingotPlan(), data, effects, { ...OPTS, timeBudgetMs: 60_000 }, {}, () => unbounded.worker);
+      await vi.advanceTimersByTimeAsync(3_600_000);
+      expect(unbounded.terminated()).toBe(0);
+    });
   });
 
   it('rejects when the worker reports an error or fails', async () => {

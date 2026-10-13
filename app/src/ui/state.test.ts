@@ -806,6 +806,7 @@ describe('solve', () => {
     expect(runs).toHaveLength(1);
     expect(runs[0].plan).toBe(okPlan(app.plan));
     expect(runs[0].opts.timeBudgetMs).toBe(30_000);
+    expect(runs[0].opts.ladderBudgetMs).toBe(30_000); // the fallback ladder is bound by the budget too: a plan the router cannot do must not hang the app
     expect(runs[0].opts.simulate).toBe(true);
     expect(app.solve.budgetMs).toBe(30_000);
     expect(app.solve.layout).toBeNull();

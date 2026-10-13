@@ -34,6 +34,17 @@ export interface WorkerLike {
  */
 export const STOP_GRACE_MS = 2000;
 
+/**
+ * How long, in milliseconds, past its time budget a solve that set `ladderBudgetMs` may take before the client terminates the
+ * worker and answers with what it has (`stoppedBy: 'budget'`). The solver stops itself at the budget, in the middle of a routing or
+ * a simulation too, so this is the backstop for a step that does not look at the clock (a placement of thousands of machines).
+ */
+export const BUDGET_GRACE_MS = 5000;
+
+/** The message of a solve that ended at its budget with no layout (the solver's own, in `SolveResult.failures`, says the same). */
+export const budgetMessage = (budgetMs: number, phase: string | undefined): string =>
+  `no valid layout within the time budget of ${Math.round(budgetMs / 1000)} s (stopped while: ${phase ?? 'starting'})`;
+
 function browserWorker(): WorkerLike {
   const worker = new Worker(new URL('./worker.ts', import.meta.url), { type: 'module' });
   return {
@@ -61,6 +72,7 @@ export function startSolve(
   const worker = createWorker();
   let settled = false;
   let stopTimer: ReturnType<typeof setTimeout> | undefined;
+  let budgetTimer: ReturnType<typeof setTimeout> | undefined;
   let lastProgress: SolveProgress | undefined;
   let best: { layout: Layout; report: ValidationReport; footprint: number } | undefined;
 
@@ -75,6 +87,7 @@ export function startSolve(
     if (settled) return;
     settled = true;
     if (stopTimer !== undefined) clearTimeout(stopTimer);
+    if (budgetTimer !== undefined) clearTimeout(budgetTimer);
     worker.terminate();
     finish();
   };
@@ -104,6 +117,26 @@ export function startSolve(
 
   worker.post({ type: 'start', plan: serializePlan(plan), data: data.data, effectsSerialized: serializeEffects(effects), opts });
 
+  /** The answer of a worker that is given up on: what it sent last, and who gave up. */
+  const answerWith = (stoppedBy: SolveResult['stoppedBy'], failures: string[]): SolveResult => ({
+    layout: best?.layout ?? null,
+    report: best?.report ?? null,
+    footprint: best?.footprint ?? null,
+    attempts: lastProgress?.attempts ?? 0,
+    validated: lastProgress?.validated ?? 0,
+    stoppedBy,
+    failures,
+  });
+  // A solve whose ladder is bound by a budget is bound by it as a whole: past the budget and the grace the worker is stopped
+  // whatever it is doing, and the answer is its best so far (or no layout, and the reason).
+  if (opts.ladderBudgetMs !== undefined) {
+    const budgetMs = Math.max(opts.timeBudgetMs, opts.ladderBudgetMs);
+    budgetTimer = setTimeout(
+      () => settle(() => resolve(answerWith('budget', best ? [] : [budgetMessage(opts.ladderBudgetMs ?? budgetMs, lastProgress?.phase)]))),
+      budgetMs + BUDGET_GRACE_MS,
+    );
+  }
+
   return {
     done,
     stop: () => {
@@ -111,17 +144,7 @@ export function startSolve(
       worker.post({ type: 'stop' });
       stopTimer = setTimeout(() => {
         // the worker is in the middle of a long candidate: answer with what it has sent
-        settle(() =>
-          resolve({
-            layout: best?.layout ?? null,
-            report: best?.report ?? null,
-            footprint: best?.footprint ?? null,
-            attempts: lastProgress?.attempts ?? 0,
-            validated: lastProgress?.validated ?? 0,
-            stoppedBy: 'user',
-            failures: [],
-          }),
-        );
+        settle(() => resolve(answerWith('user', [])));
       }, STOP_GRACE_MS);
     },
   };
