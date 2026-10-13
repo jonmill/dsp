@@ -19,9 +19,12 @@ What you do, in order:
   whose building footprints and sorter slot positions are **estimates**. The app says so ("Geometry: approximate (fixture
   data)" in the header, a warning above the blueprint, and `[geometry: approximate - unverified in game]` in the
   blueprint's own description). Blueprints made from it may overlap or leave belts unconnected in the game.
-- After the extraction the footprints and slot positions come from the game's prefabs, and the flag goes away once every
+- After the extraction the footprints and slot positions come from the game's prefabs, and the geometry flag goes away once every
   building could be read (any building that could not be read keeps the flag). **No flag does not mean verified.** The yaw and axis convention, the belt and sorter
-  record details and the station port details have never been checked in the game; that is what section 5 is for.
+  record details and the station port details have never been checked in the game; that is what section 5 is for. So the app
+  keeps a second note whatever the data ("Conventions: not yet verified in game" above the blueprint, and
+  `[conventions: yaw and axes not yet verified in game]` in the blueprint's own description) until `CONVENTIONS_VERIFIED` in
+  `app/src/lib/blueprint/build.ts` is set to true, which is for after item 1 of section 5 has come out right.
 - The simulator that validates every layout re-implements the game's logic from decompiled code. It is meant to match
   measured rates within 2 %; that has not been measured yet. Your measurements (section 7) are the first real data.
 
