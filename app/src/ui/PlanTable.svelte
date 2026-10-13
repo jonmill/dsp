@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { headroomMachines, layoutStations, withLayout } from '../lib/calc';
+  import { headroomMachines, layoutStations, surplusExportsIn, withLayout } from '../lib/calc';
   import type { PlanError, ProductionPlan } from '../lib/calc';
   import { provisionedRate } from '../lib/validate/sim/run';
   import { buildingName, formatCount, formatPercent, formatPower, formatRate, itemName } from './format';
@@ -22,7 +22,12 @@
    */
   const laid = $derived(
     app.solve.layout && !app.solve.stale
-      ? { coaters: app.solve.layout.coaters?.length ?? 0, stations: layoutStations(app.solve.layout, app.index) }
+      ? {
+          coaters: app.solve.layout.coaters?.length ?? 0,
+          stations: layoutStations(app.solve.layout, app.index),
+          // the export slots the layout has for a surplus (it deadlocked without them): the plan's own slots do not count these
+          surplusSlots: app.solve.plan ? surplusExportsIn(app.solve.layout, app.solve.plan).length : 0,
+        }
       : null,
   );
   const power = $derived(plan ? (laid ? withLayout(plan.power, laid, app.index) : plan.power) : null);
@@ -87,7 +92,7 @@
           {plan.stages.reduce((n, s) => n + s.machines, 0)} machines,
           {#if laid}
             {laid.stations.length} station{laid.stations.length === 1 ? '' : 's'} in the layout
-            ({plan.stationSlots.length} item slot{plan.stationSlots.length === 1 ? '' : 's'})
+            ({plan.stationSlots.length + laid.surplusSlots} item slot{plan.stationSlots.length + laid.surplusSlots === 1 ? '' : 's'}{#if laid.surplusSlots > 0}, {laid.surplusSlots} of them for a surplus{/if})
           {:else}
             {plan.stationsNeeded} station{plan.stationsNeeded === 1 ? '' : 's'}
             (plan estimate, {plan.stationSlots.length} item slot{plan.stationSlots.length === 1 ? '' : 's'})

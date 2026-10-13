@@ -25,6 +25,7 @@ import {
   layoutStations,
   planProduction,
   plannableProducers,
+  surplusExportsIn,
   withLayout,
 } from '../lib/calc';
 import type { PlanRequest, PlanResult, ProductionPlan, ProliferatorSetting } from '../lib/calc';
@@ -336,9 +337,12 @@ export function makeBlueprint(
   if (plan.imports.length > MAX_DESC_IMPORTS) imports.push('...');
   const power = report?.sim?.power ?? null;
   const estimate = withLayout(plan.power, { coaters: layout.coaters?.length ?? 0, stations: laidStations }, index);
+  // the export slots the layout has for a surplus (it deadlocked without): the player drains them
+  const surplus = surplusExportsIn(layout, plan).map((s) => itemName(index, s.itemId));
   const lines = [
     `${shortDesc}, ${machines} machines, ${stations}${footprint === null ? '' : `, ${Math.round(footprint)} tiles`}.`,
     imports.length > 0 ? `Supplied: ${imports.join(', ')}.` : 'Nothing supplied.',
+    ...(surplus.length > 0 ? [`Surplus export (drain it in game): ${surplus.join(', ')}.`] : []),
     power
       ? `Power (simulated): ${formatPower(power.steadyW)} steady, ${formatPower(power.peakW)} peak.`
       : `Power (estimate): ${formatPower(estimate.steadyW)} steady, ${formatPower(estimate.peakW)} peak.`,

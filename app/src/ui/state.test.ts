@@ -3,12 +3,12 @@ import { loadFixtureGameData } from '../../test/fixtures/fixtureGameData';
 import { planProduction } from '../lib/calc';
 import type { PlanResult, ProductionPlan } from '../lib/calc';
 import { decodeBlueprint } from '../lib/blueprint';
-import { allTechs, techClosure } from '../lib/data';
+import { allTechs, GameDataIndex, techClosure } from '../lib/data';
 import type { SolveResult } from '../lib/layout/solver';
 import { compositeLayout, stationPairLayout } from '../lib/validate/testkit';
 import type { Violation } from '../lib/validate';
 import { formatPower } from './format';
-import { blueprintFileName, createAppState, PROFILES_KEY, UNLOCK_ALL_PROFILE } from './state.svelte';
+import { blueprintFileName, createAppState, makeBlueprint, PROFILES_KEY, UNLOCK_ALL_PROFILE } from './state.svelte';
 import type { AppDeps, AppState } from './state.svelte';
 
 // Pass-through spy: most tests run the real planner, the stale-result tests substitute one call.
@@ -1075,5 +1075,23 @@ describe('blueprintFileName', () => {
     expect(blueprintFileName('Re-composing Assembler', 1.5)).toBe('re-composing-assembler-1.5.txt');
     expect(blueprintFileName('Processor', 0.333333)).toBe('processor-0.333.txt');
     expect(blueprintFileName('???', 2)).toBe('blueprint-2.txt');
+  });
+});
+
+describe('makeBlueprint: the surplus exports of the layout', () => {
+  it('names the items whose belts end at an export slot for a surplus, so the player drains them; a layout without says nothing', async () => {
+    const app = createAppState(data);
+    app.setTarget(IRON_INGOT);
+    await app.whenSettled();
+    const plan = { ...okPlan(app.plan), surplus: [{ itemId: IRON_INGOT, perSecond: 0.5 }] }; // a candidate
+    const index = new GameDataIndex(data);
+    const pair = stationPairLayout();
+    const without = makeBlueprint(pair.kit.layout(), plan, index, 100, null);
+    expect(without.desc).not.toContain('Surplus export');
+    pair.sink.station!.slots[0].itemId = IRON_INGOT; // the layout has an export slot for the candidate
+    const withSink = makeBlueprint(pair.kit.layout(), plan, index, 100, null);
+    expect(withSink.desc).toContain('Surplus export (drain it in game): Iron Ingot.');
+    // a station that holds the item as a plain slot of a plan without candidates is no surplus export
+    expect(makeBlueprint(pair.kit.layout(), okPlan(app.plan), index, 100, null).desc).not.toContain('Surplus export');
   });
 });

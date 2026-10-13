@@ -1,6 +1,7 @@
 <script lang="ts">
+  import { surplusExportsIn } from '../lib/calc';
   import type { SolveResult } from '../lib/layout/solver';
-  import { formatCount, formatDuration, noLayoutMessage } from './format';
+  import { formatCount, formatDuration, itemName, noLayoutMessage, surplusExportNote } from './format';
   import type { AppState } from './state.svelte';
 
   let { app }: { app: AppState } = $props();
@@ -37,6 +38,11 @@
     const proliferated = plan.request.proliferator.tier !== 0 && plan.proliferatorPerSecond > 0;
     return noLayoutMessage(result.stoppedBy, machines, proliferated);
   });
+
+  // A layout the ladder built with surplus exports (it deadlocked without) has export slots the player must drain.
+  const surplusExports = $derived(
+    solve.layout && solve.plan && !solve.stale ? surplusExportsIn(solve.layout, solve.plan).map((s) => itemName(app.index, s.itemId)) : [],
+  );
 
   const blockedReason = $derived(
     app.canSolve
@@ -106,6 +112,9 @@
       {:else if running && !solve.layout}
         <p class="outcome muted">Looking for a first valid layout...</p>
       {/if}
+    {/if}
+    {#if surplusExports.length > 0}
+      <div class="callout" role="status">{surplusExportNote(surplusExports)}</div>
     {/if}
   </div>
 

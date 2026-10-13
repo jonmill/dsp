@@ -88,6 +88,18 @@ export function noLayoutMessage(stoppedBy: 'budget' | 'user' | 'exhausted' | 'ea
   return `${lead}${size}${longer} Try a lower rate, or split the build.`;
 }
 
+/**
+ * What to tell the player about the export slots a layout has for the surplus of `names` (calc/surplus.ts): the solver gave the items a
+ * way out after a deadlock, and the game's slot, unlike the simulator's station, stops at its maximum.
+ */
+export function surplusExportNote(names: readonly string[]): string {
+  const list = names.join(', ');
+  return (
+    `This layout ends the belt of ${list} at a station, in an export slot for the surplus. The simulation takes it without limit, ` +
+    `but the game's slot stops at its maximum: take ${list} out of that slot (or let another station demand it), or the belt backs up.`
+  );
+}
+
 /** English item name; an id GameData does not know is shown as "item <id>" rather than throwing. */
 export function itemName(index: GameDataIndex, id: number): string {
   try {

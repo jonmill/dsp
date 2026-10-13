@@ -14,6 +14,7 @@ import {
   noLayoutMessage,
   ROUTER_LIMIT_MACHINES,
   ROUTER_LIMIT_MACHINES_PROLIFERATED,
+  surplusExportNote,
   techLabel,
 } from './format';
 
@@ -204,5 +205,15 @@ describe('noLayoutMessage', () => {
     expect(noLayoutMessage('user', 500, false)).toMatch(/^Stopped before a valid layout was found\. This plan has 500 machines;/);
     expect(noLayoutMessage('exhausted', 500, false)).toMatch(/^No valid layout was found: every layout attempt failed\. /);
     expect(noLayoutMessage('budget', 500, false)).toMatch(/^No valid layout found within the time budget, with some layout attempts left\. /);
+  });
+});
+
+describe('surplusExportNote', () => {
+  it('says which belts end at a station, that the game\'s slot stops at its maximum, and what to do about it', () => {
+    const note = surplusExportNote(['Hydrogen']);
+    expect(note).toContain('ends the belt of Hydrogen at a station, in an export slot for the surplus');
+    expect(note).toContain("the game's slot stops at its maximum");
+    expect(note).toContain('take Hydrogen out of that slot');
+    expect(surplusExportNote(['Hydrogen', 'Graphene'])).toContain('Hydrogen, Graphene');
   });
 });
