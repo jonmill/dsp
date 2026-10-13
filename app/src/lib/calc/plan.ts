@@ -5,6 +5,14 @@
  * Pipeline: candidate recipes (walk back from the target, drop what cannot be fed) -> facility per
  * recipe -> proliferator multipliers per recipe -> LP (fewest machine-seconds, then fewest imports,
  * then fewest exports) -> stages, flows, imports/exports, station slots, power.
+ *
+ * The spray. Every input of a proliferated stage takes one spray, so a plan spends `Σ inputs / sprays` proliferator items a second,
+ * and normally imports them (an import with no flows: the coaters take them, not stages). A plan that makes the proliferator itself
+ * (it is the target, or some stage makes it for the others) cannot import it: nothing delivers it. The spray is then part of the LP
+ * (each proliferated recipe uses `Σ inputs / sprays` of the item per craft), so the stages that make it are sized for the stages'
+ * use and the coaters' together, and the rate asked for is what is left. That is a fixed point, and it is linear: the spray is a
+ * share of the throughput, so the LP finds it without iterating. `ProductionPlan.selfSpray` says so; the gross product (the rate and
+ * the spray) goes to the station and the coaters' feed draws the spray from its slot (an export slot, as the plan's target's is).
  */
 import type { Building, GameDataIndex, Recipe, RecipeType, TechEffects } from '../data';
 import { solveLP } from './lp';
@@ -352,6 +360,21 @@ class Planner {
     });
   }
 
+  // -- the spray ---------------------------------------------------------------------------
+
+  /**
+   * The proliferator item the plan sprays with when it makes that itself: some candidate recipe makes it and it is not supplied
+   * (the target is never supplied). Undefined without a proliferator, when the item is supplied, or when no stage can make it:
+   * the spray is then an import.
+   */
+  private ownSprayItem(candidates: Recipe[]): number | undefined {
+    const { tier } = this.req.proliferator;
+    if (tier === 0) return undefined;
+    const itemId = proliferatorItemId(tier as 1 | 2 | 3);
+    if (this.supplied.has(itemId)) return undefined;
+    return candidates.some((r) => r.outputs.some((o) => o.itemId === itemId)) ? itemId : undefined;
+  }
+
   // -- facilities --------------------------------------------------------------------------
 
   private checkOverride(recipe: Recipe, buildingItemId: number): Building {
@@ -416,8 +439,11 @@ class Planner {
     const { req, data, effects } = this;
     this.validate();
     const candidates = this.candidateRecipes();
-    const { nodes, required, pin } = this.nodesAndTargetRate(candidates, this.facilities(candidates));
-    const solution = await this.solve(nodes, required, pin);
+    const ownSpray = this.ownSprayItem(candidates);
+    const { nodes, required: asked, pin } = this.nodesAndTargetRate(candidates, this.facilities(candidates));
+    const solution = await this.solve(nodes, asked, pin, ownSpray);
+    // buildings mode of a plan whose product is its own spray: the rate is what the machines deliver net, which the LP found
+    const required = ownSpray === req.targetItemId && pin ? clean(solution.values.q ?? 0) : asked;
 
     const crafts = new Map<number, number>();
     for (const n of nodes) {
@@ -446,27 +472,34 @@ class Planner {
       ...[...exportRate].filter(([itemId]) => itemId !== req.targetItemId).map(([itemId, perSecond]) => ({ itemId, perSecond })),
     ];
 
-    // The proliferator is one more import. It feeds the spray coaters, not a stage, so it has no flows.
+    // The proliferator is one more import. It feeds the spray coaters, not a stage, so it has no flows. Unless the plan makes it
+    // (`ownSpray`): then it is not an import, it comes out of the stations' slot of its own product.
     const { proliferatorPerSecond, warnings } = this.proliferation(stages);
     if (req.suppliedItemIds.has(req.targetItemId)) {
       warnings.push(`${this.itemName(req.targetItemId)} is marked supplied but is the target; it will be produced.`);
     }
     const imports = materials.map((m) => ({ ...m }));
     let sprayItemId: number | undefined;
-    if (proliferatorPerSecond > 0) {
+    let selfSpray: ItemRate | undefined;
+    // what goes to the stations: the exports and, for a spray the plan makes, the spray as well (the feed draws it from the slot)
+    const toStation = new Map(exportRate);
+    if (proliferatorPerSecond > 0 && ownSpray !== undefined) {
+      selfSpray = { itemId: ownSpray, perSecond: proliferatorPerSecond };
+      toStation.set(ownSpray, (toStation.get(ownSpray) ?? 0) + proliferatorPerSecond);
+    } else if (proliferatorPerSecond > 0) {
       sprayItemId = proliferatorItemId(req.proliferator.tier as 1 | 2 | 3);
       const existing = imports.find((i) => i.itemId === sprayItemId);
       if (existing) existing.perSecond += proliferatorPerSecond;
       else imports.push({ itemId: sprayItemId, perSecond: proliferatorPerSecond });
     }
-    const flows = this.flows(stages, importRate, exportRate);
+    const flows = this.flows(stages, importRate, toStation);
     // the items whose belts could be given a way out for what the machines make beyond what is used (surplus.ts): candidates only,
     // so the slots, the stations and the power here are those of a plan without any (`planWithSurplusSinks` adds them)
-    const surplus = surplusSinks(stages, flows, new Set(importRate.keys()), new Set(exportRate.keys()));
+    const surplus = surplusSinks(stages, flows, new Set(importRate.keys()), new Set(toStation.keys()));
     const stationSlots = this.stationSlots(
       materials.map((m) => m.itemId),
       sprayItemId,
-      exports.map((e) => e.itemId),
+      [...exports.map((e) => e.itemId), ...(selfSpray ? [selfSpray.itemId] : [])],
     );
 
     const withoutPower = {
@@ -476,7 +509,8 @@ class Planner {
       imports,
       exports,
       ...(surplus.length > 0 ? { surplus } : {}),
-      actualTargetRate: Math.max(required, this.targetCapacity(stageNodes, stages)),
+      ...(selfSpray ? { selfSpray } : {}),
+      actualTargetRate: Math.max(required, this.targetCapacity(stageNodes, stages, selfSpray, required)),
       stationSlots,
       stationsNeeded: this.stationsNeeded(stationSlots.length),
       proliferatorPerSecond,
@@ -562,9 +596,10 @@ class Planner {
 
   /**
    * What the rounded-up machines can deliver of the target (the ceil effect), net of the target the
-   * stages eat themselves.
+   * stages eat themselves and, when the target is the spray (`selfSpray`), of the coaters' share of it: the spray is
+   * a fixed share of what the stages make, `required` and the spray being what the plan makes net and for the coaters.
    */
-  private targetCapacity(stageNodes: Node[], stages: Stage[]): number {
+  private targetCapacity(stageNodes: Node[], stages: Stage[], selfSpray: ItemRate | undefined, required: number): number {
     const target = this.req.targetItemId;
     let capacity = 0;
     stageNodes.forEach((n, i) => {
@@ -573,6 +608,9 @@ class Planner {
       capacity += s.machines * s.perMachineCraftsPerSecond * perCraft * n.effect.outputMultiplier;
       capacity -= s.inputs.find((x) => x.itemId === target)?.perSecond ?? 0;
     });
+    if (selfSpray?.itemId === target && required + selfSpray.perSecond > EPS) {
+      capacity *= required / (required + selfSpray.perSecond);
+    }
     return capacity;
   }
 
@@ -629,9 +667,11 @@ class Planner {
   /**
    * Variables: x<recipe> crafts/s, i<item> imports (supplied items), e<item> exports (every item).
    * Rows, per item: Σ (out·multiplier − in)·x + i − e = R for the target, 0 otherwise. `pin` fixes
-   * one recipe's crafts/s (buildings mode).
+   * one recipe's crafts/s (buildings mode). `ownSpray` is the proliferator item the plan makes for its coaters: every proliferated
+   * recipe uses `Σ inputs / sprays` of it per craft on top of its inputs. In buildings mode with the product as that item the rate
+   * is not known before the solve (the machines' gross output less the spray): R is the free variable `q`, with a row of its own.
    */
-  private async solve(nodes: Node[], required: number, pin?: { recipeId: number; crafts: number }) {
+  private async solve(nodes: Node[], required: number, pin?: { recipeId: number; crafts: number }, ownSpray?: number) {
     const target = this.req.targetItemId;
     const coefs = new Map<number, Map<number, number>>(); // item -> recipe -> net coefficient
     const add = (itemId: number, recipeId: number, delta: number) => {
@@ -643,6 +683,13 @@ class Planner {
       for (const i of n.recipe.inputs) add(i.itemId, n.recipe.id, -i.count);
       for (const o of n.recipe.outputs) add(o.itemId, n.recipe.id, o.count * n.effect.outputMultiplier);
     }
+    if (ownSpray !== undefined) {
+      const sprays = spraysPerItem(this.req.proliferator.tier as 1 | 2 | 3, this.data);
+      for (const n of nodes) {
+        if (n.effect.proliferated) add(ownSpray, n.recipe.id, -n.recipe.inputs.reduce((sum, i) => sum + i.count, 0) / sprays);
+      }
+    }
+    const freeRate = ownSpray === target && pin !== undefined;
     const variables: LPVariable[] = nodes.map((n) => ({
       name: `x${n.recipe.id}`,
       cost: COST_MACHINE * n.secondsPerCraft,
@@ -657,7 +704,11 @@ class Planner {
       }
       variables.push({ name: `e${itemId}`, cost: COST_EXPORT });
       terms.push({ variable: `e${itemId}`, coef: -1 });
-      constraints.push({ name: `r${itemId}`, terms, type: 'eq', rhs: itemId === target ? required : 0 });
+      if (freeRate && itemId === target) {
+        variables.push({ name: 'q', cost: 0 });
+        terms.push({ variable: 'q', coef: -1 });
+      }
+      constraints.push({ name: `r${itemId}`, terms, type: 'eq', rhs: itemId === target && !freeRate ? required : 0 });
     }
     if (pin) constraints.push({ name: 'pin', terms: [{ variable: `x${pin.recipeId}`, coef: 1 }], type: 'eq', rhs: pin.crafts });
     const solution = await solveLP({ variables, constraints });

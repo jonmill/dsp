@@ -2,7 +2,7 @@
   import { headroomMachines, layoutStations, surplusExportsIn, withLayout } from '../lib/calc';
   import type { PlanError, ProductionPlan } from '../lib/calc';
   import { provisionedRate } from '../lib/validate/sim/run';
-  import { buildingName, formatCount, formatPercent, formatPower, formatRate, itemName } from './format';
+  import { buildingName, formatCount, formatPercent, formatPower, formatRate, itemName, selfSprayNote } from './format';
   import ItemIcon from './ItemIcon.svelte';
   import type { AppState } from './state.svelte';
 
@@ -15,6 +15,17 @@
   /** What the plan provisions for the target; the machines are rounded up, so they can make more (`actualTargetRate`). */
   const requested = $derived(plan ? provisionedRate(plan) : 0);
   const hasSpareCapacity = $derived(plan !== null && plan.actualTargetRate > requested * (1 + 1e-9));
+  /** Says that the plan makes the proliferator it sprays with, if it does: there is no import of it to show. */
+  const selfSpray = $derived(
+    plan?.selfSpray
+      ? selfSprayNote(
+          itemName(app.index, plan.selfSpray.itemId),
+          plan.selfSpray.perSecond,
+          plan.selfSpray.itemId === plan.request.targetItemId ? requested : null,
+          unit,
+        )
+      : null,
+  );
   /**
    * The stations and spray coaters of the solved layout while it is for this plan. A plan counts the stations its item slots
    * need and one coater per sprayed item; a layout also needs stations for its belt ports and has a coater per sprayed belt.
@@ -210,6 +221,7 @@
             </li>
           {/each}
         </ul>
+        {#if selfSpray}<p class="hint">{selfSpray}</p>{/if}
       </div>
     </div>
 

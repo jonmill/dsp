@@ -121,9 +121,12 @@ export interface StageStat {
 }
 
 export interface SimResult {
-  /** Items per second of the plan's target item that reached a station input port in the window. */
+  /**
+   * Items per second of the plan's target item that reached a station input port in the window, net of what the stations' output
+   * ports put on belts of it (a proliferator that is its own product comes in at the export port and goes out to the coaters).
+   */
   measuredTargetRate: number;
-  /** One entry per `plan.exports` entry, in order. */
+  /** One entry per `plan.exports` entry, in order; net like `measuredTargetRate`. */
   measuredExports: ItemRate[];
   machineStats: MachineStat[];
   stageStats: StageStat[];
@@ -299,9 +302,13 @@ export function runSimulation(
   const stationItems = layout.buildings.flatMap((b) =>
     b.station ? [{ station: world.station(b.id), items: b.station.slots.map((s) => s.itemId).filter((id) => id !== 0) }] : [],
   );
-  const received = (itemId: number): number => {
+  // What reached the stations of an item, net of what the same stations sent out again (`StationSim.delivered`): a station that
+  // takes an item in and gives it out (the product that is also the proliferator its coaters spray with: it comes in at the
+  // export port and goes out at the spray belt's) has delivered the difference. That holds for any item a station both receives
+  // and emits; a station that only gives an item out (an import) takes nothing off another station's delivery of it.
+  const arrived = (itemId: number): number => {
     let sum = 0;
-    for (const s of stationItems) sum += s.station.received(itemId);
+    for (const s of stationItems) sum += s.station.delivered(itemId);
     return sum;
   };
   const receivedAny = (): number => {
@@ -360,7 +367,7 @@ export function runSimulation(
       world.tick();
       if (stored && world.ticks % STORED_SAMPLE_TICKS === 0) {
         stored.push(storedNow());
-        delivered.push(received(targetItem));
+        delivered.push(arrived(targetItem));
       }
     }
   };
@@ -378,10 +385,10 @@ export function runSimulation(
     let previous = 0;
     let settled = false;
     while (warmupTicksUsed < cap) {
-      const before = received(targetItem);
+      const before = arrived(targetItem);
       runTicks(WARMUP_WINDOW_TICKS);
       warmupTicksUsed += WARMUP_WINDOW_TICKS;
-      const windowRate = (received(targetItem) - before) / (WARMUP_WINDOW_TICKS / tps);
+      const windowRate = (arrived(targetItem) - before) / (WARMUP_WINDOW_TICKS / tps);
       if (reached(previous) && reached(windowRate)) {
         settled = true;
         break;
@@ -395,8 +402,8 @@ export function runSimulation(
     const seconds = ticks / tps;
     for (const m of machines.list) m.machine.resetStats();
     const coatersAtStart = coaters.map((c) => ({ sprayed: c.sprayedItems, taken: c.proliferatorTaken }));
-    const receivedAtStart = new Map<number, number>();
-    for (const id of [targetItem, ...exportItems]) receivedAtStart.set(id, received(id));
+    const arrivedAtStart = new Map<number, number>();
+    for (const id of [targetItem, ...exportItems]) arrivedAtStart.set(id, arrived(id));
     sumTick = 0;
     sumIdleTick = 0;
     streak = 0;
@@ -405,7 +412,7 @@ export function runSimulation(
     runTicks(ticks);
     measuring = false;
 
-    const rate = (itemId: number): number => (received(itemId) - (receivedAtStart.get(itemId) ?? 0)) / seconds;
+    const rate = (itemId: number): number => (arrived(itemId) - (arrivedAtStart.get(itemId) ?? 0)) / seconds;
     const machineStats: MachineStat[] = machines.list.map((m) => ({
       buildingId: m.buildingId,
       stageIndex: m.stageIndex,

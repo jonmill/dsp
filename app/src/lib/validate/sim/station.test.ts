@@ -222,6 +222,48 @@ describe('StationSim ports', () => {
   });
 });
 
+describe('StationSim delivered', () => {
+  const PORTS = { 0: { dir: 1 as const, storageIdx: 1 }, 1: { dir: 2 as const, storageIdx: 0 } };
+
+  it('is what reached the input ports less what the output ports put on belts of the same item (X in, Y out: X - Y)', () => {
+    const station = new StationSim(config(1, PORTS), 1);
+    const feed = new BeltSim(100, 5); // the spray belt: the port fills it
+    const product = restingBelt();
+    station.attachOutput(0, feed);
+    station.attachInput(1, product);
+    for (let t = 0; t < 20; t++) {
+      station.tick(t);
+      feed.update();
+    }
+    expect(station.received(1001)).toBe(1);
+    expect(station.emitted(1001)).toBeGreaterThan(1);
+    expect(station.delivered(1001)).toBe(station.received(1001) - station.emitted(1001));
+    expect(station.delivered(1001)).toBeLessThan(0); // it has sent out more than it took in so far
+  });
+
+  it('is what reached the input ports for a station that has no output port of the item, and 0 for one that only gives the item out', () => {
+    const takesOnly = new StationSim(config(1, { 1: PORTS[1] }), 1);
+    takesOnly.attachInput(1, restingBelt());
+    takesOnly.tick(0);
+    expect(takesOnly.delivered(1001)).toBe(1);
+    // an import station: its emissions are not a negative delivery
+    const givesOnly = new StationSim(config(1, { 0: PORTS[0] }), 1);
+    givesOnly.attachOutput(0, new BeltSim(100, 5));
+    givesOnly.tick(0);
+    expect(givesOnly.emitted(1001)).toBe(1);
+    expect(givesOnly.delivered(1001)).toBe(0);
+  });
+
+  it('judges each item on its own: an item the station only takes in is not reduced by what it sends of another', () => {
+    const station = new StationSim(config(2, { 0: { dir: 1, storageIdx: 2 }, 1: { dir: 2, storageIdx: 0 } }), 1);
+    station.attachOutput(0, new BeltSim(100, 5)); // sends 1002
+    station.attachInput(1, restingBelt()); // takes 1001
+    station.tick(0);
+    expect(station.delivered(1001)).toBe(1);
+    expect(station.delivered(1002)).toBe(0);
+  });
+});
+
 /** One cargo of item 1001 sitting at the rear of a Mk.III belt. */
 function restingBelt(): BeltSim {
   const belt = new BeltSim(100, 5);

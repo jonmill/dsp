@@ -116,6 +116,60 @@ describe('runSimulation: a smelter row', () => {
   });
 });
 
+describe('runSimulation: a station that sends out what it takes in (final review, item 1)', () => {
+  /**
+   * A plan whose target is item 1001 at `perSecond`. The stations of the layouts below take it in and send it out again, as the
+   * station of a proliferator that is its own product does (the product comes in, the spray belt goes out of the same slot).
+   */
+  const planFor1001 = (perSecond: number): ReturnType<typeof planOf> => {
+    const base = planOf([]);
+    return {
+      ...base,
+      actualTargetRate: perSecond,
+      exports: [{ itemId: 1001, perSecond }],
+      request: { ...base.request, targetItemId: 1001, quantity: { kind: 'rate' as const, perSecond } },
+    };
+  };
+  /** Station Y feeds a belt into input port 2 of station X; X's output port 0 puts 1001 on a belt that ends at X's input port 1. */
+  function loopedStation(withFeed: boolean): { layout: Layout } {
+    const kit = new LayoutKit();
+    const x = kit.station(0, 0);
+    x.station!.ports[1] = { dir: 2, storageIdx: 0 };
+    x.station!.ports[2] = { dir: 2, storageIdx: 0 };
+    kit.belt(1, 1001, line([0, 5], [9, 5]), { source: { buildingId: x.id, port: 0 }, sink: { kind: 'port', buildingId: x.id, port: 1 } });
+    if (withFeed) {
+      const y = kit.station(40, 0);
+      kit.belt(1, 1001, line([0, 9], [9, 9]), { source: { buildingId: y.id, port: 0 }, sink: { kind: 'port', buildingId: x.id, port: 2 } });
+    }
+    return { layout: kit.layout() };
+  }
+
+  it('judges the target on what the stations take in less what their output ports send out: a loop of one station reads 0', () => {
+    const { layout } = loopedStation(false);
+    const sim = runSimulation(layout, planFor1001(6), fixtureData, fixtureEffects, FAST);
+    // the belt carries 6/s round and round: every item that arrives was sent out by the same station
+    expect(sim.measuredTargetRate).toBeCloseTo(0, 1);
+    expect(sim.measuredExports).toEqual([{ itemId: 1001, perSecond: sim.measuredTargetRate }]);
+    const violations = checkSimulation(sim, layout, planFor1001(6), fixtureData);
+    expect(codesOf(violations)).toContain('SIM_OUTPUT_LOW');
+  });
+
+  it('...and a station that takes in two belts and sends one out reads the other one', () => {
+    const { layout } = loopedStation(true);
+    const sim = runSimulation(layout, planFor1001(6), fixtureData, fixtureEffects, FAST);
+    const alone = runSimulation(stationPairLayout(1, 10).kit.layout(), planFor1001(6), fixtureData, fixtureEffects, FAST);
+    expect(alone.measuredTargetRate).toBeGreaterThan(5);
+    // the gross arrival at X is twice the belt's, the net is the feed's
+    expect(sim.measuredTargetRate).toBeCloseTo(alone.measuredTargetRate, 1);
+  });
+
+  it('leaves a station that only takes in as it was: the arrival is the rate', () => {
+    const alone = runSimulation(stationPairLayout(1, 10).kit.layout(), planFor1001(6), fixtureData, fixtureEffects, FAST);
+    expect(alone.measuredTargetRate).toBeGreaterThan(5);
+    expect(checkSimulation(alone, stationPairLayout(1, 10).kit.layout(), planFor1001(5), fixtureData)).toEqual([]);
+  });
+});
+
 describe('runSimulation: the warm-up', () => {
   /** A station feeds a Mk.I belt of `nodes` nodes (20 ticks each) into another station: nothing arrives for `nodes * 20` ticks. */
   function longBelt(nodes: number, provisioned: number): { layout: Layout; plan: Parameters<typeof runSimulation>[1] } {

@@ -97,11 +97,22 @@ export interface ProductionPlan {
   /**
    * Includes the proliferator, which has no flows (spray coaters consume it, not stages). If the
    * proliferator item is also a regular import, the two are summed into one entry and the flows
-   * carry only the regular part.
+   * carry only the regular part. Not a proliferator the plan makes itself (`selfSpray`): nothing imports that.
    */
   imports: ItemRate[];
-  /** The target comes first, then by-products nothing consumes. */
+  /**
+   * The target comes first, then by-products nothing consumes. The target's rate is the net one, what the player collects: for
+   * a product that is also the proliferator its coaters spray with (`selfSpray`) it is the stages' output less the spray.
+   */
   exports: ItemRate[];
+  /**
+   * Present when the plan makes the proliferator it sprays with (the target is that proliferator, or a stage makes it for the others'
+   * recipes) and it is not supplied: the stages that make it are sized for the spray as well as for the rate (the export is the net),
+   * `perSecond` is `proliferatorPerSecond` and the plan has no import of the item. The flows to the export carry the spray on top
+   * of the export, and the station slot is an export one: the coaters' feed draws the spray from it. Absent: the spray is an import
+   * (or there is none).
+   */
+  selfSpray?: ItemRate;
   /**
    * Candidates for a surplus sink: items that several stages make and the stages use, whose belts could also end at a station port (an
    * export slot) for what the machines can make beyond what is used, as producers that share a belt that nothing drains fill it and
@@ -110,11 +121,13 @@ export interface ProductionPlan {
    * only for a layout whose validation found a deadlock. They are not exports (the flows do not change). Absent: none.
    */
   surplus?: ItemRate[];
+  /** What the rounded-up machines can deliver of the target, net of the coaters' share of it when the target is its own spray. */
   actualTargetRate: number;
   /** One slot per item id; an item with several roles keeps export over proliferator over import. */
   stationSlots: StationSlotDemand[];
   /** Slot-based lower bound; the netlist may need more once belt ports are counted. */
   stationsNeeded: number;
+  /** What the coaters spend a second, imported or (`selfSpray`) made by the plan. */
   proliferatorPerSecond: number;
   power: PowerEstimate;
   warnings: string[];

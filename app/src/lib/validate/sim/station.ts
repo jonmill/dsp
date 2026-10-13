@@ -34,6 +34,8 @@ export class StationSim {
   private readonly acceptItem = (item: number): boolean => this.slotItems.has(item);
   private readonly receivedItems = new Map<number, number>();
   private readonly emittedItems = new Map<number, number>();
+  /** Items of the attached output ports: what the station puts on belts. */
+  private readonly sentItems = new Set<number>();
 
   /** `pilerLevel` is `TechEffects.stationPilerLevel`. */
   constructor(cfg: StationConfig, pilerLevel: number) {
@@ -54,6 +56,7 @@ export class StationSim {
     const item = cfgPort.storageIdx >= 1 ? (this.cfg.slots[cfgPort.storageIdx - 1]?.itemId ?? 0) : 0;
     if (item === 0) return;
     this.outputs.push({ belt, cargo: { item, stack: this.outputStack, inc: 0 }, nextTick: 0 });
+    this.sentItems.add(item);
   }
 
   /** Drain `belt`'s rear into input port `port`. A port whose config `dir` is not 2 (input) never acts. */
@@ -70,6 +73,19 @@ export class StationSim {
   /** Items the output ports have put onto belts, for item id `itemId` (stack sizes summed). */
   emitted(itemId: number): number {
     return this.emittedItems.get(itemId) ?? 0;
+  }
+
+  /**
+   * What this station has delivered of `itemId`: what reached its input ports, less what its output ports put on belts of the same
+   * item when it has done both (the product of a plan that is also the proliferator its coaters spray with comes in at the export
+   * port and goes out at the spray belt's: the player collects the difference). A station that only gives the item out, an import
+   * station, has delivered nothing, not a negative amount; one that only takes it in, what reached its input ports. The station
+   * takes an item in once something of it has arrived, as the simulator's input ports take any item of a slot whatever the belt
+   * was meant to carry.
+   */
+  delivered(itemId: number): number {
+    const received = this.received(itemId);
+    return received > 0 && this.sentItems.has(itemId) ? received - this.emitted(itemId) : received;
   }
 
   /** Input ports, then output ports; the world calls the two halves in their own phases instead. */

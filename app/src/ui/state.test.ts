@@ -7,7 +7,7 @@ import { allTechs, GameDataIndex, techClosure } from '../lib/data';
 import type { SolveResult } from '../lib/layout/solver';
 import { compositeLayout, stationPairLayout } from '../lib/validate/testkit';
 import type { Violation } from '../lib/validate';
-import { formatPower } from './format';
+import { formatCount, formatPower } from './format';
 import { blueprintFileName, createAppState, makeBlueprint, PROFILES_KEY, UNLOCK_ALL_PROFILE } from './state.svelte';
 import type { AppDeps, AppState } from './state.svelte';
 
@@ -1093,5 +1093,41 @@ describe('makeBlueprint: the surplus exports of the layout', () => {
     expect(withSink.desc).toContain('Surplus export (drain it in game): Iron Ingot.');
     // a station that holds the item as a plain slot of a plan without candidates is no surplus export
     expect(makeBlueprint(pair.kit.layout(), okPlan(app.plan), index, 100, null).desc).not.toContain('Surplus export');
+  });
+});
+
+describe('makeBlueprint: a plan that makes the proliferator it sprays with (final review, item 1)', () => {
+  const MK3 = 1143;
+  async function selfSprayedApp(): Promise<AppState> {
+    const app = createAppState(data);
+    app.setTarget(MK3);
+    app.setProliferator({ tier: 3, mode: 'extra' });
+    await app.whenSettled();
+    return app;
+  }
+
+  it('lists no supply of it and says where it comes from, with the spray and the stages\' gross rate', async () => {
+    const app = await selfSprayedApp();
+    const plan = okPlan(app.plan);
+    expect(plan.selfSpray?.itemId).toBe(MK3);
+    const made = makeBlueprint(stationPairLayout().kit.layout(), plan, new GameDataIndex(data), 100, null);
+    expect(made.desc).not.toMatch(/Supplied:[^.]*Proliferator Mk\.III/);
+    expect(made.desc).toContain("of the Proliferator Mk.III the stages make feeds the plan's own spray coaters");
+    expect(made.desc).toContain('put a few Proliferator Mk.III in it first');
+    const spray = plan.selfSpray!.perSecond;
+    expect(made.desc).toContain(`${formatCount(spray)}/s of the Proliferator Mk.III`);
+    expect(made.desc).toContain(`to deliver ${formatCount(plan.exports[0].perSecond)}/s`);
+  });
+
+  it('a plan whose proliferator is supplied says nothing of it', async () => {
+    const app = createAppState(data);
+    app.setTarget(PROCESSOR);
+    app.setProliferator({ tier: 3, mode: 'extra' });
+    await app.whenSettled();
+    const plan = okPlan(app.plan);
+    expect(plan.selfSpray).toBeUndefined();
+    const made = makeBlueprint(stationPairLayout().kit.layout(), plan, new GameDataIndex(data), 100, null);
+    expect(made.desc).not.toContain('spray coaters, so');
+    expect(made.desc).toMatch(/Supplied:.*Proliferator Mk\.III/);
   });
 });

@@ -1124,17 +1124,31 @@ describe('buildNetlist: the proliferator net (Task 28)', () => {
     expectSound(nl, plan, allEffects);
   });
 
-  it('a plan that makes the proliferator it sprays with (it is the target) still gets its net', async () => {
+  it('a plan that makes the proliferator it sprays with (it is the target): the export nets carry the gross and the feed starts where they end', async () => {
     const plan = await planOf(
       request({
         targetItemId: MK3,
-        suppliedItemIds: new Set(ORES.concat([1006, 1114, 1112, 1115, 1301, 1111])),
-        proliferator: { tier: 3, mode: 'speed' },
+        quantity: { kind: 'rate', perSecond: 6 },
+        suppliedItemIds: new Set([1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031]),
+        proliferator: { tier: 3, mode: 'extra' },
       }),
-    ).catch(() => null);
-    if (!plan) return; // the fixture may not be able to make it: the unit above covers the netlist rules
+    );
+    expect(plan.selfSpray?.itemId).toBe(MK3);
+    expect(plan.imports.map((i) => i.itemId)).not.toContain(MK3);
     const nl = buildNetlist(plan, data, allEffects);
-    expect(nl.nets.filter((n) => n.proliferator).length).toBe(plan.proliferatorPerSecond > 0 ? 1 : 0);
+    const feeds = nl.nets.filter((n) => n.proliferator);
+    expect(feeds).toHaveLength(1);
+    expect(feeds[0].rate).toBeCloseTo(plan.proliferatorPerSecond, 9);
+    // what goes to the station is the net rate and the spray the coaters draw back out of the slot
+    const exportNets = netsOf(nl, MK3).filter((n) => !n.proliferator && n.sink.kind === 'station');
+    expect(sum(exportNets.map((n) => n.rate))).toBeCloseTo(6 + plan.proliferatorPerSecond, 6);
+    // the feed starts at a station that takes in some of it: the slot it draws from is the one the product comes into
+    const feed = feeds[0];
+    if (feed.source.kind !== 'station') throw new Error('the proliferator net is not station-sourced');
+    const feedStation = feed.source.stationIdx;
+    expect(exportNets.some((n) => n.sink.kind === 'station' && n.sink.stationIdx === feedStation)).toBe(true);
+    expect(nl.stations[feedStation].slots.find((x) => x.itemId === MK3)?.localLogic).toBe(1);
+    expectSound(nl, plan, allEffects);
   });
 });
 

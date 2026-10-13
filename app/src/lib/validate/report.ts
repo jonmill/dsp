@@ -58,7 +58,7 @@ function itemName(data: GameDataIndex, itemId: number): string {
  * How far below `rate` a measured rate may fall without being flagged: 1 % of the rate, widened to one item per
  * window (the edges of the window can cost an item) but never beyond 2 % of the rate.
  */
-function outputTolerance(rate: number, measureSeconds: number): number {
+export function outputTolerance(rate: number, measureSeconds: number): number {
   return Math.max((1 - OUTPUT_FACTOR) * rate, Math.min(1 / measureSeconds, 2 * (1 - OUTPUT_FACTOR) * rate));
 }
 
@@ -69,7 +69,9 @@ const REL_EPS = 1e-9;
  * Turn a simulation result into violations:
  *  - SIM_OUTPUT_LOW if the target item reached the stations at less than 99 % of the provisioned target rate (the
  *    plan's export of the target; see `outputTolerance` for the slack at short windows), naming the wiring warnings
- *    the simulator collected. Judged only when the plan expects output (`actualTargetRate > 0`);
+ *    the simulator collected. The rate is net: an item a station takes in and gives out again (the product that is also
+ *    the proliferator its coaters spray with) counts as what is left (`SimResult.measuredTargetRate`). Judged only when
+ *    the plan expects output (`actualTargetRate > 0`);
  *  - SIM_DEADLOCK if the simulator saw no progress for 600 ticks while output was expected;
  *  - SIM_STALLED for every stage whose machines made fewer than 90 % of the planned crafts, listing its machines. A
  *    stage is judged as a whole, so a machine rounded up to be idle part of the time does not trip it, while an
@@ -91,7 +93,8 @@ export function checkSimulation(sim: SimResult, layout: Layout, plan: Production
       code: 'SIM_OUTPUT_LOW',
       entities: sinks,
       message:
-        `${itemName(data, target)} reached the stations at ${rateText(sim.measuredTargetRate)} over ${sim.measureSeconds} s, ` +
+        `${itemName(data, target)} reached the stations at ${rateText(sim.measuredTargetRate)} over ${sim.measureSeconds} s` +
+        `${plan.selfSpray?.itemId === target ? ' (net of the spray their output ports hand the coaters)' : ''}, ` +
         `below ${pct(OUTPUT_FACTOR)} of the provisioned ${rateText(wanted)}.${warnings}`,
     });
   }

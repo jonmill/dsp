@@ -100,8 +100,14 @@ function expectFlowsConsistent(plan: ProductionPlan): void {
     if (plan.request.proliferator.tier > 0 && imp.itemId === proliferatorItem) continue;
     expect(sum((f) => f.from === 'import' && f.itemId === imp.itemId)).toBeCloseTo(imp.perSecond, 7);
   }
+  // a proliferator the plan makes itself goes to the station as well, for the coaters (`selfSpray`): on top of the export
+  const spray = plan.selfSpray;
   for (const exp of plan.exports) {
-    expect(sum((f) => f.to === 'export' && f.itemId === exp.itemId)).toBeCloseTo(exp.perSecond, 7);
+    const own = spray?.itemId === exp.itemId ? spray.perSecond : 0;
+    expect(sum((f) => f.to === 'export' && f.itemId === exp.itemId)).toBeCloseTo(exp.perSecond + own, 7);
+  }
+  if (spray && !plan.exports.some((e) => e.itemId === spray.itemId)) {
+    expect(sum((f) => f.to === 'export' && f.itemId === spray.itemId)).toBeCloseTo(spray.perSecond, 7);
   }
   for (const f of plan.flows) expect(f.perSecond).toBeGreaterThan(1e-9);
 }
@@ -309,8 +315,8 @@ describe('planProduction: fix round (overrides, tiny rates, supplied target, spr
     expect(plan.imports.map((i) => i.itemId)).not.toContain(1303);
   });
 
-  it('gives a target that is also the spray supply one station slot, as an export', async () => {
-    // Proliferator Mk.III (1143) as the target, sprayed with Mk.III: the plan both makes and imports it.
+  it('gives a target that is also the spray supply one station slot, as an export, and no import of it', async () => {
+    // Proliferator Mk.III (1143) as the target, sprayed with Mk.III: the plan makes what its coaters spray with.
     const plan = await planOf(
       request({
         targetItemId: 1143,
@@ -319,7 +325,8 @@ describe('planProduction: fix round (overrides, tiny rates, supplied target, spr
       }),
     );
     expect(plan.proliferatorPerSecond).toBeGreaterThan(0);
-    expect(rateOf(plan.imports, 1143)).toBeCloseTo(plan.proliferatorPerSecond, 9);
+    expect(rateOf(plan.imports, 1143)).toBe(0); // nothing imports the product (final review, item 1)
+    expect(plan.selfSpray).toEqual({ itemId: 1143, perSecond: plan.proliferatorPerSecond });
     expect(plan.exports[0].itemId).toBe(1143);
     const slotsFor1143 = plan.stationSlots.filter((slot) => slot.itemId === 1143);
     expect(slotsFor1143).toEqual([{ itemId: 1143, role: 'export' }]);
@@ -720,6 +727,100 @@ describe('planProduction: proliferator', () => {
     expect(plan.warnings).toHaveLength(1);
     expect(plan.warnings[0]).toContain('Assembling Machine Mk.II');
     expect(plan.warnings[0]).toMatch(/speed/i);
+  });
+});
+
+describe('planProduction: a plan that makes the proliferator it sprays with (final review, item 1)', () => {
+  const RAW = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031];
+  const mk3 = (mode: 'extra' | 'speed', over: Partial<PlanRequest> = {}): PlanRequest =>
+    request({
+      targetItemId: 1143,
+      quantity: { kind: 'rate', perSecond: 6 },
+      suppliedItemIds: new Set(RAW),
+      proliferator: { tier: 3, mode },
+      ...over,
+    });
+  /** Items/s the stages put on the belts of `itemId`, and take off them. */
+  const made = (plan: ProductionPlan, itemId: number): number => plan.stages.reduce((n, s) => n + rateOf(s.outputs, itemId), 0);
+  const used = (plan: ProductionPlan, itemId: number): number => plan.stages.reduce((n, s) => n + rateOf(s.inputs, itemId), 0);
+  const sprayedPerSecond = (plan: ProductionPlan): number =>
+    plan.stages.reduce((n, s) => n + (s.proliferated ? s.inputs.reduce((a, i) => a + i.perSecond, 0) : 0), 0);
+
+  for (const mode of ['extra', 'speed'] as const) {
+    it(`Proliferator Mk.III at 6/s with Mk.III, ${mode}: the stages make 6/s and the coaters' spray, so the export is 6/s net`, async () => {
+      const plan = await planOf(mk3(mode));
+      // the export is what was asked for, and it is net: gross - spray
+      expect(plan.exports).toEqual([{ itemId: 1143, perSecond: 6 }]);
+      expect(provisionedRate(plan)).toBe(6);
+      expect(plan.proliferatorPerSecond).toBeGreaterThan(0.5);
+      // a fixed point: 60 sprays an Mk.III, every input of every stage sprayed, and the stages sized for the spray as well
+      expect(plan.proliferatorPerSecond).toBeCloseTo(sprayedPerSecond(plan) / 60, 9);
+      expect(made(plan, 1143) - used(plan, 1143) - plan.proliferatorPerSecond).toBeCloseTo(6, 6);
+      expect(made(plan, 1143)).toBeGreaterThan(6.9); // not the 6/s that the plan made before, sprayed from an import nothing delivers
+      // ...made on site: no import of it, no spray slot, one export slot
+      expect(rateOf(plan.imports, 1143)).toBe(0);
+      expect(plan.selfSpray).toEqual({ itemId: 1143, perSecond: plan.proliferatorPerSecond });
+      expect(plan.stationSlots.filter((slot) => slot.itemId === 1143)).toEqual([{ itemId: 1143, role: 'export' }]);
+      expect(plan.stationSlots.some((slot) => slot.role === 'proliferator')).toBe(false);
+      // the belts to the station carry the gross, 6/s of it is collected
+      const toStation = plan.flows.filter((f) => f.itemId === 1143 && f.to === 'export').reduce((n, f) => n + f.perSecond, 0);
+      expect(toStation).toBeCloseTo(6 + plan.proliferatorPerSecond, 6);
+      expectFlowsConsistent(plan);
+      // the machines are rounded up and the target stage is the one that makes the rate: what they can deliver net is at least 6/s
+      expect(plan.actualTargetRate).toBeGreaterThanOrEqual(6);
+      expect(plan.actualTargetRate).toBeLessThan(6.5);
+    });
+  }
+
+  it('a speed-up plan needs fewer machines than the plain one for the same net rate, and the spray is no import in either', async () => {
+    const plain = await planOf(mk3('speed', { proliferator: { tier: 0, mode: 'speed' } }));
+    const plan = await planOf(mk3('speed'));
+    const machines = (p: ProductionPlan): number => p.stages.reduce((n, s) => n + s.machines, 0);
+    expect(machines(plan)).toBeLessThan(machines(plain));
+    expect(plain.selfSpray).toBeUndefined();
+    expect(plain.proliferatorPerSecond).toBe(0);
+  });
+
+  it('buildings mode: the count of machines is the user\'s, the rate is what they deliver net of the spray', async () => {
+    const plan = await planOf(mk3('extra', { quantity: { kind: 'buildings', count: 13 } }));
+    const final = stageFor(plan, 108);
+    expect(final.machines).toBe(13);
+    expect(final.exactMachines).toBeCloseTo(13, 9);
+    const gross = rateOf(final.outputs, 1143);
+    expect(plan.exports[0].itemId).toBe(1143);
+    expect(plan.exports[0].perSecond).toBeCloseTo(gross - plan.proliferatorPerSecond, 6);
+    expect(plan.proliferatorPerSecond).toBeCloseTo(sprayedPerSecond(plan) / 60, 9);
+    expect(plan.selfSpray?.perSecond).toBeCloseTo(plan.proliferatorPerSecond, 9);
+    expect(rateOf(plan.imports, 1143)).toBe(0);
+    expectFlowsConsistent(plan);
+  });
+
+  it('a proliferator the plan makes as an intermediate is made for the coaters too: Mk.III with Mk.II spray makes Mk.II for both', async () => {
+    const plan = await planOf(mk3('extra', { proliferator: { tier: 2, mode: 'extra' } }));
+    expect(plan.exports).toEqual([{ itemId: 1143, perSecond: 6 }]);
+    // the Mk.III stage eats Mk.II (2 a craft) and the coaters spray with it (24 sprays an item)
+    expect(plan.selfSpray).toEqual({ itemId: 1142, perSecond: plan.proliferatorPerSecond });
+    expect(plan.proliferatorPerSecond).toBeCloseTo(sprayedPerSecond(plan) / 24, 9);
+    expect(made(plan, 1142) - used(plan, 1142) - plan.proliferatorPerSecond).toBeCloseTo(0, 6);
+    expect(rateOf(plan.imports, 1142)).toBe(0);
+    // Mk.II has an export slot of its own, for the coaters, though the plan exports only the Mk.III
+    expect(plan.stationSlots.filter((slot) => slot.itemId === 1142)).toEqual([{ itemId: 1142, role: 'export' }]);
+    expect(plan.stationSlots.some((slot) => slot.role === 'proliferator')).toBe(false);
+    expectFlowsConsistent(plan);
+  });
+
+  it('a spray the plan neither makes nor was told to expect is imported as before: Processor with Mk.III', async () => {
+    const plan = await planOf(processorRequest({ proliferator: { tier: 3, mode: 'extra' } }));
+    expect(plan.selfSpray).toBeUndefined();
+    expect(rateOf(plan.imports, 1143)).toBeCloseTo(plan.proliferatorPerSecond, 9);
+    expect(plan.stationSlots).toContainEqual({ itemId: 1143, role: 'proliferator' });
+  });
+
+  it('a spray that is supplied is imported even when the plan could make it: Mk.III with Mk.II supplied and sprayed', async () => {
+    const plan = await planOf(mk3('extra', { proliferator: { tier: 2, mode: 'extra' }, suppliedItemIds: new Set([...RAW, 1142]) }));
+    expect(plan.selfSpray).toBeUndefined();
+    expect(plan.imports.filter((i) => i.itemId === 1142)).toHaveLength(1);
+    expect(rateOf(plan.imports, 1142)).toBeCloseTo(used(plan, 1142) + plan.proliferatorPerSecond, 9);
   });
 });
 

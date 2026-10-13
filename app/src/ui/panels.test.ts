@@ -286,6 +286,31 @@ describe('PlanTable', () => {
     expect(later).toContain('Station charging (full rate, plan estimate)');
   });
 
+  it('a plan that makes the proliferator it sprays with lists no import of it and says what feeds its own coaters (final review, item 1)', async () => {
+    const app = createAppState(data);
+    app.setTarget(1143);
+    app.setProliferator({ tier: 3, mode: 'extra' });
+    app.setQuantity({ kind: 'rate', perSecond: 6 });
+    await app.whenSettled();
+    const plan = app.plan?.ok ? app.plan.plan : null;
+    expect(plan!.selfSpray?.itemId).toBe(1143);
+    const page = textOf(html(PlanTable, app));
+    const imports = /Imports(.*?)Exports/.exec(page)![1];
+    expect(imports).not.toContain('Proliferator Mk.III');
+    expect(page).toContain(`${+plan!.selfSpray!.perSecond.toPrecision(3)}/s of the Proliferator Mk.III the stages make feeds the plan's own spray coaters`);
+    expect(page).toContain('to deliver 6/s');
+  });
+
+  it('says nothing of a spray the plan imports', async () => {
+    const app = createAppState(data);
+    app.setTarget(1303);
+    app.setProliferator({ tier: 3, mode: 'extra' });
+    await app.whenSettled();
+    const page = textOf(html(PlanTable, app));
+    expect(/Imports(.*?)Exports/.exec(page)![1]).toContain('Proliferator Mk.III');
+    expect(page).not.toContain('own spray coaters');
+  });
+
   it('shows no capacity when the machines make exactly what was requested', async () => {
     const app = createAppState(data);
     app.setTarget(IRON_INGOT);

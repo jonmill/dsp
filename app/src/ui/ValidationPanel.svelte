@@ -1,6 +1,7 @@
 <script lang="ts">
   import { layoutStations, withLayout } from '../lib/calc';
   import type { Violation } from '../lib/validate';
+  import { outputTolerance } from '../lib/validate';
   import { provisionedRate } from '../lib/validate/sim/run';
   import { formatPercent, formatPower, formatRate } from './format';
   import type { AppState } from './state.svelte';
@@ -12,6 +13,10 @@
   const sim = $derived(report?.sim ?? null);
   const provisioned = $derived(plan ? provisionedRate(plan) : 0);
   const capacity = $derived(sim?.measuredTargetRate ?? 0);
+  /** How far below the provisioned rate the gate lets the capacity fall, as the validator has it for the window it measured (1 % unless the window is too short for that). */
+  const tolerance = $derived(
+    sim && provisioned > 0 ? formatPercent(outputTolerance(provisioned, sim.measureSeconds) / provisioned) : formatPercent(0.01),
+  );
   /** Only the validator's own verdict makes the figure a problem; more than the provisioned rate is normal. */
   const rateLow = $derived(report?.violations.some((v) => v.code === 'SIM_OUTPUT_LOW') ?? false);
   /** The stations of the layout: the plan counts the ones its item slots need, the layout also the ones its belt ports need. */
@@ -75,7 +80,8 @@
         <p class="hint">
           The simulation runs every machine flat out against unlimited station supply, so the capacity is what this
           layout can deliver, not what the plan asks for. The check is that it reaches the provisioned rate (within the
-          validator's tolerance, about 1 %); more is normal.
+          validator's tolerance, {tolerance}); more is normal.{#if plan.selfSpray}
+            It counts what the stations take in less the proliferator their coaters take out again.{/if}
         </p>
         <p class="hint">
           Measured over {sim.measureSeconds} s after a {Math.round(sim.warmupTicksUsed / 60)} s warm-up (game time).

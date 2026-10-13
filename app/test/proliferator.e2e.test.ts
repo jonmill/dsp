@@ -162,6 +162,43 @@ describe('the proliferator network end to end [slow]', () => {
     expect(report.sim!.coaters.proliferatorPerSecond).toBeGreaterThan(0);
   }, 900_000);
 
+  // Final review, item 1: the product that is its own spray. The plan listed the spray as an import of the target nothing delivers,
+  // and the simulator counted the gross arrival at the station, so a layout whose coaters drew 1.19 of its 6.25 gross/s passed at
+  // 84 % net. Now the planner sizes the stages for the rate and the spray, and the validator judges what the stations are left with.
+  it.each(['extra', 'speed'] as const)(
+    'Proliferator Mk.III at 6/s with Mk.III, %s: the net rate passes the gate, the stations take in the spray the coaters draw out again',
+    async (mode) => {
+      const plan = await planFor({
+        targetItemId: 1143,
+        quantity: { kind: 'rate', perSecond: 6 },
+        suppliedItemIds: new Set([1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031]),
+        proliferator: { tier: 3, mode },
+        machineHeadroom: DEFAULT_MACHINE_HEADROOM,
+      });
+      expect(wantedRate(plan)).toBe(6);
+      expect(plan.selfSpray?.itemId).toBe(1143);
+      expect(plan.imports.some((i) => i.itemId === 1143)).toBe(false);
+      const { result, seconds } = solveLogged(`Proliferator Mk.III ${mode}`, plan, { timeBudgetMs: 1 });
+      expect(result.layout, `no layout; ${result.failures.join(' || ')}`).not.toBeNull();
+      const layout = result.layout as Layout;
+      const report = validateLayout(layout, plan, data, effects);
+      const sim = report.sim!;
+      log(
+        `Proliferator Mk.III ${mode}: ${plan.stages.reduce((n, s) => n + s.machines, 0)} machines; ladder ${seconds.toFixed(1)} s; net ${sim.measuredTargetRate.toFixed(3)}/s of ` +
+          `${wantedRate(plan)}/s (${((100 * sim.measuredTargetRate) / wantedRate(plan)).toFixed(1)} %), the coaters took ${sim.coaters.proliferatorPerSecond.toFixed(3)}/s ` +
+          `(plan ${plan.proliferatorPerSecond.toFixed(3)}/s); warm-up ${sim.warmupTicksUsed} ticks`,
+      );
+      expect(messages(report)).toEqual([]);
+      expect(report.pass).toBe(true);
+      // net of what the coaters drew: at least the gate, whatever the gross
+      expect(sim.measuredTargetRate).toBeGreaterThanOrEqual(0.99 * wantedRate(plan));
+      expect(sim.coaters.proliferatorPerSecond).toBeGreaterThan(0.5 * plan.proliferatorPerSecond);
+      // the layout's station holds the one slot for it, an export, and the feed belt starts at it
+      expect(layout.belts.filter((b) => b.itemId === 1143 && b.source !== undefined)).toHaveLength(1);
+    },
+    900_000,
+  );
+
   it('the same line without a proliferator: no coaters, no feed belt, and fewer constraints on the footprint (the numbers the report compares)', async () => {
     const plain = await processorPlan(1);
     const sprayed = await processorPlan(1, { tier: 3, mode: 'extra' });

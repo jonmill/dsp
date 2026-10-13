@@ -38,7 +38,7 @@ import { DEFAULT_SOLVE_OPTIONS } from '../lib/layout/solver';
 import type { SolveProgress, SolveResult } from '../lib/layout/solver';
 import type { ValidationReport, Violation } from '../lib/validate';
 import { provisionedRate } from '../lib/validate/sim/run';
-import { formatCount, formatPower, geometryBadge, itemName } from './format';
+import { formatCount, formatPower, geometryBadge, itemName, selfSprayNote } from './format';
 import { buildTree, treeLeaves } from './tree';
 import type { TreeRow } from './tree';
 
@@ -339,9 +339,13 @@ export function makeBlueprint(
   const estimate = withLayout(plan.power, { coaters: layout.coaters?.length ?? 0, stations: laidStations }, index);
   // the export slots the layout has for a surplus (it deadlocked without): the player drains them
   const surplus = surplusExportsIn(layout, plan).map((s) => itemName(index, s.itemId));
+  // a proliferator the plan makes for its own coaters is no supply: say where it comes from
+  const own = plan.selfSpray;
+  const ownSpray = own ? [selfSprayNote(itemName(index, own.itemId), own.perSecond, own.itemId === plan.request.targetItemId ? rate : null)] : [];
   const lines = [
     `${shortDesc}, ${machines} machines, ${stations}${footprint === null ? '' : `, ${Math.round(footprint)} tiles`}.`,
     imports.length > 0 ? `Supplied: ${imports.join(', ')}.` : 'Nothing supplied.',
+    ...ownSpray,
     ...(surplus.length > 0 ? [`Surplus export (drain it in game): ${surplus.join(', ')}.`] : []),
     power
       ? `Power (simulated): ${formatPower(power.steadyW)} steady, ${formatPower(power.peakW)} peak.`
