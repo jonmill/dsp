@@ -646,27 +646,44 @@ These are known to fail or to be slow; none is a bug in the plan. The numbers co
 item planned at 1 per second, the fallback ladder alone; `app/test/ladder-sweep*.e2e.test.ts`, and the deep ones with
 `npm run test:sweep-deep`).
 
-- **Large plans often cannot be routed.** The router cannot always lay out a plan of roughly **400 machines or more** (about
+- **Large plans often cannot be laid out.** The router cannot always lay out a plan of roughly **400 machines or more** (about
   **200 or more** with a proliferator, whose feed belt must reach every spray coater); some plans of that size do route (Small
   Carrier Rocket, 472 machines). The solver then tries the six rungs of its ladder, which can take longer than the time budget;
   at the budget it stops with **no layout** and a message that names the size of the plan ("No valid layout found within the
-  time budget. This plan has N machines; plans over ~400 machines (or ~200 with proliferator) often cannot be routed yet. Try a
-  lower rate, or split the build."). Lower the rate, or plan the build in parts. There is no router rewrite planned.
+  time budget, with some layout attempts left. This plan has N machines; plans over ~400 machines (or ~200 with proliferator)
+  often can't be laid out yet. A longer time budget (in Options) may help. Try a lower rate, or split the build."). When every
+  rung was tried and failed first, the message says so and does not suggest a longer budget. Lower the rate, or plan the build in
+  parts. There is no router rewrite planned.
 - **The items this hits** at 1 per second (machines in brackets). Plain: Mini Fusion Power Plant (391), Interstellar Logistics
   Vessel (400), Advanced Mining Machine (834; its one routable rung reads 0.95 per second, the others leave 1 to 7 routing
   conflicts), Energy Exchanger (856), Interstellar Logistics Station (975), Miniature Particle Collider (1162), Artificial Star
-  (1334), Vertical Launching Silo (2749). With Mk.III: Destroyer (343), Advanced Mining Machine (365), Artificial Star (590) and
-  Vertical Launching Silo (1205), which fail at the proliferator feed belt or at routing. The other items of more than 12 stages
-  pass the deep sweep, except the one below.
+  (1334). With Mk.III: Destroyer (343), Advanced Mining Machine (365), Artificial Star (590) and Vertical Launching Silo
+  (1205), which fail at the proliferator feed belt or at routing. The plain Vertical Launching Silo (2749) did not finish: the
+  sweep gave up on it after 6 hours. These are the items of the last full deep sweep that failed for their size; the rest of the
+  sweep's items were not all re-run since, so treat the list as what is known, not as a guarantee for any other plan of that size.
 - **Quantum Chemical Plant with Mk.III proliferator (208 machines) gives no layout.** Some rungs route, but the simulated
   block reaches 0.96 to 0.99 per second instead of 1. Cause: Graphene (advanced) makes Hydrogen as a by-product for Deuterium
   and Casimir Crystal, on six dead-end belts that are each planned exactly balanced, with 69 machines for 67.9 needed. A
-  Deuterium machine whose product is not drawn idles, the Hydrogen belt it feeds backs up, and the Graphene machines on that
-  belt block for 37 % of the time: about 5 % of all Graphene machine time, three times the spare, so the other belts are short
-  of Hydrogen and the Deuterium and Casimir Crystal stages run 4 % short. Neither the calculator's rates nor the simulator's
-  machine speed are wrong (a machine that is 100 % busy makes exactly its theoretical maximum). Raising the **machine
-  headroom** (Options) to 2 % (210 machines instead of 208: one more Graphene machine) gives a block that passes at 1.04 per
-  second.
+  Deuterium machine whose product is not drawn idles, the Hydrogen belt that feeds it backs up, and the Graphene machines on
+  that belt block for 37 % of the time: about 5 % of all Graphene machine time, three times the spare, so the other belts are
+  short of Hydrogen and the Deuterium and Casimir Crystal stages run 4 % short. Neither the calculator's rates nor the
+  simulator's machine speed are wrong (a machine that is 100 % busy makes exactly its theoretical maximum). Raising the
+  **machine headroom** (Options) to 2 % (210 machines instead of 208: one more Graphene machine) gives a block that passes at
+  1.04 per second.
+- **Gravity Missile Set with Mk.III proliferator (66 machines) gives no layout.** Margin 3 cannot route the proliferator belt;
+  the other five rungs read 0.93 to 0.98 per second with stages short of their crafts (the single Casimir Crystal (advanced)
+  machine 87 to 90 % output-blocked, Particle Container, Plastic, Supersonic Missile Set). Cause: Hydrogen is made by Graphene
+  (advanced) and by Plasma Refining (which also makes the Refined Oil the chain needs) on one belt, so that belt ends at a station
+  port for its surplus (see the in-game note below). The sink is the difference: without it the plan passes at margin 4 (1.03
+  per second), with it no rung does. It most likely draws Hydrogen past the one Casimir Crystal machine, which has little spare
+  capacity. The sink is kept because the same belt shape deadlocked Deuteron Fuel Rod with Mk.III.
+
+**In game: an item with a surplus sink gets an export slot that you must drain.** An item that two or more stages make and the
+plan uses (in practice Hydrogen, made by Graphene (advanced) and Plasma Refining) has its belt end at a station, so that the
+producers never block on a full belt. The station lists it as a supply slot like a by-product's, and the plan's station slots
+include it. The simulator's station takes whatever arrives without limit; the real slot stops at its `max` (5000 for a
+Planetary Logistics Station), and once it is full the belt backs up as it would without the sink. Take the item out of that slot
+by hand (sandbox mode) or let another station demand it, as for the product slot (section 4, "The product slot fills up too").
 
 ## 10. Command reference
 
