@@ -88,7 +88,10 @@ export interface SimOptions {
    * the first time: that measurement is the result. A block is still starting up if the total of what its belts and machines
    * hold grew in each of the last two windows by more than its jitter allows (`stillFilling`), or if that total, or the rate at
    * which the target reaches the stations, has been rising across the last six windows since the normal warm-up ended, by more
-   * than its own noise (`stillRising`). Omitted: the first measurement stands. Ignored when `warmupTicks` is given.
+   * than its own noise (`stillRising`). A first measurement that misses the gate by under 5 % waits as well, for a start-up that the
+   * signals cannot see yet; if no signal fires while it waits, the result is a window `LONGER_WINDOW_FACTOR` times as long, not a
+   * second window of the first one's length (the rules are in the header of this file). Omitted: the first measurement stands.
+   * Ignored when `warmupTicks` is given.
    */
   acceptable?: (result: SimResult) => boolean;
   /**
