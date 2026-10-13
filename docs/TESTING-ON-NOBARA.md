@@ -670,20 +670,17 @@ item planned at 1 per second, the fallback ladder alone; `app/test/ladder-sweep*
   simulator's machine speed are wrong (a machine that is 100 % busy makes exactly its theoretical maximum). Raising the
   **machine headroom** (Options) to 2 % (210 machines instead of 208: one more Graphene machine) gives a block that passes at
   1.04 per second.
-- **Gravity Missile Set with Mk.III proliferator (66 machines) gives no layout.** Margin 3 cannot route the proliferator belt;
-  the other five rungs read 0.93 to 0.98 per second with stages short of their crafts (the single Casimir Crystal (advanced)
-  machine 87 to 90 % output-blocked, Particle Container, Plastic, Supersonic Missile Set). Cause: Hydrogen is made by Graphene
-  (advanced) and by Plasma Refining (which also makes the Refined Oil the chain needs) on one belt, so that belt ends at a station
-  port for its surplus (see the in-game note below). The sink is the difference: without it the plan passes at margin 4 (1.03
-  per second), with it no rung does. It most likely draws Hydrogen past the one Casimir Crystal machine, which has little spare
-  capacity. The sink is kept because the same belt shape deadlocked Deuteron Fuel Rod with Mk.III.
 
-**In game: an item with a surplus sink gets an export slot that you must drain.** An item that two or more stages make and the
-plan uses (in practice Hydrogen, made by Graphene (advanced) and Plasma Refining) has its belt end at a station, so that the
-producers never block on a full belt. The station lists it as a supply slot like a by-product's, and the plan's station slots
-include it. The simulator's station takes whatever arrives without limit; the real slot stops at its `max` (5000 for a
-Planetary Logistics Station), and once it is full the belt backs up as it would without the sink. Take the item out of that slot
-by hand (sandbox mode) or let another station demand it, as for the product slot (section 4, "The product slot fills up too").
+**In game: a surplus export slot, only when the layout needed it.** Some plans have an item that two or more stages make and the
+stages use (in practice Hydrogen, made by Graphene (advanced) and Plasma Refining). The solver first builds the layout with that
+belt a dead end, as for any plan. Only if the simulation of a layout then deadlocks (Deuteron Fuel Rod with Mk.III does: the
+second producer fills the Hydrogen belt and Plasma Refining, which also makes the oil the chain needs, blocks) does it build that
+layout and the rest of its attempts with the belt ending at a station, in an export slot, so that the producers never block. The
+progress line says "surplus export" when it did, the Solve panel and the blueprint description name the item, and the plan
+table counts the slot ("N item slots, 1 of them for a surplus"). The plan view shows no such slot until a layout needs it.
+The simulator's station takes whatever arrives without limit; the real slot stops at its `max` (5000 for a Planetary Logistics
+Station), and once it is full the belt backs up as it would without the sink. Take the item out of that slot by hand (sandbox
+mode) or let another station demand it, as for the product slot (section 4, "The product slot fills up too").
 
 ## 10. Command reference
 
