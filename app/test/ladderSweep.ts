@@ -22,25 +22,37 @@ export const DEEP_ITEM_TIMEOUT_MS = 3_600_000;
 /** Which items a sweep covers: the ones of at most `MAX_STAGES` stages, or the ones of more. */
 export type Depth = 'shallow' | 'deep';
 
-/** How many items are swept: every producible item but `EXPECTED_SKIPPED`. */
+/**
+ * Critical Photon: made by nothing the planner uses, so a plan that needs it only works with it supplied. The UI supplies every leaf of
+ * the recipe tree under the target (`withLeavesSupplied`, ui/state.svelte.ts), which for Antimatter, Antimatter Capsule, Antimatter
+ * Fuel Rod and Universe Matrix is this item alone; the sweeps do the same for them (final review, M6), and only for them: with the
+ * photon supplied for every item the planner would make Hydrogen from it where it does not today.
+ */
+export const PHOTON_ITEM = 1208;
+/** How many items are swept without the photon: every producible item but `EXPECTED_SKIPPED` and the photon-fed ones. */
 export const EXPECTED_PLANNABLE = 102;
-/** Items left out of the sweep and why: the calculator has no plan for them, or the plan needs more than 12 stages. */
-export const NO_RECIPE = 'no plannable recipe';
+/** The photon-fed items of at most `MAX_STAGES` stages, which the shallow sweeps add to the `EXPECTED_PLANNABLE`... */
+export const EXPECTED_PHOTON_SHALLOW = ['Antimatter', 'Antimatter Capsule'];
+/** ...and the photon-fed ones of more, which the deep sweeps add (`EXPECTED_SKIPPED` lists them as too deep for the shallow ones). */
+export const EXPECTED_PHOTON_DEEP = ['Antimatter Fuel Rod', 'Universe Matrix'];
+/**
+ * Items left out of the sweep and why: the calculator has no plan for them with the raw items supplied (and the photon, where that is
+ * all they lack), because an input is neither supplied nor made (Dark Fog items, Core Element, ...), or the plan needs more than
+ * 12 stages.
+ */
+export const NO_RECIPE = 'an input is neither supplied nor made';
 export const TOO_DEEP = `more than ${MAX_STAGES} stages`;
 /** What the deep sweeps call the items the shallow ones cover. */
 export const NOT_DEEP = `at most ${MAX_STAGES} stages`;
 export const EXPECTED_SKIPPED: Record<string, string> = {
-  Antimatter: NO_RECIPE,
-  'Antimatter Capsule': NO_RECIPE,
-  'Antimatter Fuel Rod': NO_RECIPE,
   'Strange Annihilation Fuel Rod': NO_RECIPE,
   'Orbital Collector': NO_RECIPE,
   'Re-composing Assembler': NO_RECIPE,
   'Negentropy Smelter': NO_RECIPE,
   'Self-evolution Lab': NO_RECIPE,
-  'Universe Matrix': NO_RECIPE,
   ...Object.fromEntries(
     [
+      ...EXPECTED_PHOTON_DEEP,
       'Space Warper',
       'Quantum Chip',
       'Reinforced Thruster',
@@ -120,7 +132,7 @@ export async function plannableItems(
       skipped[name] = 'no unlocked facility';
       continue;
     }
-    const request: PlanRequest = {
+    let request: PlanRequest = {
       targetItemId: itemId,
       quantity: { kind: 'rate', perSecond: 1 },
       finalFacilityItemId: facility.itemId,
@@ -131,7 +143,12 @@ export async function plannableItems(
       proliferator: { tier: 0, mode: 'extra' },
       stationKind: 'planetary',
     };
-    const planned = await planProduction(request, data, effects);
+    let planned = await planProduction(request, data, effects);
+    if (!planned.ok && planned.error.kind === 'no-recipe' && planned.error.itemId === PHOTON_ITEM) {
+      // the UI supplies the photon for such a target, as the only leaf under it: so does the sweep (an item that lacks more stays skipped)
+      request = { ...request, suppliedItemIds: new Set([...RAW_ITEMS, PHOTON_ITEM]) };
+      planned = await planProduction(request, data, effects);
+    }
     if (!planned.ok) {
       skipped[name] = planned.error.kind === 'no-recipe' ? NO_RECIPE : `rejected: ${planned.error.kind}`;
     } else if (depth === 'shallow' && (planned.plan.stages.length < 1 || planned.plan.stages.length > MAX_STAGES)) {
@@ -171,13 +188,15 @@ export function sweep(title: string, swept: { items: Plannable[]; skipped: Recor
       log(`${title}: ${items.length} plannable items; skipped ${left.length}: ${left.join('; ') || 'none'}${shallow > 0 ? `; and ${shallow} items of ${NOT_DEEP}` : ''}`);
       if (depth === 'shallow') {
         expect(skipped).toEqual(EXPECTED_SKIPPED);
-        expect(items).toHaveLength(EXPECTED_PLANNABLE);
+        expect(items).toHaveLength(EXPECTED_PLANNABLE + EXPECTED_PHOTON_SHALLOW.length);
+        expect(EXPECTED_PHOTON_SHALLOW.every((name) => items.some((i) => i.name === name && i.plan.imports.some((m) => m.itemId === PHOTON_ITEM)))).toBe(true);
       } else {
         // the deep items are the ones the shallow sweeps leave out for their depth; the shallow ones and the ones without a plan are the rest
         expect(items.map((i) => i.name).sort()).toEqual(EXPECTED_DEEP);
         const unplanned = Object.fromEntries(Object.entries(skipped).filter(([, why]) => why !== NOT_DEEP));
         expect(unplanned).toEqual(Object.fromEntries(Object.entries(EXPECTED_SKIPPED).filter(([, why]) => why !== TOO_DEEP)));
-        expect(Object.values(skipped).filter((why) => why === NOT_DEEP)).toHaveLength(EXPECTED_PLANNABLE);
+        expect(Object.values(skipped).filter((why) => why === NOT_DEEP)).toHaveLength(EXPECTED_PLANNABLE + EXPECTED_PHOTON_SHALLOW.length);
+        expect(EXPECTED_PHOTON_DEEP.every((name) => items.some((i) => i.name === name && i.plan.imports.some((m) => m.itemId === PHOTON_ITEM)))).toBe(true);
       }
     });
 

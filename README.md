@@ -16,9 +16,9 @@ App (`app/`):
 cd app && npm install && npm test && npm run lint && npm run build
 npm run dev     # dev server
 npm run check   # svelte-check
-npm run test:e2e   # slow end-to-end tests (the solver on real plans, two 102-item ladder sweeps; 3 to 7 minutes); `npm test` leaves them out
+npm run test:e2e   # slow end-to-end tests (the solver on real plans, two ladder sweeps of 104 items: 102, and 2 photon-fed ones; 3 to 7 minutes); `npm test` leaves them out
 npm run test:all   # both
-npm run test:sweep-deep   # the deep ladder sweeps (the 37 items of more than 12 stages, plain and with Mk.III); hours, not part of `test:e2e`
+npm run test:sweep-deep   # the deep ladder sweeps (the 39 items of more than 12 stages, 37 and 2 photon-fed ones, plain and with Mk.III); hours, not part of `test:e2e`
 npm run emit:test-bp   # hand-made in-game test blueprint -> local/test-blueprints/m0-smelter-row.txt
 npm run bench -- --budget 60 --plans processor,quantum-chip,circuit-board,smelter-row   # solver benchmark; appends rows to docs/benchmarks.md
 ```
@@ -41,6 +41,7 @@ The `game` extra (`pip install -e 'tools/extract[game]'`) adds UnityPy and TypeT
 - **Quantum Chemical Plant with Mk.III proliferator** has a valid plan (208 machines) but no layout that holds 1 per second:
   by-product Hydrogen is stranded on dead-end belts. Raising the machine headroom (Options) to 2 % works around it.
 - A layout that was found stuck without it (Hydrogen, in Deuteron Fuel Rod and Crystal Explosive Unit with Mk.III) ends the belt of a shared by-product at a station: that export slot appears only then, and you must drain it in game.
+- The late-deadlock check catches a full stop, not a partial slowdown: a layout that is fine for hours of game time and then runs at a fraction of its rate is not found.
 - The list, the causes and the numbers are in [docs/TESTING-ON-NOBARA.md](docs/TESTING-ON-NOBARA.md) (section 9, Known limitations).
 
 ## Quick start on Nobara (Dyson Sphere Program under Proton)

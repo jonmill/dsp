@@ -259,7 +259,11 @@ extraction run that wrote the file, and `local/extract-report.json`.
   It changes the plan (machine counts, power) and the block: spray coaters on the belts of proliferated stages, one raised
   feed belt that reaches all coaters, and a station slot for the proliferator. **You must put that proliferator into the
   station by hand** (the plan table lists the rate it needs), like every other supplied item. Leave it at None for the first
-  tests.
+  tests. If the plan makes that proliferator itself (the target is the proliferator you spray with, or a stage makes it for
+  the others), there is nothing to supply: the stages are sized for the rate and the spray, the plan table says how much of
+  the output feeds the plan's own coaters, and the coaters draw it from the product's slot in the station. The station starts
+  empty, so put a few of that proliferator in it first; the block then builds its own stock, and the rate you collect is the
+  net one (the validator judges it net).
 - **Machine headroom** (default 1 %). A stage that would keep less than this share of its machines spare gets at least one
   more machine (`ceil(exact need x (1 + headroom))`), so at 1 % any stage that would run above 99 % busy gets another. That
   keeps the output from dipping below the plan rate; it is why a block has slightly more machines than you may expect.
@@ -682,7 +686,8 @@ fills the Hydrogen belt and Plasma Refining, which also makes the oil the chain 
 block can be fine for a long time and then stop for good (Crystal Explosive Unit with Mk.III moves for 160000 ticks and is
 stuck from 240000), a layout of such a plan that passes is run on to 1,000,000 ticks (about 4.6 hours of game time, a few
 seconds to about a minute of solver time) and must still be moving at the end of them. A layout that gets stuck later than that
-is not found. When the sinks were needed, that rung and the rungs after it are built with them: the progress line says "surplus
+is not found, and the check catches a full stop, not a partial slowdown: a layout that is fine at the start and later runs at a
+fraction of its rate, with something still moving, passes it (a short-window rate check at the horizon is too noisy to gate on). When the sinks were needed, that rung and the rungs after it are built with them: the progress line says "surplus
 export", the Solve panel and the blueprint description name the item, and the plan table counts the slot ("N item slots, 1 of
 them for a surplus"). The plan view shows no such slot until a layout needs it. The simulator's station takes whatever arrives
 without limit; the real slot stops at its `max` (5000 for a Planetary Logistics Station), and once it is full the belt backs up as
@@ -698,9 +703,9 @@ From `app/` (`cd app`):
 | `npm run dev` | The app on <http://localhost:5173/>. |
 | `npm run build` | A production build into `app/dist/`. |
 | `npm test` | The unit tests (about 20 s), including `test/regression.test.ts` and `test/mirrors.test.ts`. |
-| `npm run test:e2e` | The slow end-to-end tests (`test/*.e2e.test.ts`: the solver on real plans, both 102-item ladder sweeps, multi-station and proliferator plans), several minutes. |
+| `npm run test:e2e` | The slow end-to-end tests (`test/*.e2e.test.ts`: the solver on real plans, both ladder sweeps of 104 items (102, and 2 photon-fed ones), multi-station and proliferator plans), several minutes. |
 | `npm run test:all` | Both of the above. |
-| `npm run test:sweep-deep` | The deep ladder sweeps (the 37 items of more than 12 stages, plain and with Mk.III; hours). Failures are the known limitations in section 9. |
+| `npm run test:sweep-deep` | The deep ladder sweeps (the 39 items of more than 12 stages: 37, and 2 photon-fed ones; plain and with Mk.III; hours). Failures are the known limitations in section 9. |
 | `npm run lint`, `npm run check` | ESLint, and `svelte-check` (types). |
 | `npm run emit:test-bp` | Writes `local/test-blueprints/m0-smelter-row.txt`. |
 | `npm run bench -- --budget 30 --plans processor` | The solver benchmark; it appends a row to `docs/benchmarks.md` (add `--no-write` to only print it). |
