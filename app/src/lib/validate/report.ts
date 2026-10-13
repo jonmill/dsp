@@ -34,7 +34,7 @@ export interface ValidateOptions {
 }
 
 /** The target output must reach this share of the plan rate (the Global Constraints: 99 %). */
-const OUTPUT_FACTOR = 0.99;
+export const OUTPUT_FACTOR = 0.99;
 /** A stage must make this share of its planned crafts. */
 const STAGE_FACTOR = 0.9;
 
@@ -128,10 +128,10 @@ export function checkSimulation(sim: SimResult, layout: Layout, plan: Production
  * Whether a result's violations are SIM_STALLED and nothing else: the target rate meets the gate and nothing deadlocked, and
  * stages made fewer crafts than planned in the window. `validateLayout` measures such a result once more over a longer window
  * (`SimOptions.longerWindow`), and that measurement is its verdict: the crafts of a stage in a window swing with the cycle of a
- * chain, a stage that is really short of its crafts is short in any window, and a layout that also has another violation gets
- * no second window.
+ * chain, a stage that is really short of its crafts is short in any window, and a layout that also has another violation (SIM_OUTPUT_LOW,
+ * SIM_DEADLOCK) gets no second window. Exported for its test.
  */
-function onlyStalled(violations: readonly Violation[]): boolean {
+export function onlyStalled(violations: readonly Violation[]): boolean {
   return violations.length > 0 && violations.every((v) => v.code === 'SIM_STALLED');
 }
 

@@ -3,9 +3,10 @@ import { planProduction } from '../calc';
 import type { ProductionPlan } from '../calc';
 import { allTechs, computeTechEffects, GameDataIndex } from '../data';
 import * as validate from './index';
-import { checkSimulation, validateLayout } from './report';
-import { runSimulation } from './sim/run';
+import { checkSimulation, onlyStalled, OUTPUT_FACTOR, validateLayout } from './report';
+import { GATE_SHARE, runSimulation } from './sim/run';
 import type { SimResult } from './sim/run';
+import type { Violation } from './types';
 import {
   codesOf,
   compositeLayout,
@@ -218,6 +219,22 @@ describe('validateLayout: a stage whose crafts swing from window to window', () 
     const report = one(plan, LOW_PHASE);
     expect(codesOf(report.violations)).toEqual(['SIM_OUTPUT_LOW', 'SIM_STALLED']);
     expect(report.sim!.measureSeconds).toBe(45);
+  });
+
+  it('a layout that deadlocks is not given the longer window either: SIM_DEADLOCK plus SIM_STALLED (and any other mix) is the verdict as it stands', () => {
+    const v = (code: Violation['code']): Violation => ({ code, entities: [], message: code });
+    expect(onlyStalled([v('SIM_STALLED')])).toBe(true);
+    expect(onlyStalled([v('SIM_STALLED'), v('SIM_STALLED')])).toBe(true);
+    expect(onlyStalled([v('SIM_DEADLOCK'), v('SIM_STALLED')])).toBe(false);
+    expect(onlyStalled([v('SIM_STALLED'), v('SIM_DEADLOCK')])).toBe(false);
+    expect(onlyStalled([v('SIM_OUTPUT_LOW'), v('SIM_STALLED')])).toBe(false);
+    expect(onlyStalled([v('SIM_DEADLOCK'), v('SIM_OUTPUT_LOW'), v('SIM_STALLED')])).toBe(false);
+    expect(onlyStalled([v('SIM_DEADLOCK')])).toBe(false);
+    expect(onlyStalled([])).toBe(false);
+  });
+
+  it('the gate the simulator warms up towards is the validator\'s (run.ts cannot import report.ts: it would be circular)', () => {
+    expect(GATE_SHARE).toBe(OUTPUT_FACTOR);
   });
 
   it('applies with the adaptive warm-up as well (the option is not tied to an explicit warm-up)', () => {

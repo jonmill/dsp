@@ -182,6 +182,30 @@ describe('worker and client', () => {
       expect(result).toMatchObject({ layout, report, footprint: 9, stoppedBy: 'budget', failures: [] });
     });
 
+    it('a Stop that came before the watchdog is the user\'s answer, even if the watchdog fires within the grace period of the stop', async () => {
+      vi.useFakeTimers();
+      const w = silentWorker();
+      const handle = startSolve(await ingotPlan(), data, effects, BUDGET, {}, () => w.worker);
+      w.say({ type: 'progress', progress: { elapsedMs: 5, attempts: 2, validated: 0, bestFootprint: null, phase: 'ladder: margin 4 failed' } });
+      await vi.advanceTimersByTimeAsync(BUDGET.timeBudgetMs + BUDGET_GRACE_MS - 500); // 500 ms before the watchdog
+      handle.stop();
+      expect(w.posted.at(-1)).toEqual({ type: 'stop' });
+      await vi.advanceTimersByTimeAsync(500); // the watchdog fires, 1.5 s before the stop's own grace is over
+      const result = await handle.done;
+      expect(w.terminated()).toBe(1);
+      expect(result).toMatchObject({ layout: null, attempts: 2, stoppedBy: 'user', failures: [] });
+    });
+
+    it('a Stop that came after the budget\'s watchdog changes nothing: the answer was the budget\'s', async () => {
+      vi.useFakeTimers();
+      const w = silentWorker();
+      const handle = startSolve(await ingotPlan(), data, effects, BUDGET, {}, () => w.worker);
+      await vi.advanceTimersByTimeAsync(BUDGET.timeBudgetMs + BUDGET_GRACE_MS);
+      handle.stop();
+      expect((await handle.done).stoppedBy).toBe('budget');
+      expect(w.posted.filter((m) => m.type === 'stop')).toEqual([]);
+    });
+
     it('does nothing to a worker that answers in time, and nothing at all without a ladder budget (the sweeps\' ladder is the guarantee)', async () => {
       vi.useFakeTimers();
       const quick = silentWorker();

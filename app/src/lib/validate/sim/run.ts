@@ -158,8 +158,11 @@ export const LONGER_WINDOW_FACTOR = 4;
 const FIRST_MISS_SHARE = 0.05;
 /** ...by this many windows of the measurement (at least one `FILL_STEP_TICKS`), after which the signals decide. */
 const FIRST_MISS_WINDOWS = 4;
-/** The share of the provisioned rate the target must reach: the validator's gate (`report.ts`). */
-const GATE_SHARE = 0.99;
+/**
+ * The share of the provisioned rate the target must reach: the validator's gate (`OUTPUT_FACTOR` in `report.ts`, which imports this
+ * module, so the value is repeated here; a test asserts the two are equal).
+ */
+export const GATE_SHARE = 0.99;
 /** The adaptive warm-up runs in windows of this many ticks (1 game minute), at least two of them. */
 const WARMUP_WINDOW_TICKS = 3600;
 /**

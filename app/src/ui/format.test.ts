@@ -165,30 +165,44 @@ describe('formatDuration', () => {
 });
 
 describe('noLayoutMessage', () => {
-  it('a budget stop of a plan over the router\'s limit names the machines and the limits, and says what to try', () => {
+  it('a budget stop of a plan over the router\'s limit names the machines and the limits, and says what to try, a longer budget included', () => {
     expect(noLayoutMessage('budget', 975, false)).toBe(
-      'No valid layout found within the time budget. This plan has 975 machines; plans over ~400 machines (or ~200 with proliferator) often cannot be routed yet. Try a lower rate, or split the build.',
+      "No valid layout found within the time budget, with some layout attempts left. This plan has 975 machines; plans over ~400 machines (or ~200 with proliferator) often can't be laid out yet. A longer time budget (in Options) may help. Try a lower rate, or split the build.",
     );
   });
 
   it('the limit is 200 machines with a proliferator and 400 without', () => {
     expect(ROUTER_LIMIT_MACHINES).toBe(400);
     expect(ROUTER_LIMIT_MACHINES_PROLIFERATED).toBe(200);
-    expect(noLayoutMessage('budget', 300, true)).toContain('often cannot be routed yet');
-    expect(noLayoutMessage('budget', 300, false)).not.toContain('often cannot be routed yet');
-    expect(noLayoutMessage('budget', 200, true)).not.toContain('often cannot be routed yet');
-    expect(noLayoutMessage('budget', 401, false)).toContain('often cannot be routed yet');
+    const often = "often can't be laid out yet";
+    expect(noLayoutMessage('budget', 300, true)).toContain(often);
+    expect(noLayoutMessage('budget', 300, false)).not.toContain(often);
+    expect(noLayoutMessage('budget', 200, true)).not.toContain(often);
+    expect(noLayoutMessage('budget', 401, false)).toContain(often);
+    expect(noLayoutMessage('budget', 401, false)).not.toContain('routed');
   });
 
   it('a smaller plan is not blamed on the router: its message suggests a longer budget on a budget stop only', () => {
     expect(noLayoutMessage('budget', 38, false)).toBe(
-      'No valid layout found within the time budget. This plan has 38 machines. A longer time budget (in Options) may help. Try a lower rate, or split the build.',
+      'No valid layout found within the time budget, with some layout attempts left. This plan has 38 machines. A longer time budget (in Options) may help. Try a lower rate, or split the build.',
     );
-    expect(noLayoutMessage('exhausted', 1, false)).toBe('No valid layout was found. This plan has 1 machine. Try a lower rate, or split the build.');
+    expect(noLayoutMessage('exhausted', 1, false)).toBe(
+      'No valid layout was found: every layout attempt failed. This plan has 1 machine. Try a lower rate, or split the build.',
+    );
+  });
+
+  it('only a stop at the budget suggests a longer budget: not when every rung was tried, not when the user stopped it, not for a big plan either', () => {
+    for (const machines of [38, 975]) {
+      expect(noLayoutMessage('budget', machines, false)).toContain('longer time budget');
+      expect(noLayoutMessage('exhausted', machines, false)).not.toContain('longer time budget');
+      expect(noLayoutMessage('early', machines, false)).not.toContain('longer time budget');
+      expect(noLayoutMessage('user', machines, false)).not.toContain('longer time budget');
+    }
   });
 
   it('says who stopped it', () => {
     expect(noLayoutMessage('user', 500, false)).toMatch(/^Stopped before a valid layout was found\. This plan has 500 machines;/);
-    expect(noLayoutMessage('exhausted', 500, false)).toMatch(/^No valid layout was found\. /);
+    expect(noLayoutMessage('exhausted', 500, false)).toMatch(/^No valid layout was found: every layout attempt failed\. /);
+    expect(noLayoutMessage('budget', 500, false)).toMatch(/^No valid layout found within the time budget, with some layout attempts left\. /);
   });
 });

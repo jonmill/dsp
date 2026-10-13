@@ -60,33 +60,32 @@ export function formatDuration(ms: number): string {
 }
 
 /**
- * Plans of more machines than this often cannot be routed yet (Task 30b): in the deep ladder sweep the routers failed every rung from 391
+ * Plans of more machines than this often cannot be laid out yet (Task 30b): in the deep ladder sweep the routers failed every rung from 391
  * machines without a proliferator, and the proliferator feed from 208 with one.
  */
 export const ROUTER_LIMIT_MACHINES = 400;
 export const ROUTER_LIMIT_MACHINES_PROLIFERATED = 200;
 
 /**
- * What to tell the user when a solve ended with no layout: why it ended, how big the plan is, and what to try. `stoppedBy` is the solver's
- * (`budget`: its time budget ran out; `user`: stopped by the user; `exhausted`: every rung failed). A plan over the router's limit is
- * told so; a smaller one is not.
+ * What to tell the user when a solve ended with no layout: why it ended, how big the plan is, and what to try. `stoppedBy` is the
+ * solver's: `budget` (the time budget ran out with rungs of the ladder left untried: a longer budget may help), `exhausted` (every rung was
+ * tried and failed: a longer budget would not), `user` (stopped by the user). A plan over the router's limit is told so, with "often": some
+ * plans of that size can be laid out and some below it cannot.
  */
 export function noLayoutMessage(stoppedBy: 'budget' | 'user' | 'exhausted' | 'early', machines: number, proliferated: boolean): string {
   const lead =
     stoppedBy === 'budget'
-      ? 'No valid layout found within the time budget.'
+      ? 'No valid layout found within the time budget, with some layout attempts left.'
       : stoppedBy === 'user'
         ? 'Stopped before a valid layout was found.'
-        : 'No valid layout was found.';
+        : 'No valid layout was found: every layout attempt failed.';
   const count = `${formatCount(machines)} machine${machines === 1 ? '' : 's'}`;
   const big = machines > (proliferated ? ROUTER_LIMIT_MACHINES_PROLIFERATED : ROUTER_LIMIT_MACHINES);
-  if (big) {
-    return (
-      `${lead} This plan has ${count}; plans over ~${ROUTER_LIMIT_MACHINES} machines (or ~${ROUTER_LIMIT_MACHINES_PROLIFERATED} with proliferator) ` +
-      'often cannot be routed yet. Try a lower rate, or split the build.'
-    );
-  }
-  return `${lead} This plan has ${count}.${stoppedBy === 'budget' ? ' A longer time budget (in Options) may help.' : ''} Try a lower rate, or split the build.`;
+  const size = big
+    ? ` This plan has ${count}; plans over ~${ROUTER_LIMIT_MACHINES} machines (or ~${ROUTER_LIMIT_MACHINES_PROLIFERATED} with proliferator) often can't be laid out yet.`
+    : ` This plan has ${count}.`;
+  const longer = stoppedBy === 'budget' ? ' A longer time budget (in Options) may help.' : '';
+  return `${lead}${size}${longer} Try a lower rate, or split the build.`;
 }
 
 /** English item name; an id GameData does not know is shown as "item <id>" rather than throwing. */

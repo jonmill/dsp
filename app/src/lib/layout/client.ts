@@ -72,6 +72,8 @@ export function startSolve(
   const worker = createWorker();
   let settled = false;
   let stopTimer: ReturnType<typeof setTimeout> | undefined;
+  /** The user pressed Stop: whoever gives up on the worker next, the answer is the user's. */
+  let userStopped = false;
   let budgetTimer: ReturnType<typeof setTimeout> | undefined;
   let lastProgress: SolveProgress | undefined;
   let best: { layout: Layout; report: ValidationReport; footprint: number } | undefined;
@@ -132,7 +134,11 @@ export function startSolve(
   if (opts.ladderBudgetMs !== undefined) {
     const budgetMs = Math.max(opts.timeBudgetMs, opts.ladderBudgetMs);
     budgetTimer = setTimeout(
-      () => settle(() => resolve(answerWith('budget', best ? [] : [budgetMessage(opts.ladderBudgetMs ?? budgetMs, lastProgress?.phase)]))),
+      () => {
+        // a Stop that came first is the user's, even if the watchdog fires within the grace period it gave the worker
+        if (userStopped) settle(() => resolve(answerWith('user', [])));
+        else settle(() => resolve(answerWith('budget', best ? [] : [budgetMessage(opts.ladderBudgetMs ?? budgetMs, lastProgress?.phase)])));
+      },
       budgetMs + BUDGET_GRACE_MS,
     );
   }
@@ -141,6 +147,7 @@ export function startSolve(
     done,
     stop: () => {
       if (settled || stopTimer !== undefined) return;
+      userStopped = true;
       worker.post({ type: 'stop' });
       stopTimer = setTimeout(() => {
         // the worker is in the middle of a long candidate: answer with what it has sent
