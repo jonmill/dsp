@@ -61,6 +61,15 @@ export interface SimOptions {
    * than its own noise (`stillRising`). Omitted: the first measurement stands. Ignored when `warmupTicks` is given.
    */
   acceptable?: (result: SimResult) => boolean;
+  /**
+   * Asked once, after the final measurement (the one that stands as the result). When it says yes the run measures once more,
+   * over `LONGER_WINDOW_FACTOR` times the window, continuing the same block, and that measurement is the result. For
+   * `validateLayout`: the stages are the only thing wrong with the result and the target rate meets the gate. A chain that
+   * swings has stages whose crafts in one window are 0.6 or 1.3 of their mean (Space Warper, Gravity Matrix); the same
+   * layouts pass 88-100 % of the 20-minute windows against 12-66 % of the 5-minute ones, with the same thresholds. It applies
+   * to a run with an explicit `warmupTicks` as well.
+   */
+  longerWindow?: (result: SimResult) => boolean;
 }
 
 /** `SimOptions.shouldAbort` said yes. */
@@ -138,6 +147,19 @@ export interface SimResult {
   warnings: string[];
 }
 
+/** `SimOptions.longerWindow` measures this many times the window. */
+export const LONGER_WINDOW_FACTOR = 4;
+/**
+ * A run with `acceptable` whose first measurement misses the gate by less than this share (of the gate) warms up on before the
+ * trend signals are asked: a start-up that rises by less than their floors over the 5 minutes of the first measurement shows
+ * only in the rate (Automatic Piler with Mk.III: 0.84, 0.95, 0.98, 1.04 of the rate after 18000, 36000, 68400, 100000 ticks, where
+ * the adaptive warm-up had been ended by two lucky minutes at 68400).
+ */
+const FIRST_MISS_SHARE = 0.05;
+/** ...by this many windows of the measurement (at least one `FILL_STEP_TICKS`), after which the signals decide. */
+const FIRST_MISS_WINDOWS = 4;
+/** The share of the provisioned rate the target must reach: the validator's gate (`report.ts`). */
+const GATE_SHARE = 0.99;
 /** The adaptive warm-up runs in windows of this many ticks (1 game minute), at least two of them. */
 const WARMUP_WINDOW_TICKS = 3600;
 /**
@@ -240,7 +262,6 @@ export function runSimulation(
   }
   if (!Number.isInteger(measureTicks) || measureTicks < 1) throw new RangeError(`measureTicks ${measureTicks} must be a whole number of at least 1`);
   const tps = data.data.constants.ticksPerSecond;
-  const measureSeconds = measureTicks / tps;
 
   const world = new World(layout, plan, data, effects, { powerSupplyW: opts.powerSupplyW });
   const buildingById = new Map<number, PlacedBuilding>();
@@ -349,8 +370,9 @@ export function runSimulation(
     }
     if (!settled && opts.warmupCapTicks !== undefined && opts.warmupCapTicks < MAX_WARMUP_TICKS) throw new WarmupNotSettled(warmupTicksUsed);
   }
-  /** Measure `measureTicks` more ticks: the counters start from zero, the block from the state it is in. */
-  const measure = (): SimResult => {
+  /** Measure `ticks` more ticks (default `measureTicks`): the counters start from zero, the block from the state it is in. */
+  const measure = (ticks: number = measureTicks): SimResult => {
+    const seconds = ticks / tps;
     for (const m of machines.list) m.machine.resetStats();
     const coatersAtStart = coaters.map((c) => ({ sprayed: c.sprayedItems, taken: c.proliferatorTaken }));
     const receivedAtStart = new Map<number, number>();
@@ -360,22 +382,22 @@ export function runSimulation(
     streak = 0;
     longestStreak = 0;
     measuring = true;
-    runTicks(measureTicks);
+    runTicks(ticks);
     measuring = false;
 
-    const rate = (itemId: number): number => (received(itemId) - (receivedAtStart.get(itemId) ?? 0)) / measureSeconds;
+    const rate = (itemId: number): number => (received(itemId) - (receivedAtStart.get(itemId) ?? 0)) / seconds;
     const machineStats: MachineStat[] = machines.list.map((m) => ({
       buildingId: m.buildingId,
       stageIndex: m.stageIndex,
       crafts: m.machine.crafts,
-      busyFraction: m.machine.busyTicks / measureTicks,
-      outputBlockedFraction: m.machine.stalledTicks / measureTicks,
-      starvedFraction: m.machine.starvedTicks / measureTicks,
+      busyFraction: m.machine.busyTicks / ticks,
+      outputBlockedFraction: m.machine.stalledTicks / ticks,
+      starvedFraction: m.machine.starvedTicks / ticks,
     }));
     const stageStats: StageStat[] = plan.stages.map((stage, stageIndex) => ({
       stageIndex,
       crafts: machineStats.reduce((sum, m) => (m.stageIndex === stageIndex ? sum + m.crafts : sum), 0),
-      plannedCrafts: stage.craftsPerSecond * measureSeconds,
+      plannedCrafts: stage.craftsPerSecond * seconds,
     }));
 
     let chargePerTick = 0;
@@ -394,15 +416,15 @@ export function runSimulation(
       measuredExports: exportItems.map((itemId) => ({ itemId, perSecond: rate(itemId) })),
       machineStats,
       stageStats,
-      coaters: { count: coaters.length, sprayedItems, proliferatorPerSecond: proliferatorTaken / measureSeconds },
+      coaters: { count: coaters.length, sprayedItems, proliferatorPerSecond: proliferatorTaken / seconds },
       deadlocked: expectsOutput && longestStreak >= DEADLOCK_TICKS,
       power: {
-        steadyW: (sumTick / measureTicks) * tps,
-        idleW: (sumIdleTick / measureTicks) * tps,
+        steadyW: (sumTick / ticks) * tps,
+        idleW: (sumIdleTick / ticks) * tps,
         peakW: peakTick * tps + stationChargeW,
         stationChargeW,
       },
-      measureSeconds,
+      measureSeconds: seconds,
       warmupTicksUsed,
       warnings,
     };
@@ -423,14 +445,26 @@ export function runSimulation(
     const planPerSample = (provisionedRate(plan) * STORED_SAMPLE_TICKS) / tps;
     const startingUp = (): boolean => stillStartingUp(stored, delivered, planPerSample, since);
     let used = warmupTicksUsed + measureTicks;
-    if (startingUp() && used + FILL_STEP_TICKS <= limit) {
+    // A first measurement that misses the gate by under 5 % may be a start-up too slow for the signals to see in so short a
+    // history: wait `FIRST_MISS_WINDOWS` windows of the measurement, once, and let the signals decide from there.
+    const wanted = provisionedRate(plan);
+    const gate = GATE_SHARE * wanted;
+    const rate = measured.measuredTargetRate;
+    let forcedSteps = wanted > 0 && rate < gate && rate >= (1 - FIRST_MISS_SHARE) * gate ? Math.ceil((FIRST_MISS_WINDOWS * measureTicks) / FILL_STEP_TICKS) : 0;
+    const goOn = (): boolean => forcedSteps > 0 || startingUp();
+    if (goOn() && used + FILL_STEP_TICKS <= limit) {
       do {
         runTicks(FILL_STEP_TICKS);
         used += FILL_STEP_TICKS;
-      } while (startingUp() && used + FILL_STEP_TICKS <= limit);
+        if (forcedSteps > 0) forcedSteps--;
+      } while (goOn() && used + FILL_STEP_TICKS <= limit);
       warmupTicksUsed = used;
       measured = measure();
     }
+  }
+  if (opts.longerWindow?.(measured)) {
+    warmupTicksUsed = world.ticks;
+    measured = measure(LONGER_WINDOW_FACTOR * measureTicks);
   }
   return measured;
 }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { planProduction } from '../calc';
 import type { ProductionPlan } from '../calc';
-import { allTechs, computeTechEffects } from '../data';
+import { allTechs, computeTechEffects, GameDataIndex } from '../data';
 import * as validate from './index';
 import { checkSimulation, validateLayout } from './report';
 import { runSimulation } from './sim/run';
@@ -152,6 +152,84 @@ describe('validateLayout', () => {
     expect(report.stage).toBe('simulation');
     expect(report.pass).toBe(false);
     expect(codesOf(report.violations)).toContain('SIM_OUTPUT_LOW');
+  });
+});
+
+describe('validateLayout: a stage whose crafts swing from window to window', () => {
+  /**
+   * The gear line with a 30 s recipe (one assembler, one craft every 1800 ticks). A 2700-tick window holds one craft or two, and the
+   * plan asks for 1.5: one craft is 0.67 of the planned, two are 1.33. Over four windows (10800 ticks) there are always six, which
+   * is the plan. The target is asked for 0.02/s, which one craft in 45 s (0.022/s) meets.
+   */
+  const slow = (() => {
+    const raw = structuredClone(fixtureData.data);
+    raw.recipes.find((r) => r.id === 5)!.timeTicks = 1800;
+    return new GameDataIndex(raw);
+  })();
+  const planFor = (craftsPerSecond: number, exportRate: number): ProductionPlan => {
+    const stage = planStage(5, {
+      buildingItemId: 2304,
+      craftsPerSecond,
+      inputs: [{ itemId: IRON_INGOT, perSecond: craftsPerSecond }],
+      outputs: [{ itemId: GEAR, perSecond: craftsPerSecond }],
+    });
+    const base = planOf([stage]);
+    return { ...base, request: { ...base.request, targetItemId: GEAR }, actualTargetRate: craftsPerSecond, exports: [{ itemId: GEAR, perSecond: exportRate }] };
+  };
+  const SHORT = { measureTicks: 2700 };
+  /** The warm-up after which the short window holds one craft (the low phase); 3000 holds two. */
+  const LOW_PHASE = 4000;
+  const one = (plan: ProductionPlan, warmupTicks: number, opts: { measureTicks: number } = SHORT) =>
+    validateLayout(gearLine().kit.layout(), plan, slow, fixtureEffects, { warmupTicks, ...opts });
+  const plain = (plan: ProductionPlan, warmupTicks: number) => {
+    const layout = gearLine().kit.layout();
+    return checkSimulation(runSimulation(layout, plan, slow, fixtureEffects, { warmupTicks, measureTicks: 2700 }), layout, plan, slow);
+  };
+
+  it('passes when only the window was unlucky: SIM_STALLED alone in the short window is measured again over four times as long', () => {
+    const plan = planFor(1 / 30, 0.02);
+    expect(codesOf(plain(plan, LOW_PHASE))).toEqual(['SIM_STALLED']); // the precondition: the normal window fails on the stage alone
+    const report = one(plan, LOW_PHASE);
+    expect(report.violations).toEqual([]);
+    expect(report.pass).toBe(true);
+    expect(report.sim!.measureSeconds).toBe(180); // four windows of 45 s
+    expect(report.sim!.stageStats[0].crafts).toBe(6);
+    expect(report.sim!.warmupTicksUsed).toBe(LOW_PHASE + 2700); // the first window is warm-up now
+  });
+
+  it('a window that passes is left alone, and is not measured again', () => {
+    const report = one(planFor(1 / 30, 0.02), 3000);
+    expect(report.pass).toBe(true);
+    expect(report.sim!.measureSeconds).toBe(45);
+  });
+
+  it('a stage that is really short of its crafts still fails: the long window reads it too, with its own length in the message', () => {
+    const plan = planFor(1.3 / 30, 0.02); // the machine makes 1/30 a second: 0.77 of the planned, whatever the window
+    expect(codesOf(plain(plan, LOW_PHASE))).toEqual(['SIM_STALLED']);
+    const report = one(plan, LOW_PHASE);
+    expect(codesOf(report.violations)).toEqual(['SIM_STALLED']);
+    expect(report.pass).toBe(false);
+    expect(report.sim!.measureSeconds).toBe(180);
+    expect(report.violations[0].message).toContain('made 6 crafts in 180 s');
+  });
+
+  it('a layout that also misses the rate is not given the longer window: SIM_OUTPUT_LOW plus SIM_STALLED is the verdict as it stands', () => {
+    const plan = planFor(1 / 30, 0.1); // the target is asked for 0.1/s and the machine delivers 0.022
+    const report = one(plan, LOW_PHASE);
+    expect(codesOf(report.violations)).toEqual(['SIM_OUTPUT_LOW', 'SIM_STALLED']);
+    expect(report.sim!.measureSeconds).toBe(45);
+  });
+
+  it('applies with the adaptive warm-up as well (the option is not tied to an explicit warm-up)', () => {
+    const layout = gearLine().kit.layout();
+    const asked: number[] = [];
+    const sim = runSimulation(layout, planFor(1 / 30, 0.02), slow, fixtureEffects, {
+      measureTicks: 2700,
+      longerWindow: (r) => (asked.push(r.measureSeconds), r.measureSeconds === 45),
+    });
+    expect(asked).toEqual([45]); // asked once, about the first (and only normal) measurement
+    expect(sim.measureSeconds).toBe(180);
+    expect(sim.warmupTicksUsed).toBeGreaterThan(0);
   });
 });
 

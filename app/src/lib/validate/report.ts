@@ -125,8 +125,21 @@ export function checkSimulation(sim: SimResult, layout: Layout, plan: Production
 }
 
 /**
+ * Whether a result's violations are SIM_STALLED and nothing else: the target rate meets the gate and nothing deadlocked, and
+ * stages made fewer crafts than planned in the window. `validateLayout` measures such a result once more over a longer window
+ * (`SimOptions.longerWindow`), and that measurement is its verdict: the crafts of a stage in a window swing with the cycle of a
+ * chain, a stage that is really short of its crafts is short in any window, and a layout that also has another violation gets
+ * no second window.
+ */
+function onlyStalled(violations: readonly Violation[]): boolean {
+  return violations.length > 0 && violations.every((v) => v.code === 'SIM_STALLED');
+}
+
+/**
  * Validate `layout` against `plan`: geometry first, then the rate-capacity check, then (unless `simulate` is false)
- * the tick simulation. Stops at the first stage that finds a violation. `pass` means no violations.
+ * the tick simulation. Stops at the first stage that finds a violation. `pass` means no violations. A simulation whose only
+ * violations are SIM_STALLED (the target meets the gate) is measured once more over `LONGER_WINDOW_FACTOR` times the window, and
+ * that measurement is the verdict (`report.sim.measureSeconds` says which window it is).
  */
 export function validateLayout(
   layout: Layout,
@@ -150,6 +163,7 @@ export function validateLayout(
     shouldAbort: opts.shouldAbort,
     warmupCapTicks: opts.warmupCapTicks,
     acceptable: (result) => checkSimulation(result, layout, plan, data).length === 0,
+    longerWindow: (result) => onlyStalled(checkSimulation(result, layout, plan, data)),
   });
   const violations = checkSimulation(sim, layout, plan, data);
   return { pass: violations.length === 0, violations, sim, checkedAt, stage: 'simulation' };

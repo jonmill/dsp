@@ -286,6 +286,49 @@ describe('runSimulation: a start-up that is still going on', () => {
   /** The plan rate in items per sample: 1 item/s, 10 items in 10 s. */
   const PLAN = 10;
 
+  describe('a first measurement that misses the gate by under 5 %', () => {
+    // three smelters make 3/s: asked for 3.09/s that is 0.971 of it, 2 % under the gate (0.99) and silent to every signal
+    const near = (planned: number): ReturnType<typeof smelterRowLayout> => {
+      const row = smelterRowLayout(3);
+      row.plan.exports = [{ itemId: 1101, perSecond: planned }];
+      return row;
+    };
+
+    it('warms up on by four windows of the measurement, once, and then measures as a plain run does', () => {
+      const row = near(3.09);
+      const plain = simulate(row, {});
+      expect(plain.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
+      let asked = 0;
+      const sim = simulate(row, { acceptable: () => (asked++, false) });
+      expect(asked).toBe(1);
+      expect(sim.measuredTargetRate).toBeLessThan(0.99 * 3.09);
+      // 72000 of warm-up and 18000 measured, then 4 x 18000 = 72000 more, in steps of 36000
+      expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS + 18000 + 72000);
+      expect(sim).toEqual(simulate(row, { warmupTicks: sim.warmupTicksUsed }));
+    });
+
+    it('is the signals that decide after that: a start-up still under way goes on', () => {
+      // the decoy block of the start-up tests takes 2 % of the ore until its store is full, which is 200000 ticks
+      const row = decoyRow(200);
+      row.plan.exports = [{ itemId: 1101, perSecond: 6.1 }];
+      const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: () => false });
+      expect(sim.warmupTicksUsed).toBeGreaterThan(MAX_WARMUP_TICKS + 18000 + 72000);
+    }, 60_000);
+
+    it('does not extend a result that is further away than 5 %, or one that is at the gate already', () => {
+      for (const planned of [3.4, 3.0]) {
+        const row = near(planned); // 0.88 of 3.4: a stage short of the rate; 3.0: the rate is there and `acceptable` just says no
+        const sim = simulate(row, { acceptable: () => false });
+        expect(sim, `planned ${planned}`).toEqual(simulate(row, {}));
+      }
+    });
+
+    it('an explicit warm-up is not extended', () => {
+      const sim = simulate(near(3.09), { warmupTicks: 7200, acceptable: () => false });
+      expect(sim.warmupTicksUsed).toBe(7200);
+    });
+  });
+
   it('stillRising: the target rate or the stored total keeps rising across the last six windows beyond its own noise, and not a level, a swing, or a drift under the floor', () => {
     const flat = storedSeries(720, 0, 3);
     // the target rate: a level with swings, and a climb under the same swings
