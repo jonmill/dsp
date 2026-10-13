@@ -28,9 +28,8 @@
 // holds the proliferator's slot, with no taps and a dead end. Where it goes is not known yet: the router lays it through
 // the top passages of the coaters, which are placed on the other nets' routes (proliferator.ts). Every other net that has a
 // consumer in a proliferated stage is marked `sprayed`: a coater goes on its belt. The feed takes a belt port of its
-// station like any other net, so a full station (12 ports) gets a new one. A plan that makes the proliferator it sprays with
-// (`plan.selfSpray`: the target is the sprayed proliferator, or a stage makes it for the others) has no import of it: the item has
-// an export slot, the nets that carry it to the station include the spray on top of the export, and the feed starts at the
+// station like any other net, so a full station (12 ports) gets a new one. A plan whose target is the proliferator it sprays with
+// (`plan.selfSpray`) has no import of it: the item has an export slot, the nets that carry it to the station include the spray on top of the export, and the feed starts at the
 // station that takes them in (the netlist groups the feed with the sinks of its item, as it does an import with the nets that come
 // back), so the slot's stock is what the coaters draw and the export is what is left.
 //

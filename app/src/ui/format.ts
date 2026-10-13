@@ -89,16 +89,12 @@ export function noLayoutMessage(stoppedBy: 'budget' | 'user' | 'exhausted' | 'ea
 }
 
 /**
- * What to tell the player about a plan that makes the proliferator its coaters spray with (`ProductionPlan.selfSpray`): it is not
- * supplied, the stages make it and the station hands it to the coaters. `net` is the rate the plan delivers when the proliferator is also
- * the target (the stages then make that and the spray); null when it is made for the coaters only. The station starts empty, so the
- * first spray has to come from the player.
+ * What to tell the player about a plan whose target is the proliferator its coaters spray with (`ProductionPlan.selfSpray`): it is not
+ * supplied, the stages make it and the station hands it to the coaters. `net` is the rate the plan delivers (the stages make that and
+ * the spray). The station starts empty, so the first spray has to come from the player.
  */
-export function selfSprayNote(name: string, spray: number, net: number | null, unit: 's' | 'min' = 's'): string {
-  const lead =
-    net === null
-      ? `${formatRate(spray, unit)} of the ${name} the stages make goes to the plan's own spray coaters, through a station slot of its own.`
-      : `${formatRate(spray, unit)} of the ${name} the stages make feeds the plan's own spray coaters, so they make ${formatRate(net + spray, unit)} to deliver ${formatRate(net, unit)}.`;
+export function selfSprayNote(name: string, spray: number, net: number, unit: 's' | 'min' = 's'): string {
+  const lead = `${formatRate(spray, unit)} of the ${name} the stages make feeds the plan's own spray coaters, so they make ${formatRate(net + spray, unit)} to deliver ${formatRate(net, unit)}.`;
   return `${lead} Nothing is supplied for it; the coaters start from what the station holds, so put a few ${name} in it first.`;
 }
 

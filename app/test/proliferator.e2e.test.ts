@@ -199,6 +199,37 @@ describe('the proliferator network end to end [slow]', () => {
     900_000,
   );
 
+  // Final review, round 2: a spray item that is only an intermediate (Mk.II, which the Mk.III stage eats) is not made for the coaters: it is
+  // an import like any other, as before, because the validator measures only the target and the exports, and the net of an intermediate
+  // the coaters draw from ran short (Mk.I extra, 6/s: -2.6/s). These plans ladder-pass as they did.
+  it.each(['extra', 'speed'] as const)(
+    'Proliferator Mk.III at 6/s sprayed with Mk.II, %s: Mk.II is an import for the spray, there is no self-supply, and the ladder passes',
+    async (mode) => {
+      const plan = await planFor({
+        targetItemId: 1143,
+        quantity: { kind: 'rate', perSecond: 6 },
+        suppliedItemIds: new Set([1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031]),
+        proliferator: { tier: 2, mode },
+        machineHeadroom: DEFAULT_MACHINE_HEADROOM,
+      });
+      expect(plan.selfSpray).toBeUndefined();
+      expect(plan.imports.find((i) => i.itemId === 1142)?.perSecond).toBeCloseTo(plan.proliferatorPerSecond, 9);
+      expect(plan.stationSlots.filter((s) => s.itemId === 1142)).toEqual([{ itemId: 1142, role: 'proliferator' }]);
+      const { result, seconds } = solveLogged(`Proliferator Mk.III, Mk.II ${mode}`, plan, { timeBudgetMs: 1 });
+      expect(result.layout, `no layout; ${result.failures.join(' || ')}`).not.toBeNull();
+      const report = validateLayout(result.layout as Layout, plan, data, effects);
+      const sim = report.sim!;
+      log(
+        `Proliferator Mk.III sprayed with Mk.II, ${mode}: ${plan.stages.reduce((n, s) => n + s.machines, 0)} machines; ladder ${seconds.toFixed(1)} s; ` +
+          `${sim.measuredTargetRate.toFixed(3)}/s of ${wantedRate(plan)}/s, the coaters took ${sim.coaters.proliferatorPerSecond.toFixed(3)} Mk.II/s (plan ${plan.proliferatorPerSecond.toFixed(3)}/s)`,
+      );
+      expect(messages(report)).toEqual([]);
+      expect(report.pass).toBe(true);
+      expect(sim.measuredTargetRate).toBeGreaterThanOrEqual(0.99 * wantedRate(plan));
+    },
+    900_000,
+  );
+
   it('the same line without a proliferator: no coaters, no feed belt, and fewer constraints on the footprint (the numbers the report compares)', async () => {
     const plain = await processorPlan(1);
     const sprayed = await processorPlan(1, { tier: 3, mode: 'extra' });

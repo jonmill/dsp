@@ -339,9 +339,9 @@ export function makeBlueprint(
   const estimate = withLayout(plan.power, { coaters: layout.coaters?.length ?? 0, stations: laidStations }, index);
   // the export slots the layout has for a surplus (it deadlocked without): the player drains them
   const surplus = surplusExportsIn(layout, plan).map((s) => itemName(index, s.itemId));
-  // a proliferator the plan makes for its own coaters is no supply: say where it comes from
+  // a target that is the proliferator its own coaters spray with is no supply: say where the spray comes from
   const own = plan.selfSpray;
-  const ownSpray = own ? [selfSprayNote(itemName(index, own.itemId), own.perSecond, own.itemId === plan.request.targetItemId ? rate : null)] : [];
+  const ownSpray = own ? [selfSprayNote(itemName(index, own.itemId), own.perSecond, rate)] : [];
   const lines = [
     `${shortDesc}, ${machines} machines, ${stations}${footprint === null ? '' : `, ${Math.round(footprint)} tiles`}.`,
     imports.length > 0 ? `Supplied: ${imports.join(', ')}.` : 'Nothing supplied.',

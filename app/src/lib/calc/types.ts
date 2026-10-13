@@ -97,20 +97,21 @@ export interface ProductionPlan {
   /**
    * Includes the proliferator, which has no flows (spray coaters consume it, not stages). If the
    * proliferator item is also a regular import, the two are summed into one entry and the flows
-   * carry only the regular part. Not a proliferator the plan makes itself (`selfSpray`): nothing imports that.
+   * carry only the regular part. Not the target when it is its own spray (`selfSpray`): nothing imports that. A spray item that is only
+   * an intermediate of the plan is an import like any other, and the player supplies it.
    */
   imports: ItemRate[];
   /**
    * The target comes first, then by-products nothing consumes. The target's rate is the net one, what the player collects: for
-   * a product that is also the proliferator its coaters spray with (`selfSpray`) it is the stages' output less the spray.
+   * a target that is also the proliferator its coaters spray with (`selfSpray`) it is the stages' output less the spray.
    */
   exports: ItemRate[];
   /**
-   * Present when the plan makes the proliferator it sprays with (the target is that proliferator, or a stage makes it for the others'
-   * recipes) and it is not supplied: the stages that make it are sized for the spray as well as for the rate (the export is the net),
-   * `perSecond` is `proliferatorPerSecond` and the plan has no import of the item. The flows to the export carry the spray on top
-   * of the export, and the station slot is an export one: the coaters' feed draws the spray from it. Absent: the spray is an import
-   * (or there is none).
+   * Present when the target is the proliferator the plan sprays with: the stages that make it are sized for the spray as well as
+   * for the rate (the export is the net), `perSecond` is `proliferatorPerSecond` and the plan has no import of the item. The flows to
+   * the export carry the spray on top of the export, and the station slot is an export one: the coaters' feed draws the spray from
+   * it. Absent: the spray is an import (or there is none), also when a stage makes the spray item for the others (an intermediate
+   * is not validated net: the validator measures the target and the exports).
    */
   selfSpray?: ItemRate;
   /**

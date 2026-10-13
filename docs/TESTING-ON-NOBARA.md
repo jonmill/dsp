@@ -259,11 +259,12 @@ extraction run that wrote the file, and `local/extract-report.json`.
   It changes the plan (machine counts, power) and the block: spray coaters on the belts of proliferated stages, one raised
   feed belt that reaches all coaters, and a station slot for the proliferator. **You must put that proliferator into the
   station by hand** (the plan table lists the rate it needs), like every other supplied item. Leave it at None for the first
-  tests. If the plan makes that proliferator itself (the target is the proliferator you spray with, or a stage makes it for
-  the others), there is nothing to supply: the stages are sized for the rate and the spray, the plan table says how much of
-  the output feeds the plan's own coaters, and the coaters draw it from the product's slot in the station. The station starts
-  empty, so put a few of that proliferator in it first; the block then builds its own stock, and the rate you collect is the
-  net one (the validator judges it net).
+  tests. If the target is the proliferator you spray with (Proliferator Mk.III sprayed with Mk.III), there is nothing to supply:
+  the stages are sized for the rate and the spray, the plan table says how much of the output feeds the plan's own coaters, and
+  the coaters draw it from the product's slot in the station. The station starts empty, so put a few of that proliferator in it
+  first; the block then builds its own stock, and the rate you collect is the net one (the validator judges it net). A spray item
+  that is only an intermediate of the plan (Mk.III sprayed with Mk.II, which its Mk.III stage also eats) is supplied like any
+  other import.
 - **Machine headroom** (default 1 %). A stage that would keep less than this share of its machines spare gets at least one
   more machine (`ceil(exact need x (1 + headroom))`), so at 1 % any stage that would run above 99 % busy gets another. That
   keeps the output from dipping below the plan rate; it is why a block has slightly more machines than you may expect.
