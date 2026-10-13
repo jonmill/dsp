@@ -9,7 +9,7 @@ import { compatibleFacilities, planProduction, plannableProducers } from '../src
 import type { ProductionPlan } from '../src/lib/calc';
 import type { Layout } from '../src/lib/geometry';
 import { surplusExportsIn } from '../src/lib/calc';
-import { DEFAULT_SOLVE_OPTIONS, solve } from '../src/lib/layout/solver';
+import { DEADLOCK_PROBE_TICKS, DEFAULT_SOLVE_OPTIONS, solve } from '../src/lib/layout/solver';
 import { data, effects, everything } from '../src/lib/layout/testkit';
 import { checkSimulation, runSimulation, validateLayout } from '../src/lib/validate';
 import { RAW_ITEMS } from './ladderSweep';
@@ -78,5 +78,61 @@ describe('Deuteron Fuel Rod with Mk.III proliferator', () => {
       expect(sim.measuredTargetRate, `rung ${i + 1}`).toBeGreaterThan(0.9);
       expect(checkSimulation(sim, layout, plan, data).filter((v) => v.code === 'SIM_DEADLOCK'), `rung ${i + 1}`).toEqual([]);
     }
+  }, 300_000);
+});
+
+// A deadlock that comes after the start-up (Task 30b round 3). Crystal Explosive Unit with Mk.III proliferator (14 machines): the
+// ladder's first layout passes validateLayout (1.04/s after 54000 ticks of warm-up) and moves for 160000 ticks, and from about
+// 240000 on nothing moves, for good, because the hydrogen belt its two producers share is full and one of them blocks. The ladder
+// watches a sinkless layout of a plan with surplus candidates to DEADLOCK_PROBE_TICKS before it takes it.
+describe('Crystal Explosive Unit with Mk.III proliferator', () => {
+  const hydrogen = data.data.items.find((i) => i.name === 'Hydrogen')!.id;
+
+  it('the premise: the sinkless layout passes validateLayout, is fine at 160000 ticks, and is stuck at 400000', async () => {
+    const plan = await planOf('Crystal Explosive Unit', 3);
+    const layouts: Layout[] = [];
+    // the validator without the probe, as plain validateLayout is: the first rung's layout passes
+    const noProbe: typeof validateLayout = (layout, p, d, fx, o) => {
+      layouts.push(layout);
+      return validateLayout(layout, p, d, fx, { ...o, deadlockProbeTicks: undefined });
+    };
+    const result = solve(plan, data, effects, { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: 1 }, () => {}, () => {}, () => false, noProbe);
+    expect(result.report!.pass).toBe(true);
+    const bare = layouts[0];
+    expect(surplusExportsIn(bare, plan)).toEqual([]);
+    expect(validateLayout(bare, plan, data, effects).pass).toBe(true); // plain validateLayout takes it
+    expect(runSimulation(bare, plan, data, effects, { warmupTicks: 160_000 }).deadlocked).toBe(false);
+    const late = runSimulation(bare, plan, data, effects, { warmupTicks: 400_000 });
+    expect(late.deadlocked).toBe(true);
+    expect(late.measuredTargetRate).toBe(0);
+  }, 300_000);
+
+  it('the ladder returns a layout with the surplus export, built from margin 3 on, that moves to the probe horizon', async () => {
+    const plan = await planOf('Crystal Explosive Unit', 3);
+    const phases: string[] = [];
+    const result = solve(
+      plan, data, effects, { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: 1 },
+      (p) => { if (p.phase.startsWith('ladder:')) phases.push(p.phase); }, () => {}, () => false,
+    );
+    expect(phases).toEqual(['ladder: margin 3 deadlocked; Hydrogen gets a surplus export from here on', 'ladder: margin 3 (surplus export)']);
+    expect(result.failures.some((f) => f.startsWith('margin 3: SIM_DEADLOCK') && f.includes('of the run nothing did'))).toBe(true);
+    expect(result.layout).not.toBeNull();
+    expect(surplusExportsIn(result.layout!, plan).map((s) => s.itemId)).toEqual([hydrogen]);
+    expect(validateLayout(result.layout!, plan, data, effects).pass).toBe(true);
+    const horizon = runSimulation(result.layout!, plan, data, effects, { warmupTicks: DEADLOCK_PROBE_TICKS });
+    expect(horizon.deadlocked).toBe(false);
+    expect(horizon.measuredTargetRate).toBeGreaterThan(0.99);
+  }, 300_000);
+
+  it('a plan whose sinkless layout does not get stuck keeps it: Crystal Explosive Unit, plain', async () => {
+    const plan = await planOf('Crystal Explosive Unit', 0);
+    const phases: string[] = [];
+    const result = solve(
+      plan, data, effects, { ...DEFAULT_SOLVE_OPTIONS, timeBudgetMs: 1 },
+      (p) => { if (p.phase.startsWith('ladder:')) phases.push(p.phase); }, () => {}, () => false,
+    );
+    expect(phases).toEqual(['ladder: margin 3']);
+    expect(surplusExportsIn(result.layout!, plan)).toEqual([]);
+    expect(runSimulation(result.layout!, plan, data, effects, { warmupTicks: DEADLOCK_PROBE_TICKS }).deadlocked).toBe(false);
   }, 300_000);
 });

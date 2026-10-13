@@ -6,7 +6,7 @@ import { LayoutKit, compositeLayout } from '../validate/testkit';
 import { MAX_WARMUP_TICKS, SimulationAborted, validateLayout, WarmupNotSettled } from '../validate';
 import type { ValidateOptions, ValidationReport } from '../validate';
 import type { SimResult } from '../validate/sim/run';
-import { annealHeat, annealStart, BestKeeper, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, mayReplaceBest, Reheat, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
+import { annealHeat, annealStart, BestKeeper, DEADLOCK_PROBE_TICKS, DEFAULT_SOLVE_OPTIONS, footprintOf, ladderRungs, MarginPicker, mayReplaceBest, Reheat, solve, solveSteps, validateGated, validateWithRetry, warmupCapFor } from './solver';
 import type { SolveOptions, SolveProgress, SolveResult } from './solver';
 import { VERIFIED_MOTIFS } from './motifs';
 import { buildNetlist } from './netlist';
@@ -1037,15 +1037,22 @@ describe('solve', () => {
     };
     const passed: ValidationReport = { pass: true, violations: [], checkedAt: '', stage: 'simulation' };
 
-    /** A validator that answers `verdicts[n]` to the n-th validation and records the plan and the layout it was given. */
+    /** A validator that answers `verdicts[n]` to the n-th validation and records the plan, the layout and the probe it was given. */
     function recording(verdicts: ValidationReport[]) {
-      const seen: { plan: ProductionPlan; layout: Layout }[] = [];
-      const fn = ((layout, plan) => {
-        seen.push({ plan, layout });
+      const seen: { plan: ProductionPlan; layout: Layout; probe: number | undefined }[] = [];
+      const fn = ((layout, plan, _d, _fx, o) => {
+        seen.push({ plan, layout, probe: (o as ValidateOptions | undefined)?.deadlockProbeTicks });
         return verdicts[Math.min(seen.length - 1, verdicts.length - 1)];
       }) as typeof validateLayout;
       return { fn, seen };
     }
+    /** The verdict of a layout that moved in the measurement and was stuck at the probe's horizon: SIM_DEADLOCK alone. */
+    const probeDeadlock: ValidationReport = {
+      pass: false,
+      violations: [{ code: 'SIM_DEADLOCK', entities: [], message: 'the measurement made progress, but at tick 1000000 of the run nothing did' }],
+      checkedAt: '',
+      stage: 'simulation',
+    };
     const hasHydrogenExport = (plan: ProductionPlan): boolean => plan.stationSlots.some((s) => s.itemId === HYDROGEN && s.role === 'export');
     const solveWith = (plan: ProductionPlan, v: typeof validateLayout, phases: string[] = []) => {
       const fake = fakeClock(1);
@@ -1129,6 +1136,82 @@ describe('solve', () => {
       expect(phases.filter((p) => p.startsWith('ladder:'))).toEqual(['ladder: margin 3 rejected', 'ladder: margin 4']);
       expect(result.failures.every((f) => f.startsWith('margin 3: '))).toBe(true);
     }, 120_000);
+
+    it('a sinkless layout of a plan with candidates is validated with the deadlock probe, one with the sinks on is not', async () => {
+      const plan = await deuteronPlan();
+      const v = recording([deadlock, rejection, passed]);
+      solveWith(plan, v.fn);
+      expect(v.seen.map((x) => x.probe)).toEqual([DEADLOCK_PROBE_TICKS, undefined, undefined]);
+      expect(DEADLOCK_PROBE_TICKS).toBeGreaterThanOrEqual(1_000_000);
+    }, 300_000);
+
+    it('a deadlock that only the probe sees switches the sinks on like any other: the same rung is built again with them', async () => {
+      const plan = await deuteronPlan();
+      // the validator passes the layout unless it is asked for the probe, which finds it stuck; with the sinks on it asks for none
+      const seen: { plan: ProductionPlan; probe: number | undefined }[] = [];
+      const fn = ((layout, p, _d, _fx, o) => {
+        const probe = (o as ValidateOptions).deadlockProbeTicks;
+        seen.push({ plan: p, probe });
+        return probe !== undefined ? probeDeadlock : passed;
+      }) as typeof validateLayout;
+      const phases: string[] = [];
+      const result = solveWith(plan, fn, phases);
+      expect(seen.map((x) => [hasHydrogenExport(x.plan), x.probe !== undefined])).toEqual([[false, true], [true, false]]);
+      expect(phases.filter((p) => p.startsWith('ladder:'))).toEqual([
+        'ladder: margin 3 deadlocked; Hydrogen gets a surplus export from here on',
+        'ladder: margin 3 (surplus export)',
+      ]);
+      expect(result.failures).toEqual(['margin 3: SIM_DEADLOCK: the measurement made progress, but at tick 1000000 of the run nothing did']);
+      expect(result.report).toBe(passed);
+      expect(surplusExportsIn(result.layout!, plan).map((x) => x.itemId)).toEqual([HYDROGEN]);
+    }, 300_000);
+
+    it('a plan with no candidates never probes: no rung, and no improvement candidate, is validated with a probe', async () => {
+      const plan = await ingotPlan();
+      const v = recording([rejection, passed]);
+      const fake = fakeClock(1_000);
+      solve(plan, data, effects, { ...DEFAULT_SOLVE_OPTIONS, ...SIM, seed: 7, minRunMs: 1e9, timeBudgetMs: 6_000, now: fake.now }, (p) => fake.onProgress(p), () => {}, () => false, v.fn);
+      expect(v.seen.length).toBeGreaterThan(2); // the ladder's two rungs, and improvement candidates
+      expect(v.seen.every((x) => x.probe === undefined)).toBe(true);
+    }, 120_000);
+
+    it('the improvement loop probes the candidates of a plan with candidates, and turns one down for a deadlock at the horizon', async () => {
+      // the ingot plan with a made-up candidate: only whether a probe is asked for matters here
+      const plan: ProductionPlan = { ...(await ingotPlan()), surplus: [{ itemId: 1101, perSecond: 0.1 }] };
+      const seen: (number | undefined)[] = [];
+      let calls = 0;
+      const fn = ((_layout, _p, _d, _fx, o) => {
+        const probe = (o as ValidateOptions).deadlockProbeTicks;
+        seen.push(probe);
+        return ++calls === 1 || probe === undefined ? passed : probeDeadlock; // the ladder's layout is fine, the candidates get stuck late
+      }) as typeof validateLayout;
+      const fake = fakeClock(1_000);
+      const phases: string[] = [];
+      const improved = vi.fn();
+      const result = solve(
+        plan, data, effects, { ...DEFAULT_SOLVE_OPTIONS, ...SIM, seed: 7, minRunMs: 1e9, timeBudgetMs: 12_000, now: fake.now },
+        (p) => fake.onProgress(p, (q) => phases.push(q.phase)), improved, () => false, fn,
+      );
+      expect(seen[0]).toBe(DEADLOCK_PROBE_TICKS); // the ladder's layout
+      expect(seen.length).toBeGreaterThan(1);
+      expect(seen.every((x) => x === DEADLOCK_PROBE_TICKS)).toBe(true); // and every candidate: the sinks are not on
+      expect(phases.some((p) => /^improve: margin \d rejected by the simulation$/.test(p))).toBe(true);
+      expect(improved).toHaveBeenCalledTimes(1); // only the ladder's layout was ever the best
+      expect(result.report).toBe(passed);
+    }, 120_000);
+
+    it('the budget message counts rungs, not attempts: a rung built again with the sinks is one rung', async () => {
+      const plan = await deuteronPlan();
+      const v = recording([deadlock, rejection]); // rung 1 deadlocks and is built again, rung 2 is turned down, the budget ends the ladder before rung 3
+      const fake = fakeClock(1_000);
+      const result = solve(
+        plan, data, effects, { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, ladderBudgetMs: 3_500, now: fake.now },
+        (p) => fake.onProgress(p), () => {}, () => false, v.fn,
+      );
+      expect(result.stoppedBy).toBe('budget');
+      expect(result.attempts).toBe(3); // three layouts were built...
+      expect(result.failures.at(-1)).toMatch(/^no valid layout within the time budget of 4 s: the ladder tried 2 of its 6 rungs/); // ...of two rungs
+    }, 300_000);
 
     it('a deadlock after a layout has passed over the longer window does not switch: the improvement loop would mix two netlists', async () => {
       const plan = await deuteronPlan();

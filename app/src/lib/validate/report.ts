@@ -6,7 +6,7 @@ import type { GameDataIndex, TechEffects } from '../data';
 import type { Layout } from '../geometry';
 import { checkCapacity } from './capacity';
 import { checkGeometry } from './geometry-checks';
-import { provisionedRate, runSimulation } from './sim/run';
+import { PROBE_WINDOW_TICKS, provisionedRate, runSimulation } from './sim/run';
 import type { SimResult } from './sim/run';
 import type { Violation, ViolationEntity } from './types';
 
@@ -31,6 +31,11 @@ export interface ValidateOptions {
   shouldAbort?: () => boolean;
   /** See `SimOptions.warmupCapTicks`: an adaptive warm-up that is still short of the rate at the cap ends with a `WarmupNotSettled`. */
   warmupCapTicks?: number;
+  /**
+   * A result that passes goes on to this many ticks in all, and fails with SIM_DEADLOCK if nothing moves at the end of them
+   * (`SimOptions.deadlockProbe`). Omitted: no probe, which is what plain `validateLayout` does.
+   */
+  deadlockProbeTicks?: number;
 }
 
 /** The target output must reach this share of the plan rate (the Global Constraints: 99 %). */
@@ -102,6 +107,18 @@ export function checkSimulation(sim: SimResult, layout: Layout, plan: Production
     });
   }
 
+  if (sim.deadlockProbe?.deadlocked && !sim.deadlocked) {
+    const stuck = sim.deadlockProbe.stuckBuildingIds.map((id): ViolationEntity => ({ kind: 'building', id }));
+    violations.push({
+      code: 'SIM_DEADLOCK',
+      entities: stuck,
+      message:
+        `the measurement made progress, but at tick ${sim.deadlockProbe.atTick} of the run nothing did for 600 ticks or more ` +
+        `(a block that was fine early and is stuck for good, as when a producer blocks on a belt nothing drains); ` +
+        `${stuck.length} of ${sim.machineStats.length} machines made no craft in the last ${PROBE_WINDOW_TICKS} ticks.${warnings}`,
+    });
+  }
+
   for (const stat of sim.stageStats) {
     if (stat.plannedCrafts <= 0 || stat.crafts >= stat.plannedCrafts * STAGE_FACTOR) continue;
     const stage = plan.stages[stat.stageIndex];
@@ -164,6 +181,10 @@ export function validateLayout(
     warmupCapTicks: opts.warmupCapTicks,
     acceptable: (result) => checkSimulation(result, layout, plan, data).length === 0,
     longerWindow: (result) => onlyStalled(checkSimulation(result, layout, plan, data)),
+    deadlockProbe:
+      opts.deadlockProbeTicks === undefined
+        ? undefined
+        : { horizonTicks: opts.deadlockProbeTicks, when: (result) => checkSimulation(result, layout, plan, data).length === 0 },
   });
   const violations = checkSimulation(sim, layout, plan, data);
   return { pass: violations.length === 0, violations, sim, checkedAt, stage: 'simulation' };

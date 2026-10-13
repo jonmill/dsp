@@ -3,7 +3,7 @@ import { GameDataIndex } from '../../data';
 import type { Layout } from '../../geometry';
 import { checkSimulation } from '../report';
 import { codesOf, fixtureData, fixtureEffects, ITEM, LayoutKit, line, only, onNode, onSlot, planOf, refineryLayout, smelterRowLayout, stationConfig, stationPairLayout } from '../testkit';
-import { ABORT_CHECK_TICKS, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, runSimulation, SimulationAborted, stillFilling, stillRising, stillStartingUp, WarmupNotSettled } from './run';
+import { ABORT_CHECK_TICKS, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, PROBE_WINDOW_TICKS, runSimulation, SimulationAborted, stillFilling, stillRising, stillStartingUp, WarmupNotSettled } from './run';
 import type { SimOptions, SimResult } from './run';
 
 const TPS = 60;
@@ -932,5 +932,65 @@ describe('runSimulation: aborting and capping the warm-up (Task 27)', () => {
     expect(simulate(row, { warmupTicks: 1200, measureTicks: 600, warmupCapTicks: 600 }).warmupTicksUsed).toBe(1200);
     const sim = simulate(smelterRowLayout(3, { deadEnd: true }), { measureTicks: 600, warmupCapTicks: MAX_WARMUP_TICKS });
     expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
+  });
+});
+
+describe('runSimulation: the deadlock probe (Task 30b)', () => {
+  /** A feed belt and a dead-end store of 60 cargo: sorter deliveries count as progress until the store is full, about 2400 ticks in. */
+  const fillingStore = () => {
+    const kit = new LayoutKit();
+    const source = kit.station(0, 0);
+    const feed = kit.belt(1, 1001, line([0, 5], [30, 5]), { source: { buildingId: source.id, port: 0 } });
+    const store = kit.belt(1, 1001, line([0, 9], [30, 9]));
+    kit.sorter(onNode(feed, 10), onNode(store, 10), 1, { filterItemId: 1001 });
+    return { kit, plan: { ...planOf([]), actualTargetRate: 1 } };
+  };
+
+  it('goes on to the horizon and watches the last window there; a block that keeps moving is no deadlock, and the verdict is untouched', () => {
+    const row = smelterRowLayout(3);
+    const plain = simulate(row, { warmupTicks: 1800, measureTicks: 3600 });
+    const probed = simulate(row, { warmupTicks: 1800, measureTicks: 3600, deadlockProbe: { horizonTicks: 20_000 } });
+    expect(probed.deadlockProbe).toEqual({ atTick: 20_000, deadlocked: false, stuckBuildingIds: [] });
+    expect({ ...probed, deadlockProbe: undefined }).toEqual(plain);
+  });
+
+  it('finds a block that is moving in the measurement and stuck by the horizon', () => {
+    const kit = fillingStore();
+    const sim = simulate(kit, { warmupTicks: 0, measureTicks: 1200, deadlockProbe: { horizonTicks: 9000 } });
+    expect(sim.deadlocked).toBe(false); // the store was still filling in the window
+    expect(sim.deadlockProbe).toMatchObject({ atTick: 9000, deadlocked: true });
+    expect(simulate(kit, { warmupTicks: 0, measureTicks: 1200 }).deadlockProbe).toBeUndefined(); // no probe, none asked for
+  });
+
+  it('lists the machines that made no craft in the last window', () => {
+    const row = smelterRowLayout(3);
+    const sim = simulate(row, { warmupTicks: 1800, measureTicks: 3600, deadlockProbe: { horizonTicks: 9000 } });
+    expect(sim.deadlockProbe!.stuckBuildingIds).toEqual([]);
+    row.ore.source = undefined; // no ore: nothing crafts
+    const dead = simulate(row, { warmupTicks: 1800, measureTicks: 3600, deadlockProbe: { horizonTicks: 9000 } });
+    expect(dead.deadlockProbe!.deadlocked).toBe(true);
+    expect(dead.deadlockProbe!.stuckBuildingIds).toHaveLength(3);
+  });
+
+  it('asks `when` about the verdict and probes only on a yes; no probe if the run is at the horizon already', () => {
+    const row = smelterRowLayout(3);
+    const asked: SimResult[] = [];
+    const opts = { warmupTicks: 1800, measureTicks: 3600 };
+    const no = simulate(row, { ...opts, deadlockProbe: { horizonTicks: 20_000, when: (r) => (asked.push(r), false) } });
+    expect(no.deadlockProbe).toBeUndefined();
+    expect(asked).toHaveLength(1);
+    expect(asked[0].measuredTargetRate).toBeGreaterThan(2.9);
+    expect(simulate(row, { ...opts, deadlockProbe: { horizonTicks: 20_000, when: () => true } }).deadlockProbe).toBeDefined();
+    expect(simulate(row, { ...opts, deadlockProbe: { horizonTicks: 5400 } }).deadlockProbe).toBeUndefined(); // 1800 + 3600 ticks have run
+    expect(simulate(row, { ...opts, deadlockProbe: { horizonTicks: 5400 + PROBE_WINDOW_TICKS } }).deadlockProbe?.atTick).toBe(5400 + PROBE_WINDOW_TICKS);
+  });
+
+  it('honours shouldAbort like the rest of the run', () => {
+    const row = smelterRowLayout(3);
+    let polls = 0;
+    // 5 polls for the warm-up and the measurement; the probe's first poll is the 6th, its second ends the run
+    const abort = () => ++polls > 6;
+    expect(() => simulate(row, { warmupTicks: 1200, measureTicks: 1800, shouldAbort: abort, deadlockProbe: { horizonTicks: 100_000 } })).toThrow(SimulationAborted);
+    expect(polls).toBe(7);
   });
 });

@@ -23,7 +23,11 @@
 // SIM_DEADLOCK: that rung is built again with the sinks (`planWithSurplusSinks`: an export slot at a station, where the belts end), as
 // are the rungs after it, their labels say "surplus export", and the improvement loop keeps to the variant that passed. A
 // ladder that fails without a deadlock never switches them on. Deuteron Fuel Rod with Mk.III deadlocks without them and
-// passes with them; Gravity Missile Set and Plane Filter with Mk.III pass without them and fail with them.
+// passes with them; Gravity Missile Set and Plane Filter with Mk.III pass without them and fail with them. A deadlock can come
+// long after the start-up (Crystal Explosive Unit with Mk.III: fine for 160000 ticks, stuck for good from 240000, after a pass), so a
+// sinkless layout of such a plan is also run on to `DEADLOCK_PROBE_TICKS` before it is taken (`SimOptions.deadlockProbe`): the ladder's
+// layout and every layout the improvement loop would accept. A probe that finds nothing moving at the horizon is a SIM_DEADLOCK like
+// any other: the ladder switches the sinks on, the improvement loop turns the candidate down. It looks to that horizon and no further.
 //
 // Improvement loop. Until a stop condition holds: pick a margin from {1, 2} ({1, 2, 3} with a proliferator net, whose
 // feed wants the room of a wider placement), anneal the placement of the best layout
@@ -282,7 +286,20 @@ export interface SimSettings {
    * loop turns it off for a candidate that could not replace the best anyway (`mayReplaceBest`), which saves the simulation.
    */
   nearMissRetry?: boolean;
+  /**
+   * A layout that passes goes on to this many ticks in all, and fails with SIM_DEADLOCK if nothing moves at the end of them
+   * (`ValidateOptions.deadlockProbeTicks`). Set for a layout built without surplus sinks, of a plan that has candidates for them.
+   */
+  deadlockProbeTicks?: number;
 }
+
+/**
+ * How far a sinkless layout of a plan with surplus candidates is simulated before it is accepted (about 4.6 h of game time at 60
+ * ticks a second): a block can be fine for 160000 ticks and stuck for good from 240000 (Crystal Explosive Unit with Mk.III), which no
+ * measurement window near the start-up sees. A deadlock does not end, so one look at the horizon is enough; a layout that gets
+ * stuck later than this is not found.
+ */
+export const DEADLOCK_PROBE_TICKS = 1_000_000;
 
 /** The adaptive warm-up of a candidate is given up on after this many times the best layout's warm-up... */
 const WARMUP_CAP_FACTOR = 2;
@@ -351,6 +368,7 @@ export function validateGated(
     measureTicks: sim.measureTicks,
     shouldAbort: sim.shouldAbort,
     warmupCapTicks: sim.warmupCapTicks,
+    deadlockProbeTicks: sim.deadlockProbeTicks,
   };
   const first = validate(layout, plan, data, effects, opts);
   if (first.pass || !first.sim) return { report: first, longerWindow: false };
@@ -702,7 +720,11 @@ export function* solveSteps(
     let report: ValidationReport;
     let longerWindow: boolean;
     try {
-      ({ report, longerWindow } = validateGated(built.layout, plan, data, effects, { ...sim, shouldAbort: abort, warmupCapTicks: warmupCap, nearMissRetry }, validate));
+      // a layout without sinks, of a plan that has candidates for them, is also watched for a deadlock that comes late (see the ladder)
+      const deadlockProbeTicks = surplusCandidates.length > 0 && !sinksOn ? DEADLOCK_PROBE_TICKS : undefined;
+      ({ report, longerWindow } = validateGated(
+        built.layout, plan, data, effects, { ...sim, shouldAbort: abort, warmupCapTicks: warmupCap, nearMissRetry, deadlockProbeTicks }, validate,
+      ));
     } catch (err) {
       if (err instanceof SimulationAborted) return { stopped: true };
       if (err instanceof WarmupNotSettled) {
@@ -740,6 +762,8 @@ export function* solveSteps(
     adopt(provisional.best);
     progress(`ladder: ${provisional.tag}, over the longer window`);
   };
+  /** How many rungs were started: a rung built again with the sinks (after a deadlock) is the same rung. */
+  let rungsTried = 0;
   // the user stops the ladder, and so does its own budget when the caller set one (inside a routing or a simulation too)
   const ladderStop = (): boolean => shouldStop() || (opts.ladderBudgetMs !== undefined && elapsed() >= opts.ladderBudgetMs);
   /** Ends the ladder where it stands: the user's stop, or the ladder's budget (which says so in `failures`). */
@@ -749,7 +773,7 @@ export function* solveSteps(
     if (shouldStop() || opts.ladderBudgetMs === undefined || elapsed() < opts.ladderBudgetMs) return result('user');
     if (!keeper.best) {
       failures.push(
-        `no valid layout within the time budget of ${Math.round((opts.ladderBudgetMs ?? 0) / 1000)} s: the ladder tried ${attempts} of its ` +
+        `no valid layout within the time budget of ${Math.round((opts.ladderBudgetMs ?? 0) / 1000)} s: the ladder tried ${rungsTried} of its ` +
           `${rungs.length} rungs (${Math.round(elapsed() / 1000)} s)`,
       );
     }
@@ -768,6 +792,7 @@ export function* solveSteps(
     const tag = tagOf(rung);
     yield;
     if (ladderStop()) return endLadder();
+    rungsTried = Math.max(rungsTried, i + 1);
     const placed: MarginPlacement = { placement: constructive(margin), margin };
     const built = tryBuild(net, placed.placement, ladderStop, rung.exact ? EXACT_ROUTE : {}, rung.exact);
     attempts++;

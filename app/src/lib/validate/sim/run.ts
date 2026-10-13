@@ -70,6 +70,16 @@ export interface SimOptions {
    * to a run with an explicit `warmupTicks` as well.
    */
   longerWindow?: (result: SimResult) => boolean;
+  /**
+   * A look for a deadlock that comes after the start-up (Task 30b): a block whose shared by-product belt fills, and whose producers
+   * then block on it, can run for 100000 ticks and more before nothing moves any more (Crystal Explosive Unit with Mk.III: fine at
+   * 160000 ticks, dead at 240000 and for good). After the final measurement, if `when` says yes (default: always; the validator asks
+   * whether the result passes) and the run is not yet at `horizonTicks`, the run goes on to that many ticks in all and watches the last
+   * `PROBE_WINDOW_TICKS` of them for no progress (`DEADLOCK_TICKS` in a row). That is all it judges: the result of the measurement is
+   * not touched, `SimResult.deadlockProbe` says what the probe saw. A deadlock does not end, so the one look at the horizon is
+   * enough. It ends with a `SimulationAborted` when `shouldAbort` says yes, like the rest of the run.
+   */
+  deadlockProbe?: { horizonTicks: number; when?: (result: SimResult) => boolean };
 }
 
 /** `SimOptions.shouldAbort` said yes. */
@@ -145,6 +155,11 @@ export interface SimResult {
   warmupTicksUsed: number;
   /** Things the simulator saw in the layout that make it act differently from what was meant (mis-wired ports...). */
   warnings: string[];
+  /**
+   * Present when the run had a `SimOptions.deadlockProbe` that ran: the tick the probe window ended at, whether nothing made progress
+   * for `DEADLOCK_TICKS` in a row in it, and the machines that made no craft in it.
+   */
+  deadlockProbe?: { atTick: number; deadlocked: boolean; stuckBuildingIds: number[] };
 }
 
 /** `SimOptions.longerWindow` measures this many times the window. */
@@ -215,6 +230,8 @@ const WARMUP_REACHED = 0.999;
 const DEFAULT_MEASURE_TICKS = 18000;
 /** Consecutive measured ticks without progress that make a deadlock. */
 export const DEADLOCK_TICKS = 600;
+/** The window a `SimOptions.deadlockProbe` watches at its horizon: six times the stretch that makes a deadlock (1 game minute). */
+export const PROBE_WINDOW_TICKS = 3600;
 const STAGE_ROLE = /^stage:(\d+)$/;
 const itemName = (data: GameDataIndex, itemId: number): string => {
   try {
@@ -468,6 +485,25 @@ export function runSimulation(
   if (opts.longerWindow?.(measured)) {
     warmupTicksUsed = world.ticks;
     measured = measure(LONGER_WINDOW_FACTOR * measureTicks);
+  }
+  const probe = opts.deadlockProbe;
+  if (probe && world.ticks < probe.horizonTicks && (probe.when?.(measured) ?? true)) {
+    // on to the horizon (the last window of it is watched), the verdict above untouched
+    runTicks(Math.max(0, probe.horizonTicks - PROBE_WINDOW_TICKS - world.ticks));
+    for (const m of machines.list) m.machine.resetStats();
+    streak = 0;
+    longestStreak = 0;
+    measuring = true;
+    runTicks(PROBE_WINDOW_TICKS);
+    measuring = false;
+    measured = {
+      ...measured,
+      deadlockProbe: {
+        atTick: world.ticks,
+        deadlocked: expectsOutput && longestStreak >= DEADLOCK_TICKS,
+        stuckBuildingIds: machines.list.filter((m) => m.machine.crafts === 0).map((m) => m.buildingId),
+      },
+    };
   }
   return measured;
 }

@@ -86,6 +86,19 @@ describe('validateLayout', () => {
     expect(new Date(report.checkedAt).toISOString()).toBe(report.checkedAt);
   });
 
+  it('probes for a late deadlock only when asked: deadlockProbeTicks runs a passing layout on to that many ticks and still passes if it moves', () => {
+    const line_ = gearLine();
+    expect(validateKit(line_.kit, line_.plan).sim!.deadlockProbe).toBeUndefined(); // plain validateLayout does not
+    const probed = validateKit(line_.kit, line_.plan, { warmupTicks: 600, measureTicks: 1200, deadlockProbeTicks: 20_000 });
+    expect(probed.violations).toEqual([]);
+    expect(probed.sim!.deadlockProbe).toMatchObject({ atTick: 20_000, deadlocked: false });
+    // a layout that fails its verdict is not probed: it is turned down anyway (here the cold start of a 5 s window)
+    const turnedDown = validateKit(line_.kit, line_.plan, { warmupTicks: 0, measureTicks: 300, deadlockProbeTicks: 20_000 });
+    expect(turnedDown.pass).toBe(false);
+    expect(turnedDown.stage).toBe('simulation'); // it was simulated, and turned down
+    expect(turnedDown.sim?.deadlockProbe).toBeUndefined();
+  });
+
   it('stops at geometry: an overlap fails there, and no simulation runs', () => {
     const line_ = gearLine();
     line_.kit.assembler(10, 7, 0, 5, 2304); // on top of the first
@@ -368,6 +381,18 @@ describe('checkSimulation thresholds', () => {
     const v = only(check(sim), 'SIM_DEADLOCK');
     expect(v).toHaveLength(1);
     expect(v[0].entities).toEqual([{ kind: 'building', id: 7 }]);
+  });
+
+  it('SIM_DEADLOCK from the probe: the measurement made progress, the probe window at the horizon did not (Task 30b)', () => {
+    const stuck = simOf({ deadlockProbe: { atTick: 1_000_000, deadlocked: true, stuckBuildingIds: [7, 8] } });
+    const v = only(check(stuck), 'SIM_DEADLOCK');
+    expect(v).toHaveLength(1);
+    expect(v[0].entities).toEqual([{ kind: 'building', id: 7 }, { kind: 'building', id: 8 }]);
+    expect(v[0].message).toContain('at tick 1000000 of the run');
+    expect(check(stuck)).toHaveLength(1); // nothing else is judged
+    // a probe that saw progress is no violation, and a run that deadlocked in the measurement already is named once
+    expect(check(simOf({ deadlockProbe: { atTick: 1_000_000, deadlocked: false, stuckBuildingIds: [] } }))).toEqual([]);
+    expect(only(check(simOf({ deadlocked: true, deadlockProbe: { atTick: 1_000_000, deadlocked: true, stuckBuildingIds: [7] } })), 'SIM_DEADLOCK')).toHaveLength(1);
   });
 
   it('SIM_STALLED below 90 % of the planned crafts, with each machine\'s busy and blocked share', () => {
