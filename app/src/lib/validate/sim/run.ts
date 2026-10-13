@@ -9,6 +9,36 @@
 // Power: sorters, machines and coaters report their demand to the world every tick and set next tick's serve ratio
 // (`World`). Station charging is not part of that loop: it is reported as a constant at peak (blocks start with empty
 // stations), and `steadyW` leaves it out.
+//
+// What the target rate is. Items a station both takes in and gives out are counted net (`StationSim.delivered`): the
+// proliferator that is also the product comes in at the export port and goes out to the coaters, and what the player collects is
+// the difference.
+//
+// The verdict windows (final review, items 2 and M3). A rate is judged over a measurement window of W ticks (`measureTicks`:
+// 18000, 5 game minutes, or longer when the plan's rate is so low that 5 minutes hold fewer than `GATE_ITEMS` of its items: the
+// gate is 1 % of the rate, and an item more or less at the edges of the window must not be able to move the reading by more).
+// An output that swings from one window to the next (machines in step) reads differently in any two windows, so a failed window
+// followed by another window of the same length would be two looks at the same layout, the better of which counts. The rules
+// that keep that from happening, in the order they apply (`validateLayout` supplies `acceptable` and `longerWindow`):
+//  1. The adaptive warm-up, then one window of W ticks. If `acceptable` says yes it is the verdict.
+//  2. Else, if a start-up is under way (`stillStartingUp`: the stored total filling, or the stored total or the target rate rising
+//     across the last windows), the run warms up on until no signal sees one or the limit, and a fresh window of W ticks is the
+//     verdict: the window that failed was start-up, which is what the signals are for, not a look at the steady state.
+//  3. Else, if the first window missed the gate by under 5 % (`FIRST_MISS_SHARE`), the run waits `FIRST_MISS_WINDOWS` windows
+//     (a start-up too slow for the signals to see in so short a history, Automatic Piler with Mk.III) and measures the verdict over
+//     `LONGER_WINDOW_FACTOR` times W: no signal saw a start-up in it, so the failed window is explained by noise alone, and a
+//     fresh window of W ticks would be a second look. A start-up that has settled reads its rate in the long window as well.
+//     (A signal that fires at any time during the wait puts the run back under rule 2.)
+//  4. A verdict window shorter than `LONGER_WINDOW_FACTOR` times W that has no violation but SIM_STALLED (the target meets the
+//     gate) is measured once more over that many times W, which is then the verdict (the crafts of a stage swing with the cycle of a
+//     chain). A window that long already is not measured again.
+//  5. The deadlock probe (SIM_DEADLOCK only) runs on after the verdict and does not touch it.
+// And, one level up, `validateGated` (layout/solver.ts): a result whose only violation is SIM_OUTPUT_LOW within 2 % of the rate is
+// validated again from the start with a window twice the verdict's, and that second verdict stands (flagged `longerWindow`, so the
+// ladder prefers a layout that passed the plain one). Its window starts where the first one's did, so it is the same measurement
+// made longer, and it never overrides a longer window with a shorter one. So no path gives two verdicts from windows of the same
+// short length unless a start-up signal explained the first: every window that replaces a failed one is longer than it, or follows
+// a start-up. (A pass on the first window of a swinging output is one look, as it always was.)
 import type { ProductionPlan, ItemRate } from '../../calc';
 import type { Building, GameDataIndex, Recipe, TechEffects } from '../../data';
 import { coaterBuilding, coaterProliferators, findCoaterTop, sprayCoaterDef } from '../../geometry';
@@ -31,7 +61,7 @@ export interface SimOptions {
    * says how long it ran.
    */
   warmupTicks?: number;
-  /** Ticks measured. Default 18000 (5 game minutes). */
+  /** Ticks measured. Default 18000 (5 game minutes), or longer for a low rate, so that the window holds 100 items of it (`defaultMeasureTicks`). */
   measureTicks?: number;
   /** Power the block's network can supply, in watts. Omitted: unlimited (serve ratio 1). */
   powerSupplyW?: number;
@@ -231,6 +261,25 @@ export const ABORT_CHECK_TICKS = 600;
 /** Two consecutive warm-up windows that each make this share of the provisioned rate end the adaptive warm-up. */
 const WARMUP_REACHED = 0.999;
 const DEFAULT_MEASURE_TICKS = 18000;
+/**
+ * A measurement window holds at least this many of the target's items when the plan's rate allows: the gate is 1 % of the rate
+ * (`GATE_SHARE`), and an item more or less at the edges of the window moves the reading by 1 / items, so 100 items keep that
+ * to the gate's own 1 % (`outputTolerance` in `report.ts` widens the gate where a window holds fewer).
+ */
+export const GATE_ITEMS = Math.ceil(1 / (1 - GATE_SHARE) - 1e-9);
+/** ...but never longer than this many times the usual window (60 game minutes): a rate under ~0.028/s does not fill it. */
+const MAX_LOW_RATE_WINDOW_FACTOR = 12;
+
+/**
+ * The measurement window of a run that is not given one (`SimOptions.measureTicks`): 18000 ticks (5 game minutes), or, for a plan
+ * whose rate is low enough that those hold fewer than `GATE_ITEMS` items of its target (under 0.33/s), as many ticks as hold them, up
+ * to 12 times as many. `wantedPerSecond` is the provisioned rate; a plan without one gets the usual window.
+ */
+export function defaultMeasureTicks(wantedPerSecond: number, ticksPerSecond: number): number {
+  if (!(wantedPerSecond > 0)) return DEFAULT_MEASURE_TICKS;
+  const needed = Math.ceil((GATE_ITEMS / wantedPerSecond) * ticksPerSecond - 1e-9);
+  return Math.min(Math.max(DEFAULT_MEASURE_TICKS, needed), MAX_LOW_RATE_WINDOW_FACTOR * DEFAULT_MEASURE_TICKS);
+}
 /** Consecutive measured ticks without progress that make a deadlock. */
 export const DEADLOCK_TICKS = 600;
 /** The window a `SimOptions.deadlockProbe` watches at its horizon: six times the stretch that makes a deadlock (1 game minute). */
@@ -279,12 +328,12 @@ export function runSimulation(
   effects: TechEffects,
   opts: SimOptions = {},
 ): SimResult {
-  const measureTicks = opts.measureTicks ?? DEFAULT_MEASURE_TICKS;
+  const tps = data.data.constants.ticksPerSecond;
+  const measureTicks = opts.measureTicks ?? defaultMeasureTicks(provisionedRate(plan), tps);
   if (opts.warmupTicks !== undefined && (!Number.isInteger(opts.warmupTicks) || opts.warmupTicks < 0)) {
     throw new RangeError(`warmupTicks ${opts.warmupTicks} must be a whole number of at least 0`);
   }
   if (!Number.isInteger(measureTicks) || measureTicks < 1) throw new RangeError(`measureTicks ${measureTicks} must be a whole number of at least 1`);
-  const tps = data.data.constants.ticksPerSecond;
 
   const world = new World(layout, plan, data, effects, { powerSupplyW: opts.powerSupplyW });
   const buildingById = new Map<number, PlacedBuilding>();
@@ -458,6 +507,8 @@ export function runSimulation(
   };
 
   let measured = measure();
+  /** The length of the window the result stands on. */
+  let verdictTicks = measureTicks;
   const acceptable = opts.acceptable;
   if (stored && acceptable && !acceptable(measured)) {
     // A start-up still going on has not been judged. The window just measured was warm-up as far as the next one is concerned;
@@ -478,7 +529,13 @@ export function runSimulation(
     const gate = GATE_SHARE * wanted;
     const rate = measured.measuredTargetRate;
     let forcedSteps = wanted > 0 && rate < gate && rate >= (1 - FIRST_MISS_SHARE) * gate ? Math.ceil((FIRST_MISS_WINDOWS * measureTicks) / FILL_STEP_TICKS) : 0;
-    const goOn = (): boolean => forcedSteps > 0 || startingUp();
+    // whether a signal ever saw a start-up under way (asked at every decision, forced steps or not: it decides the verdict window)
+    let signalled = false;
+    const goOn = (): boolean => {
+      const now = startingUp();
+      if (now) signalled = true;
+      return now || forcedSteps > 0;
+    };
     if (goOn() && used + FILL_STEP_TICKS <= limit) {
       do {
         runTicks(FILL_STEP_TICKS);
@@ -486,10 +543,15 @@ export function runSimulation(
         if (forcedSteps > 0) forcedSteps--;
       } while (goOn() && used + FILL_STEP_TICKS <= limit);
       warmupTicksUsed = used;
-      measured = measure();
+      // A signal saw a start-up: the window that failed was warm-up, and a fresh window is the verdict. Without one, the first-miss
+      // rule alone kept the run waiting and the failed window has no explanation but noise; a second window of its length would be
+      // a second look at an output that may swing (a row of machines in step: 0.943 of the plan in the first window, 0.990 in the
+      // next, a mean of 0.966), so the verdict is measured over `LONGER_WINDOW_FACTOR` times the window.
+      verdictTicks = signalled ? measureTicks : LONGER_WINDOW_FACTOR * measureTicks;
+      measured = measure(verdictTicks);
     }
   }
-  if (opts.longerWindow?.(measured)) {
+  if (verdictTicks < LONGER_WINDOW_FACTOR * measureTicks && opts.longerWindow?.(measured)) {
     warmupTicksUsed = world.ticks;
     measured = measure(LONGER_WINDOW_FACTOR * measureTicks);
   }

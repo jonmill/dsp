@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { GameDataIndex } from '../../data';
 import type { Layout } from '../../geometry';
-import { checkSimulation } from '../report';
+import { checkSimulation, outputTolerance } from '../report';
 import { codesOf, fixtureData, fixtureEffects, ITEM, LayoutKit, line, only, onNode, onSlot, planOf, refineryLayout, smelterRowLayout, stationConfig, stationPairLayout } from '../testkit';
-import { ABORT_CHECK_TICKS, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, PROBE_WINDOW_TICKS, runSimulation, SimulationAborted, stillFilling, stillRising, stillStartingUp, WarmupNotSettled } from './run';
+import { ABORT_CHECK_TICKS, defaultMeasureTicks, GATE_ITEMS, LONGER_WINDOW_FACTOR, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, PROBE_WINDOW_TICKS, runSimulation, SimulationAborted, stillFilling, stillRising, stillStartingUp, WarmupNotSettled } from './run';
 import type { SimOptions, SimResult } from './run';
 
 const TPS = 60;
@@ -167,6 +167,44 @@ describe('runSimulation: a station that sends out what it takes in (final review
     const alone = runSimulation(stationPairLayout(1, 10).kit.layout(), planFor1001(6), fixtureData, fixtureEffects, FAST);
     expect(alone.measuredTargetRate).toBeGreaterThan(5);
     expect(checkSimulation(alone, stationPairLayout(1, 10).kit.layout(), planFor1001(5), fixtureData)).toEqual([]);
+  });
+});
+
+describe('runSimulation: the measurement window of a low rate (final review, M3)', () => {
+  /** A station feeds a Mk.I belt into another station; the plan asks for `provisioned`/s of what it carries (6/s). */
+  const measured = (provisioned: number, opts: SimOptions = {}): SimResult => {
+    const { kit } = stationPairLayout(1, 10);
+    const base = planOf([]);
+    const plan = {
+      ...base,
+      actualTargetRate: provisioned,
+      exports: [{ itemId: 1001, perSecond: provisioned }],
+      request: { ...base.request, targetItemId: 1001, quantity: { kind: 'rate' as const, perSecond: provisioned } },
+    };
+    return runSimulation(kit.layout(), plan, fixtureData, fixtureEffects, opts);
+  };
+
+  it('holds 100 items of the plan\'s rate, so that an item at the edges of the window is 1 %: 5 minutes down to 0.33/s, longer below', () => {
+    expect(GATE_ITEMS).toBe(100);
+    expect(measured(1).measureSeconds).toBe(300);
+    expect(measured(0.34).measureSeconds).toBe(300);
+    expect(measured(0.2).measureSeconds).toBe(500);
+    expect(measured(0.1).measureSeconds).toBe(1000);
+    expect(measured(0.05).measureSeconds).toBe(2000);
+  });
+
+  it('is capped at 12 times the usual window, which a rate under 0.028/s does not fill: the gate widens there (to 2 % at most)', () => {
+    expect(measured(0.01).measureSeconds).toBe(12 * 300);
+    expect(defaultMeasureTicks(0.01, 60)).toBe(12 * 18000);
+    expect(defaultMeasureTicks(0.0278, 60)).toBe(Math.ceil((100 / 0.0278) * 60));
+    // 0.01/s over 3600 s holds 36 items: one is 2.8 %, and the gate allows 2 %
+    expect(outputTolerance(0.01, 3600)).toBeCloseTo(0.0002, 12);
+  });
+
+  it('is the window the plan asks for unless the caller gives one, and a plan without a rate gets the usual one', () => {
+    expect(measured(0.1, { measureTicks: 7200 }).measureSeconds).toBe(120);
+    expect(measured(0).measureSeconds).toBe(300);
+    expect(defaultMeasureTicks(Number.NaN, 60)).toBe(18000);
   });
 });
 
@@ -348,7 +386,7 @@ describe('runSimulation: a start-up that is still going on', () => {
       return row;
     };
 
-    it('warms up on by four windows of the measurement, once, and then measures as a plain run does', () => {
+    it('warms up on by four windows of the measurement, once, and measures the verdict over four windows: no signal saw a start-up, so a window of the first one\'s length would be a second look', () => {
       const row = near(3.09);
       const plain = simulate(row, {});
       expect(plain.warmupTicksUsed).toBe(MAX_WARMUP_TICKS);
@@ -358,16 +396,69 @@ describe('runSimulation: a start-up that is still going on', () => {
       expect(sim.measuredTargetRate).toBeLessThan(0.99 * 3.09);
       // 72000 of warm-up and 18000 measured, then 4 x 18000 = 72000 more, in steps of 36000
       expect(sim.warmupTicksUsed).toBe(MAX_WARMUP_TICKS + 18000 + 72000);
-      expect(sim).toEqual(simulate(row, { warmupTicks: sim.warmupTicksUsed }));
+      expect(sim.measureSeconds).toBe(LONGER_WINDOW_FACTOR * 300);
+      expect(sim).toEqual(simulate(row, { warmupTicks: sim.warmupTicksUsed, measureTicks: LONGER_WINDOW_FACTOR * 18000 }));
     });
 
-    it('is the signals that decide after that: a start-up still under way goes on', () => {
+    it('is the signals that decide after that: a start-up still under way goes on, and its verdict is a fresh window of the usual length', () => {
       // the decoy block of the start-up tests takes 2 % of the ore until its store is full, which is 200000 ticks
       const row = decoyRow(200);
       row.plan.exports = [{ itemId: 1101, perSecond: 6.1 }];
       const sim = runSimulation(row.layout, row.plan, row.data, fixtureEffects, { acceptable: () => false });
       expect(sim.warmupTicksUsed).toBeGreaterThan(MAX_WARMUP_TICKS + 18000 + 72000);
+      expect(sim.measureSeconds).toBe(300);
     }, 60_000);
+
+    describe('a row of machines in step, whose output swings from window to window (final review, item 2)', () => {
+      // Six smelters on a 713-tick recipe, all in step: 6 items every 713 ticks, 25 batches and a bit in a window of 18000 ticks. A plan
+      // asked for 0.5227/s (a mean of 0.966 of it) reads 0.957 of it in the first window, 0.995 in a fresh one after the extension,
+      // and 0.966 over any long stretch: the layout is under the gate, however the windows fall.
+      const T = 713;
+      const planned = (6 * 60) / T / 0.966;
+      const raw = structuredClone(fixtureData.data);
+      raw.recipes.find((r) => r.id === 1)!.timeTicks = T;
+      const slow = new GameDataIndex(raw);
+      const swinging = (): ReturnType<typeof smelterRowLayout> => {
+        const row = smelterRowLayout(6);
+        row.plan.exports = [{ itemId: 1101, perSecond: planned }];
+        row.plan.actualTargetRate = planned;
+        row.plan.stages[0].craftsPerSecond = 360 / T;
+        row.plan.stages[0].perMachineCraftsPerSecond = 60 / T;
+        return row;
+      };
+      const run = (row: ReturnType<typeof swinging>, opts: SimOptions): SimResult => runSimulation(row.kit.layout(), row.plan, slow, fixtureEffects, opts);
+      const passes = (row: ReturnType<typeof swinging>, sim: SimResult): boolean => checkSimulation(sim, row.kit.layout(), row.plan, slow).length === 0;
+
+      it('swings: the first window and a fresh one after the extension read 0.957 and 0.995 of the plan, a long stretch 0.966', () => {
+        const row = swinging();
+        const first = run(row, { warmupTicks: MAX_WARMUP_TICKS });
+        const fresh = run(row, { warmupTicks: MAX_WARMUP_TICKS + 18000 + 72000 });
+        const long = run(row, { warmupTicks: MAX_WARMUP_TICKS + 18000 + 72000, measureTicks: LONGER_WINDOW_FACTOR * 18000 });
+        expect(first.measuredTargetRate / planned).toBeCloseTo(0.957, 2);
+        expect(fresh.measuredTargetRate / planned).toBeCloseTo(0.995, 2);
+        expect(long.measuredTargetRate / planned).toBeCloseTo(0.966, 2);
+        expect(passes(row, first)).toBe(false);
+        expect(passes(row, fresh)).toBe(true); // a second short look would pass it
+        expect(passes(row, long)).toBe(false);
+      });
+
+      it('does not pass: the verdict after the first-miss extension is measured over four windows, which read the mean', () => {
+        const row = swinging();
+        const verdicts: SimResult[] = [];
+        const sim = run(row, { acceptable: (r) => (verdicts.push(r), passes(row, r)) });
+        expect(verdicts).toHaveLength(1); // only the first measurement is asked about; no signal saw a start-up
+        expect(verdicts[0].measureSeconds).toBe(300);
+        expect(sim.measureSeconds).toBe(LONGER_WINDOW_FACTOR * 300);
+        expect(sim.measuredTargetRate / planned).toBeLessThan(0.985);
+        expect(passes(row, sim)).toBe(false);
+      });
+
+      it('and a row whose first window is at the gate is not looked at again', () => {
+        const row = smelterRowLayout(4);
+        const sim = runSimulation(row.kit.layout(), row.plan, fixtureData, fixtureEffects, { acceptable: () => true });
+        expect(sim.measureSeconds).toBe(300);
+      });
+    });
 
     it('does not extend a result that is further away than 5 %, or one that is at the gate already', () => {
       for (const planned of [3.4, 3.0]) {

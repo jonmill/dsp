@@ -349,6 +349,13 @@ describe('validateWithRetry (a longer measure window for a near miss)', () => {
       expect(v.calls[1].warmupTicks).toBeUndefined();
     });
 
+    it('doubles the window the first run\'s verdict stood on, so a retry never overrides a long window with a shorter one (first-miss rule, final review item 2)', () => {
+      // the first run waited out a first miss and measured its verdict over four windows (1200 s): the retry is 2400 s, not 600 s
+      const v = validator(report([low], sim(1.98, 1200)), report([], sim(2, 2400)));
+      retry(v);
+      expect(v.calls[1].measureTicks).toBe(144000);
+    });
+
     it('returns the longer window verdict even when it fails too (and does not retry again)', () => {
       const second = report([low], sim(1.96, 120));
       const v = validator(report([low], sim(1.97)), second);
