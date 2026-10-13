@@ -8,7 +8,7 @@ import { assemblerSorters, loadBlueprintSample } from '../../../test/fixtures/bl
 import { GameDataIndex, parseGameData } from '../data';
 import { headingDeg, portInfos, prefabToGrid, slotInfos, sorterEnds, sorterTapPoint, TILE } from '../geometry';
 import type { BeltPath, Layout, PlacedBuilding, Sorter, StationConfig, StationPortConfig } from '../geometry';
-import { layoutToBlueprint, layoutToBlueprintString } from './build';
+import { CONVENTIONS_FLAG, CONVENTIONS_VERIFIED, layoutToBlueprint, layoutToBlueprintString } from './build';
 import { decodeBlueprint, encodeBlueprint } from './codec';
 import type { BlueprintBuilding } from './model';
 
@@ -243,21 +243,27 @@ describe('layoutToBlueprint', () => {
     expect(s.yaw).toBeCloseTo(180, 4);
   });
 
-  test('(c) desc carries the approximate-geometry flag only when the geometry is approximate', () => {
+  test('(c) desc carries the approximate-geometry flag only when the geometry is approximate, and the conventions flag always (final review, M5)', () => {
+    expect(CONVENTIONS_VERIFIED).toBe(false);
     const approx = decodeBlueprint(layoutToBlueprintString(layoutOf({ buildings: [tower(1, 0, 0)] }), data, OPTS));
     expect(approx.header.desc).toContain('approximate');
-    expect(approx.header.desc).toBe('hand-made\n[geometry: approximate - unverified in game]');
+    expect(approx.header.desc).toBe('hand-made\n[geometry: approximate - unverified in game]\n[conventions: yaw and axes not yet verified in game]');
 
+    // extracting the geometry is not checking the conventions: the blueprint still says so
     const extracted = decodeBlueprint(
       layoutToBlueprintString(layoutOf({ buildings: [tower(1, 0, 0)], meta: meta('extracted') }), data, OPTS),
     );
     expect(extracted.header.desc).not.toContain('approximate');
-    expect(extracted.header.desc).toBe('hand-made');
+    expect(extracted.header.desc).toBe(`hand-made\n${CONVENTIONS_FLAG}`);
 
     const noDesc = decodeBlueprint(
       layoutToBlueprintString(layoutOf({ buildings: [tower(1, 0, 0)] }), data, { ...OPTS, desc: '' }),
     );
-    expect(noDesc.header.desc).toBe('[geometry: approximate - unverified in game]');
+    expect(noDesc.header.desc).toBe(`[geometry: approximate - unverified in game]\n${CONVENTIONS_FLAG}`);
+    const bare = decodeBlueprint(
+      layoutToBlueprintString(layoutOf({ buildings: [tower(1, 0, 0)], meta: meta('extracted') }), data, { ...OPTS, desc: '' }),
+    );
+    expect(bare.header.desc).toBe(CONVENTIONS_FLAG);
   });
 
   test('(d) every record has index == position and every link is in range', () => {

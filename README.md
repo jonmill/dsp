@@ -65,4 +65,5 @@ The app reads `data/dsp-<gameVersion>.json` (the highest game version) and falls
 What is approximate until the extractor has run on your game: building footprints and sorter slot positions come from
 the fixture, which only estimates them, so every blueprint made from it is flagged "geometry: approximate - unverified in
 game" and may overlap or leave belts unconnected. Even with extracted geometry the yaw and axis convention and several belt,
-sorter, station and spray coater details have not been tried in the game; the runbook lists each one to check.
+sorter, station and spray coater details have not been tried in the game; the runbook lists each one to check, and the app
+and every blueprint description keep a "conventions not yet verified in game" note until the first paste has come out right.

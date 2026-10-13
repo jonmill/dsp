@@ -887,7 +887,10 @@ describe('solve', () => {
     const extracted = { ...solved, meta: { ...solved.meta, geometrySource: 'extracted' as const } };
     runs[0].callbacks.onImproved?.(extracted, passing, 150);
     expect(app.blueprint?.approximate).toBe(false);
-    expect(decodeBlueprint(app.blueprint!.text).header.desc).not.toContain('approximate');
+    const desc = decodeBlueprint(app.blueprint!.text).header.desc;
+    expect(desc).not.toContain('approximate');
+    // ...but the conventions are unverified until a paste in game says otherwise, whatever the geometry (final review, M5)
+    expect(desc).toContain('[conventions: yaw and axes not yet verified in game]');
   });
 
   it('reports a layout the blueprint builder rejects instead of throwing', async () => {

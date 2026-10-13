@@ -95,6 +95,20 @@ describe('BlueprintPanel', () => {
     expect(html(BlueprintPanel, app)).not.toContain('approximate');
   });
 
+  it('says the yaw and axis conventions are not yet verified in game whatever the geometry, once there is a blueprint (final review, M5)', async () => {
+    const approximate = await appWith();
+    expect(textOf(html(BlueprintPanel, approximate.app))).not.toContain('Conventions: not yet verified'); // nothing to paste yet
+    await approximate.finish();
+    expect(textOf(html(BlueprintPanel, approximate.app))).toContain('Conventions: not yet verified in game');
+    const layout = compositeLayout().kit.layout();
+    layout.meta.geometrySource = 'extracted';
+    const extracted = await appWith(layout);
+    await extracted.finish();
+    const page = textOf(html(BlueprintPanel, extracted.app));
+    expect(page).toContain('Conventions: not yet verified in game');
+    expect(page).not.toContain('Geometry: approximate');
+  });
+
   it('says the blueprint is for an earlier plan once the plan has changed', async () => {
     const { app, finish } = await appWith();
     await finish();

@@ -21,6 +21,15 @@ import type { Blueprint, BlueprintBuilding, BlueprintHeader } from './model';
 /** Appended to `desc` while the geometry the layout was built on is approximate (Review Focus #5). */
 const APPROXIMATE_FLAG = '[geometry: approximate - unverified in game]';
 
+/**
+ * Whether the yaw and axis conventions of the blueprint (`prefabToGrid`, BF §5; docs/TESTING-ON-NOBARA.md, item 1) have been checked in
+ * game. Extracting the building geometry does not check them: a blueprint is only known to paste right once it has been pasted, so every
+ * blueprint and the UI say so until this is flipped, after the first in-game paste of the runbook has come out right (final review, M5).
+ */
+export const CONVENTIONS_VERIFIED = false;
+/** Appended to `desc` (after the geometry flag) while `CONVENTIONS_VERIFIED` is false, whatever the geometry source. */
+export const CONVENTIONS_FLAG = '[conventions: yaw and axes not yet verified in game]';
+
 /** What the builder needs to resolve ids: the game data, and the layout by id. */
 interface Context {
   data: GameDataIndex;
@@ -348,7 +357,9 @@ export function layoutToBlueprint(layout: Layout, data: GameDataIndex, opts: Bui
   const h = cellCount(minY, maxY, dy);
 
   const approximate = layout.meta.geometrySource === 'approximate';
-  const desc = approximate ? (opts.desc ? `${opts.desc}\n${APPROXIMATE_FLAG}` : APPROXIMATE_FLAG) : opts.desc;
+  const desc = [opts.desc, ...(approximate ? [APPROXIMATE_FLAG] : []), ...(CONVENTIONS_VERIFIED ? [] : [CONVENTIONS_FLAG])]
+    .filter((part) => part !== '')
+    .join('\n');
   const header: BlueprintHeader = {
     rawCells: [],
     headerVersion: 0,

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { CONVENTIONS_VERIFIED } from '../lib/blueprint';
   import type { AppState } from './state.svelte';
 
   /** How long a download's blob URL lives. */
@@ -65,9 +66,18 @@
   {#if blueprint?.approximate}
     <div class="callout warn" role="note">
       <strong>Geometry: approximate - unverified in game.</strong>
-      This layout was built on estimated building footprints, and the blueprint's yaw and axis conventions have not
-      been checked in game. Expect pieces that overlap or do not connect when you paste it. The blueprint description
-      carries the same flag.
+      This layout was built on estimated building footprints. Expect pieces that overlap or do not connect when you
+      paste it. The blueprint description carries the same flag.
+    </div>
+  {/if}
+
+  <!-- Extracting the geometry does not check the yaw and axis conventions: only a paste in game does. -->
+  {#if blueprint && !CONVENTIONS_VERIFIED}
+    <div class="callout warn" role="note">
+      <strong>Conventions: not yet verified in game.</strong>
+      The blueprint's yaw and axis conventions have not been checked by pasting one in game, with the real building
+      geometry or not (runbook item 1). If a pasted block comes out rotated or mirrored, that is the reason. The
+      blueprint description carries the same flag.
     </div>
   {/if}
 
