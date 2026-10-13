@@ -103,7 +103,7 @@ describe('the plan of Deuteron Fuel Rod', () => {
     const plan = await planOf('Deuteron Fuel Rod', 3);
     const hydrogen = data.data.items.find((i) => i.name === 'Hydrogen')!.id;
     const on = planWithSurplusSinks(plan, true, data, effects);
-    expect(on.stationSlots).toEqual([...plan.stationSlots, { itemId: hydrogen, role: 'export' }]);
+    expect(on.stationSlots).toEqual([...plan.stationSlots, { itemId: hydrogen, role: 'export', surplus: true }]); // marked: it is the sink's slot
     expect(on.stationsNeeded).toBe(Math.max(1, Math.ceil(on.stationSlots.length / maxKinds)));
     expect(on.surplus).toEqual(plan.surplus); // the candidates stay: the netlist looks for their slots
     expect(on.exports).toEqual(plan.exports); // not an export of the plan
@@ -118,6 +118,24 @@ describe('the plan of Deuteron Fuel Rod', () => {
         expect(out).toBeCloseTo(o.perSecond, 9);
       }
     });
+  });
+
+  it('switching off takes away only the slots it added: a slot of the same item that something else asked for stays (Task 30b round 3)', async () => {
+    const plan = await planOf('Deuteron Fuel Rod', 3);
+    const hydrogen = data.data.items.find((i) => i.name === 'Hydrogen')!.id;
+    for (const role of ['import', 'export'] as const) {
+      // a plan that has a slot for the candidate already (here made up: the planner never gives a candidate one)
+      const own = { ...plan, stationSlots: [...plan.stationSlots, { itemId: hydrogen, role }] };
+      const on = planWithSurplusSinks(own, true, data, effects);
+      expect(on.stationSlots.filter((s) => s.itemId === hydrogen), role).toEqual([{ itemId: hydrogen, role }]); // not a second one, not marked
+      expect(planWithSurplusSinks(on, false, data, effects).stationSlots, role).toEqual(own.stationSlots);
+      expect(planWithSurplusSinks(own, false, data, effects).stationSlots, role).toEqual(own.stationSlots);
+    }
+    // and the slots it added go: other slots of the plan keep their place
+    const on = planWithSurplusSinks(plan, true, data, effects);
+    expect(on.stationSlots.filter((s) => s.surplus)).toEqual([{ itemId: hydrogen, role: 'export', surplus: true }]);
+    expect(planWithSurplusSinks(on, false, data, effects).stationSlots).toEqual(plan.stationSlots);
+    expect(plan.stationSlots.some((s) => s.surplus)).toBe(false);
   });
 
   it('a slot that pushes the plan over the station\'s item kinds needs another station, and the power says so', async () => {

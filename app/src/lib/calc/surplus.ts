@@ -19,7 +19,9 @@
 // deadlocks). No structural rule tells the two apart: Gravity Missile Set has the same belt shape as Deuteron Fuel Rod, and a loop
 // through a producer that makes another item as well is there in both. So these are candidates only: the plan lists them
 // (`plan.surplus`), its slots, stations and power are those of a plan without sinks, and the layout solver builds the ladder without
-// them, switching them on (`planWithSurplusSinks`) from the rung whose validation reports SIM_DEADLOCK on. What the rule picks is the
+// them, switching them on (`planWithSurplusSinks`) from the rung whose validation reports SIM_DEADLOCK on, in the measurement or in
+// the probe that runs a passing sinkless layout of such a plan on to `DEADLOCK_PROBE_TICKS` (a deadlock can come long after the
+// start-up). What the rule picks is the
 // belts that two or more stages make: a lone producer fills the belt of its own item and waits, and the loop through it needs
 // another producer to start it.
 import type { Layout } from '../geometry';

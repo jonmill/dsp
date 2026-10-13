@@ -72,4 +72,17 @@ describe('a plan with a surplus candidate', () => {
     const table = textOf(html(PlanTable, app));
     expect(table).toContain(`${plan!.stationSlots.length + 1} item slots, 1 of them for a surplus`);
   });
+
+  it('a layout for an older plan says nothing of its surplus export: change the quantity and the note and the table\'s count go', async () => {
+    const app = await solved(true);
+    expect(textOf(html(SolvePanel, app))).toContain('export slot for the surplus');
+    expect(textOf(html(PlanTable, app))).toContain('1 of them for a surplus');
+    app.setQuantity({ kind: 'rate', perSecond: 2 });
+    await app.whenSettled();
+    expect(app.solve.stale).toBe(true);
+    expect(textOf(html(SolvePanel, app))).not.toContain('export slot for the surplus');
+    const table = textOf(html(PlanTable, app));
+    expect(table).not.toContain('for a surplus');
+    expect(table).toContain('plan estimate'); // the plan's own figures again
+  });
 });

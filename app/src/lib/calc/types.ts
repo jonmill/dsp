@@ -73,6 +73,11 @@ export interface Flow {
 export interface StationSlotDemand {
   itemId: number;
   role: 'import' | 'export' | 'proliferator';
+  /**
+   * An export slot that only a surplus sink asked for (`planWithSurplusSinks`; calc/surplus.ts): the plan has it when the layout
+   * solver switched the sinks on, and nothing else exports the item. Absent on the slots of the planner's own plan.
+   */
+  surplus?: true;
 }
 
 export interface PowerEstimate {

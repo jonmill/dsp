@@ -129,15 +129,17 @@ function stationsNeededFor(slots: number, kind: PlanRequest['stationKind'], data
 /**
  * `plan` with the station slots of its surplus candidates (`plan.surplus`, calc/surplus.ts) switched `on` or off, and the stations
  * and the power that follow from the slots. The planner's own plan is the one with them off: the layout solver builds its netlist
- * without sinks, and switches them on only when the validator finds a deadlock (layout/solver.ts). A candidate is never imported or
- * exported, so any export slot it has is its sink's. A plan without candidates is returned as it is.
+ * without sinks, and switches them on only when a validation finds a deadlock (layout/solver.ts). The slots it adds are export
+ * slots marked `surplus`, one per candidate that has no slot already; switching off takes away those and nothing else, so a
+ * slot that something else asked for (an import or an export of the same item) stays. A plan without candidates is returned as it is.
  */
 export function planWithSurplusSinks(plan: ProductionPlan, on: boolean, data: GameDataIndex, effects: TechEffects): ProductionPlan {
   const candidates = plan.surplus ?? [];
   if (candidates.length === 0) return plan;
-  const ids = new Set(candidates.map((c) => c.itemId));
-  const rest = plan.stationSlots.filter((slot) => !ids.has(slot.itemId));
-  const stationSlots = on ? [...rest, ...candidates.map((c): StationSlotDemand => ({ itemId: c.itemId, role: 'export' }))] : rest;
+  const rest = plan.stationSlots.filter((slot) => slot.surplus !== true);
+  const held = new Set(rest.map((slot) => slot.itemId));
+  const added = on ? candidates.filter((c) => !held.has(c.itemId)).map((c): StationSlotDemand => ({ itemId: c.itemId, role: 'export', surplus: true })) : [];
+  const stationSlots = [...rest, ...added];
   const stationsNeeded = stationsNeededFor(stationSlots.length, plan.request.stationKind, data) ?? plan.stationsNeeded;
   const changed: ProductionPlan = { ...plan, stationSlots, stationsNeeded };
   return { ...changed, power: estimatePower(changed, data, effects) };
