@@ -673,14 +673,18 @@ item planned at 1 per second, the fallback ladder alone; `app/test/ladder-sweep*
 
 **In game: a surplus export slot, only when the layout needed it.** Some plans have an item that two or more stages make and the
 stages use (in practice Hydrogen, made by Graphene (advanced) and Plasma Refining). The solver first builds the layout with that
-belt a dead end, as for any plan. Only if the simulation of a layout then deadlocks (Deuteron Fuel Rod with Mk.III does: the
-second producer fills the Hydrogen belt and Plasma Refining, which also makes the oil the chain needs, blocks) does it build that
-layout and the rest of its attempts with the belt ending at a station, in an export slot, so that the producers never block. The
-progress line says "surplus export" when it did, the Solve panel and the blueprint description name the item, and the plan
-table counts the slot ("N item slots, 1 of them for a surplus"). The plan view shows no such slot until a layout needs it.
-The simulator's station takes whatever arrives without limit; the real slot stops at its `max` (5000 for a Planetary Logistics
-Station), and once it is full the belt backs up as it would without the sink. Take the item out of that slot by hand (sandbox
-mode) or let another station demand it, as for the product slot (section 4, "The product slot fills up too").
+belt a dead end, as for any plan. It gives the belt a station to end in, in an export slot, so that the producers never block,
+only if a simulation of a layout of that plan finds the block stuck: in the measurement (Deuteron Fuel Rod: the second producer
+fills the Hydrogen belt and Plasma Refining, which also makes the oil the chain needs, blocks), or in a longer run. Because a
+block can be fine for a long time and then stop for good (Crystal Explosive Unit with Mk.III moves for 160000 ticks and is
+stuck from 240000), a layout of such a plan that passes is run on to 1,000,000 ticks (about 4.6 hours of game time, a few
+seconds to about a minute of solver time) and must still be moving at the end of them. A layout that gets stuck later than that
+is not found. When the sinks were needed, that rung and the rungs after it are built with them: the progress line says "surplus
+export", the Solve panel and the blueprint description name the item, and the plan table counts the slot ("N item slots, 1 of
+them for a surplus"). The plan view shows no such slot until a layout needs it. The simulator's station takes whatever arrives
+without limit; the real slot stops at its `max` (5000 for a Planetary Logistics Station), and once it is full the belt backs up as
+it would without the sink. Take the item out of that slot by hand (sandbox mode) or let another station demand it, as for the
+product slot (section 4, "The product slot fills up too").
 
 ## 10. Command reference
 

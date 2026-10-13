@@ -40,7 +40,7 @@ The `game` extra (`pip install -e 'tools/extract[game]'`) adds UnityPy and TypeT
   plans at 1 per second.
 - **Quantum Chemical Plant with Mk.III proliferator** has a valid plan (208 machines) but no layout that holds 1 per second:
   by-product Hydrogen is stranded on dead-end belts. Raising the machine headroom (Options) to 2 % works around it.
-- A layout that deadlocked without it ends the belt of a shared by-product (Hydrogen, in Deuteron Fuel Rod) at a station: that export slot appears only then, and you must drain it in game.
+- A layout that was found stuck without it (Hydrogen, in Deuteron Fuel Rod and Crystal Explosive Unit with Mk.III) ends the belt of a shared by-product at a station: that export slot appears only then, and you must drain it in game.
 - The list, the causes and the numbers are in [docs/TESTING-ON-NOBARA.md](docs/TESTING-ON-NOBARA.md) (section 9, Known limitations).
 
 ## Quick start on Nobara (Dyson Sphere Program under Proton)
