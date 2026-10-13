@@ -34,11 +34,17 @@
 //     chain). A window that long already is not measured again.
 //  5. The deadlock probe (SIM_DEADLOCK only) runs on after the verdict and does not touch it.
 // And, one level up, `validateGated` (layout/solver.ts): a result whose only violation is SIM_OUTPUT_LOW within 2 % of the rate is
-// validated again from the start with a window twice the verdict's, and that second verdict stands (flagged `longerWindow`, so the
-// ladder prefers a layout that passed the plain one). Its window starts where the first one's did, so it is the same measurement
-// made longer, and it never overrides a longer window with a shorter one. So no path gives two verdicts from windows of the same
-// short length unless a start-up signal explained the first: every window that replaces a failed one is longer than it, or follows
-// a start-up. (A pass on the first window of a swinging output is one look, as it always was.)
+// validated again from the start with a window twice the one its verdict stood on, and that second verdict stands (flagged
+// `longerWindow`, so the ladder prefers a layout that passed the plain one). The retry runs the same adaptive warm-up, so its window
+// starts where the first run's first window did: when the first verdict was that window, the retry is the same measurement made longer;
+// when it was the window after a wait (rules 2 and 3), the retry's window is a different, longer stretch that starts earlier. It
+// never overrides a longer window with a shorter one. So no path gives two verdicts from windows of the same short length unless a
+// start-up signal explained the first: every window that replaces a failed one is longer than it, or follows a start-up. (A pass on
+// the first window of a swinging output is one look, as it always was.)
+// The cost of that, worst case: the windows compound. A first run that waited under rule 3 has a verdict of 4W; the retry's
+// window is 8W, and if its first window misses the gate by under 5 % again it waits under rule 3 itself and its verdict is 4 times
+// that, 32W. At the cap of a low rate (W = 216000 ticks) the last window alone is 6.9 million ticks (32W), with a wait as long
+// before it. Only a layout whose output is within 2 % of its rate gets there.
 import type { ProductionPlan, ItemRate } from '../../calc';
 import type { Building, GameDataIndex, Recipe, TechEffects } from '../../data';
 import { coaterBuilding, coaterProliferators, findCoaterTop, sprayCoaterDef } from '../../geometry';

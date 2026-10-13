@@ -65,7 +65,7 @@ exit codes:
   0  GameData written (some buildings may use approximate geometry; the summary says how many)
   2  Dyson Sphere Program not found (also what argparse uses for a command line usage error)
   3  extraction failed and no GameData written (including too many unreadable buildings, see --allow-partial, or any
-     unreadable belt, sorter, logistics station, production building or lab, which --allow-partial does not allow);
+     unreadable belt, sorter, logistics station, spray coater, production building or lab, which --allow-partial does not allow);
      also --strict with report errors, or a crash after the data was written
   4  the extracted GameData failed schema validation, nothing written
   5  --check and a mirrored game method changed or went missing
@@ -78,7 +78,8 @@ FINGERPRINTS_FILE = "fingerprints.json"
 ACCEPTED_MARKER = ".accepted"  # in local/decompiled: that decompile's run wrote its GameData and fingerprints
 PARTIAL_LIMIT = 0.25  # more unreadable buildings than this share of all buildings: no GameData without --allow-partial
 # The buildings the planner cannot do without, by item id (stable across game versions): the belts, sorters and logistics stations
-# every layout is made of, and every building that runs a recipe (smelters, assemblers, refineries, chemical plants, colliders, labs).
+# every layout is made of, the spray coater every proliferated layout has, and every building that runs a recipe (smelters,
+# assemblers, refineries, chemical plants, colliders, labs).
 # A building whose prefab could not be read has no descriptors, so GameData would have it as kind 'other' and the planner could not
 # use it: an unreadable one of these is fatal whatever its share of all buildings, and --allow-partial does not allow it.
 CORE_BUILDING_ITEMS: dict[int, str] = {
@@ -87,6 +88,7 @@ CORE_BUILDING_ITEMS: dict[int, str] = {
     **{item_id: "station" for item_id in (2103, 2104)},
     **{item_id: "production building" for item_id in (2302, 2303, 2304, 2305, 2308, 2309, 2310, 2315, 2317, 2318, 2319)},
     **{item_id: "lab" for item_id in (2901, 2902)},
+    2313: "spray coater",
 }
 MAX_FAILED_LISTED = 10
 MAX_DIFF_LINES = 30  # per drift entry on the terminal; the report keeps the whole diff

@@ -72,7 +72,7 @@ from inside either. Run it from anywhere inside the repository checkout.
 | `--no-decompile` | Do not run ilspycmd (see above for what that costs). |
 | `--check` | Compare the mirrored game methods with `data/fingerprints.json` and exit 5 if one `changed` or went `missing`. Does not rewrite the fingerprints, so the drift stays visible until you run without `--check`. |
 | `--strict` | Exit 3 after writing if the report has errors (for example a building prefab that could not be read). |
-| `--allow-partial` | Write the GameData even when more than 25% of the buildings could not be read from their prefab. Without it that case exits 3 and writes nothing. It does not allow an unreadable belt, sorter, logistics station, production building or lab (`CORE_BUILDING_ITEMS` in `cli.py`): any one of those exits 3 and writes nothing, whatever the share. |
+| `--allow-partial` | Write the GameData even when more than 25% of the buildings could not be read from their prefab. Without it that case exits 3 and writes nothing. It does not allow an unreadable belt, sorter, logistics station, spray coater, production building or lab (`CORE_BUILDING_ITEMS` in `cli.py`): any one of those exits 3 and writes nothing, whatever the share. |
 | `--report PATH` | Where to write the report (default `local/extract-report.json`). |
 
 Without `--check`, new fingerprints are written after a successful run and any drift is printed with a diff
@@ -90,7 +90,7 @@ many fell back to **approximate** geometry (the app marks those blueprints "geom
 which code constants were read from the game, the fingerprint and drift status, and the number of report errors
 and warnings. A building whose prefab could not be read at all is called out separately; if more than a quarter
 of the buildings are in that state the run stops with exit 3 and writes no GameData (`--allow-partial` overrides
-this), listing the first ten with the reason. A belt, sorter, logistics station, production building or lab that could
+this), listing the first ten with the reason. A belt, sorter, logistics station, spray coater, production building or lab that could
 not be read stops the run whatever the share, and `--allow-partial` does not override that: the planner cannot use a
 layout of buildings it knows nothing about.
 
@@ -100,7 +100,7 @@ layout of buildings it knows nothing about.
 |---|---|
 | 0 | GameData written. Some buildings may still use approximate geometry; the summary counts them. |
 | 2 | Dyson Sphere Program not found (the message lists what was searched), or a command line usage error. |
-| 3 | Extraction failed and no GameData was written: the message names the missing class, key or field, the missing `game` extra, or the buildings that could not be read (more than 25%, see `--allow-partial`; any one belt, sorter, station, production building or lab, always). Also `--strict` with errors in the report, and a crash late in the run; in those two cases GameData may already have been written, and the report says so (`output`). |
+| 3 | Extraction failed and no GameData was written: the message names the missing class, key or field, the missing `game` extra, or the buildings that could not be read (more than 25%, see `--allow-partial`; any one belt, sorter, station, spray coater, production building or lab, always). Also `--strict` with errors in the report, and a crash late in the run; in those two cases GameData may already have been written, and the report says so (`output`). |
 | 4 | The extracted data failed schema validation (the first violations are listed); nothing was written. |
 | 5 | `--check` found a mirrored game method that changed or went missing. |
 

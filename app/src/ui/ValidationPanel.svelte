@@ -3,7 +3,7 @@
   import type { Violation } from '../lib/validate';
   import { outputTolerance } from '../lib/validate';
   import { provisionedRate } from '../lib/validate/sim/run';
-  import { formatPercent, formatPower, formatRate } from './format';
+  import { formatPercent, formatPower, formatRate, formatTolerance } from './format';
   import type { AppState } from './state.svelte';
 
   let { app }: { app: AppState } = $props();
@@ -15,7 +15,7 @@
   const capacity = $derived(sim?.measuredTargetRate ?? 0);
   /** How far below the provisioned rate the gate lets the capacity fall, as the validator has it for the window it measured (1 % unless the window is too short for that). */
   const tolerance = $derived(
-    sim && provisioned > 0 ? formatPercent(outputTolerance(provisioned, sim.measureSeconds) / provisioned) : formatPercent(0.01),
+    sim && provisioned > 0 ? formatTolerance(outputTolerance(provisioned, sim.measureSeconds) / provisioned) : formatTolerance(0.01),
   );
   /** Only the validator's own verdict makes the figure a problem; more than the provisioned rate is normal. */
   const rateLow = $derived(report?.violations.some((v) => v.code === 'SIM_OUTPUT_LOW') ?? false);

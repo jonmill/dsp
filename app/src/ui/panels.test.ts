@@ -152,6 +152,18 @@ describe('ValidationPanel', () => {
     expect(plain).toContain('Plan estimate (with the 1 station of this layout)');
   });
 
+  it('says what the gate lets the capacity fall short by, to one decimal, for the window it measured', async () => {
+    const tolerance = async (measureSeconds: number): Promise<string> => {
+      const report: ValidationReport = { ...passing, stage: 'simulation', sim: { ...simulated(1)!, measureSeconds } };
+      const { app, finish } = await appWith(undefined, report);
+      await finish();
+      return /validator's tolerance, ([^)]*)\)/.exec(textOf(html(ValidationPanel, app)))![1];
+    };
+    expect(await tolerance(300)).toBe('1.0 %'); // a window of 300 s holds 300 items at 1/s
+    expect(await tolerance(70)).toBe('1.4 %'); // one item more or less in 70 s is 1.43 % of the rate: the gate widens to it
+    expect(await tolerance(20)).toBe('2.0 %'); // ...but not beyond 2 %
+  });
+
   it('puts the stations of the layout into the plan estimate: the plan counts 1 station, the layout has 2 Interstellar ones (60 MW each)', async () => {
     const pair = stationPairLayout();
     for (const b of pair.kit.buildings) if (b.station) b.station.chargePerTick = 1_000_000;

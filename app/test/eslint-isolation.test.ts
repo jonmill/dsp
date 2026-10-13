@@ -36,6 +36,9 @@ describe('the validator isolation lint rule', () => {
     ['a dynamic import whose path is a variable', 'const m = await import(path);'],
     ['a dynamic import of a module that is allowed, which cannot be told from the rest', "const m = await import('../geometry');"],
     ['a require', "const m = require('../layout');"],
+    ['a type written as an import type', "type Solve = import('../layout').solve;"],
+    ['an import type of a file', "let x: import('../layout/solver').SolveResult;"],
+    ['an import type two levels up', "type Netlist = import('../../layout/netlist').Netlist;", 'src/lib/validate/sim/example.ts'],
   ];
 
   it.each(REFUSED)('refuses %s', async (_what, code, filePath) => {
@@ -48,6 +51,7 @@ describe('the validator isolation lint rule', () => {
     ['its own files', "import { runSimulation } from './sim/run';"],
     ['a module whose name only contains the word', "import { x } from './layoutKit';"],
     ['a package', "import { ESLint } from 'eslint';"],
+    ['an import type of the shared geometry', "type Layout = import('../geometry').Layout;"],
   ];
 
   it.each(ALLOWED)('allows %s', async (_what, code, filePath) => {

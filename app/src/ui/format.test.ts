@@ -7,6 +7,7 @@ import {
   formatCount,
   formatDuration,
   formatPercent,
+  formatTolerance,
   formatPower,
   formatRate,
   geometryBadge,
@@ -97,6 +98,16 @@ describe('itemName', () => {
 
   it('falls back to the id for an unknown item rather than throwing', () => {
     expect(itemName(index, 987654)).toBe('item 987654');
+  });
+});
+
+describe('formatTolerance', () => {
+  it('shows one decimal, so that 1.4 % is not read as 1 %', () => {
+    expect(formatTolerance(0.01)).toBe('1.0 %');
+    expect(formatTolerance(0.014)).toBe('1.4 %');
+    expect(formatTolerance(0.0142857)).toBe('1.4 %');
+    expect(formatTolerance(0.02)).toBe('2.0 %');
+    expect(formatTolerance(Number.NaN)).toBe('-');
   });
 });
 

@@ -1138,6 +1138,7 @@ CORE_BUILDINGS = [
     (2318, "production building"),
     (2901, "lab"),
     (2902, "lab"),
+    (2313, "spray coater"),
 ]
 
 

@@ -25,7 +25,8 @@ export default defineConfig([
     // geometry/model.ts but must never reach into the layout solver. Any import path with a
     // segment named `layout` is the solver (`../layout`, `../layout/x`, `../../layout`, `../../lib/layout/x`,
     // `$lib/layout`), the directory itself included. A dynamic import() or a require() cannot be told from its
-    // argument (`import(path)`), so the validator takes none: they are refused whatever they name.
+    // argument (`import(path)`), so the validator takes none: they are refused whatever they name. An import type
+    // (`import('../layout').Solve`) names its path, so it is matched like an import.
     files: ['src/lib/validate/**'],
     rules: {
       'no-restricted-imports': [
@@ -43,6 +44,13 @@ export default defineConfig([
         {
           selector: "CallExpression[callee.name='require']",
           message: 'validator must stay independent of the solver: it takes no require(), which cannot be checked',
+        },
+        {
+          // `import('../layout').Solve` as a type (the path is `source` of the node, or the literal inside `argument` in other
+          // parser versions). The selector's regex cannot hold a slash, so \x2f stands for it: the same layout path segment as above.
+          selector:
+            'TSImportType > Literal.source[value=/(^|\\x2f)layout(\\x2f|$)/], TSImportType > TSLiteralType > Literal[value=/(^|\\x2f)layout(\\x2f|$)/]',
+          message: 'validator must stay independent of the solver: it takes no import type of the layout directory',
         },
       ],
     },

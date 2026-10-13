@@ -52,6 +52,11 @@ export function formatPercent(fraction: number): string {
   return Number.isFinite(fraction) ? `${Math.round(fraction * 100)}%` : DASH;
 }
 
+/** A share of the rate to one decimal ("1.0 %", "1.4 %"): the validator's tolerance, which a whole percent would round (1.4 % reads 1 %). */
+export function formatTolerance(fraction: number): string {
+  return Number.isFinite(fraction) ? `${(fraction * 100).toFixed(1)} %` : DASH;
+}
+
 /** A duration in milliseconds as minutes and seconds ("0:07", "10:00", "75:30"); whole seconds, rounded down. */
 export function formatDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms < 0) return DASH;
