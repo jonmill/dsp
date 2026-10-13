@@ -11,9 +11,12 @@ import {
   hitTest,
   layoutBounds,
   maxLevel,
+  PAN_STEP,
+  previewKeyAction,
   renderLayout,
   screenToGrid,
   VIOLATION_COLOR,
+  ZOOM_STEP,
   zoomAt,
 } from './preview';
 
@@ -408,5 +411,37 @@ describe('spray coaters (Task 28)', () => {
     // on the axis the belt is hit; a little off it (0.27 tiles, past a belt's 0.25) the coater's body is
     expect(hitTest(layout, data, 5, 10)).toMatchObject({ kind: 'belt' });
     expect(hitTest(layout, data, 5, 10.27)).toEqual({ kind: 'building', id: coaterId });
+  });
+});
+
+describe('previewKeyAction (final review, T25)', () => {
+  const key = (k: string, mods: Partial<Record<'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey', boolean>> = {}) =>
+    previewKeyAction({ key: k, ctrlKey: false, metaKey: false, altKey: false, ...mods });
+
+  it('arrows pan, + and - zoom, 0 fits', () => {
+    expect(key('ArrowLeft')).toEqual({ kind: 'pan', dx: PAN_STEP, dy: 0 });
+    expect(key('ArrowRight')).toEqual({ kind: 'pan', dx: -PAN_STEP, dy: 0 });
+    expect(key('ArrowUp')).toEqual({ kind: 'pan', dx: 0, dy: PAN_STEP });
+    expect(key('ArrowDown')).toEqual({ kind: 'pan', dx: 0, dy: -PAN_STEP });
+    expect(key('+')).toEqual({ kind: 'zoom', factor: ZOOM_STEP });
+    expect(key('=')).toEqual({ kind: 'zoom', factor: ZOOM_STEP });
+    expect(key('-')).toEqual({ kind: 'zoom', factor: 1 / ZOOM_STEP });
+    expect(key('_')).toEqual({ kind: 'zoom', factor: 1 / ZOOM_STEP });
+    expect(key('0')).toEqual({ kind: 'fit' });
+  });
+
+  it('leaves a key with Ctrl, Cmd or Alt held to the browser: Ctrl/Cmd +, - and 0 are the page zoom', () => {
+    for (const k of ['+', '=', '-', '_', '0', 'ArrowLeft', 'ArrowUp']) {
+      for (const mod of ['ctrlKey', 'metaKey', 'altKey'] as const) expect(key(k, { [mod]: true }), `${k} with ${mod}`).toBeNull();
+    }
+  });
+
+  it('does not count Shift, which many layouts need for +', () => {
+    expect(key('+', { shiftKey: true })).toEqual({ kind: 'zoom', factor: ZOOM_STEP });
+  });
+
+  it('ignores other keys', () => {
+    expect(key('a')).toBeNull();
+    expect(key('Tab')).toBeNull();
   });
 });

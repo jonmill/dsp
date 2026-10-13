@@ -484,3 +484,38 @@ export function zoomAt(view: View, sx: number, sy: number, factor: number): View
   const at = screenToGrid(sx, sy, view);
   return { scale, origin: { x: sx - at.x * scale, y: sy + at.y * scale } };
 }
+
+/** Pixels an arrow key pans the view by. */
+export const PAN_STEP = 40;
+/** The factor + zooms in by (and - out by the inverse). */
+export const ZOOM_STEP = 1.4;
+
+export type PreviewKeyAction = { kind: 'pan'; dx: number; dy: number } | { kind: 'zoom'; factor: number } | { kind: 'fit' };
+
+/**
+ * What a key does to a focused preview: arrows pan, + and - zoom, 0 fits; null for any other key, and for any key with Ctrl, Cmd or Alt
+ * held, which belongs to the browser (Ctrl/Cmd +, - and 0 are the page zoom). Shift does not count: + needs it on many layouts.
+ */
+export function previewKeyAction(event: Pick<KeyboardEvent, 'key' | 'ctrlKey' | 'metaKey' | 'altKey'>): PreviewKeyAction | null {
+  if (event.ctrlKey || event.metaKey || event.altKey) return null;
+  switch (event.key) {
+    case 'ArrowLeft':
+      return { kind: 'pan', dx: PAN_STEP, dy: 0 };
+    case 'ArrowRight':
+      return { kind: 'pan', dx: -PAN_STEP, dy: 0 };
+    case 'ArrowUp':
+      return { kind: 'pan', dx: 0, dy: PAN_STEP };
+    case 'ArrowDown':
+      return { kind: 'pan', dx: 0, dy: -PAN_STEP };
+    case '+':
+    case '=':
+      return { kind: 'zoom', factor: ZOOM_STEP };
+    case '-':
+    case '_':
+      return { kind: 'zoom', factor: 1 / ZOOM_STEP };
+    case '0':
+      return { kind: 'fit' };
+    default:
+      return null;
+  }
+}

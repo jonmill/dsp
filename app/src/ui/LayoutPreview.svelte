@@ -2,7 +2,7 @@
   import { untrack } from 'svelte';
   import { on } from 'svelte/events';
   import type { ViolationEntity } from '../lib/validate';
-  import { describeEntity, entityCentre, fitView, hitTest, layoutBounds, maxLevel, renderLayout, screenToGrid, zoomAt } from './preview';
+  import { describeEntity, entityCentre, fitView, hitTest, layoutBounds, maxLevel, previewKeyAction, renderLayout, screenToGrid, zoomAt } from './preview';
   import type { View } from './preview';
   import { formatCount } from './format';
   import type { AppState } from './state.svelte';
@@ -103,41 +103,18 @@
     view = zoomAt(view, width / 2, height / 2, factor);
   }
 
-  const PAN_STEP = 40;
-
-  /** With the canvas focused: arrows pan, + and - zoom, 0 fits. */
+  /** With the canvas focused: arrows pan, + and - zoom, 0 fits. A key with Ctrl, Cmd or Alt held is the browser's (page zoom). */
   function onKeyDown(event: KeyboardEvent): void {
-    const pan = (dx: number, dy: number): void => {
+    const action = previewKeyAction(event);
+    if (action === null) return;
+    if (action.kind === 'pan') {
       touched = true;
-      view = { scale: view.scale, origin: { x: view.origin.x + dx, y: view.origin.y + dy } };
-    };
-    switch (event.key) {
-      case 'ArrowLeft':
-        pan(PAN_STEP, 0);
-        break;
-      case 'ArrowRight':
-        pan(-PAN_STEP, 0);
-        break;
-      case 'ArrowUp':
-        pan(0, PAN_STEP);
-        break;
-      case 'ArrowDown':
-        pan(0, -PAN_STEP);
-        break;
-      case '+':
-      case '=':
-        zoom(1.4);
-        break;
-      case '-':
-      case '_':
-        zoom(1 / 1.4);
-        break;
-      case '0':
-        touched = false;
-        fit();
-        break;
-      default:
-        return;
+      view = { scale: view.scale, origin: { x: view.origin.x + action.dx, y: view.origin.y + action.dy } };
+    } else if (action.kind === 'zoom') {
+      zoom(action.factor);
+    } else {
+      touched = false;
+      fit();
     }
     event.preventDefault();
   }
