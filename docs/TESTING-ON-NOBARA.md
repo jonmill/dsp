@@ -94,7 +94,7 @@ cd app && npm install && cd ..
 **A quick self-check** (optional, none of it needs the game):
 
 ```bash
-cd app && npm test && cd ..                  # about 20 s; a timing test can fail on a busy machine, run it again
+cd app && npm test && cd ..                  # 40 to 50 s (over 2 minutes on a busy machine); a timing test can fail on a busy machine, run it again
 tools/extract/.venv/bin/pytest tools/extract
 ```
 
@@ -702,7 +702,7 @@ From `app/` (`cd app`):
 |---|---|
 | `npm run dev` | The app on <http://localhost:5173/>. |
 | `npm run build` | A production build into `app/dist/`. |
-| `npm test` | The unit tests (about 20 s), including `test/regression.test.ts` and `test/mirrors.test.ts`. |
+| `npm test` | The unit tests (40 to 50 s on a quiet machine), including `test/regression.test.ts` and `test/mirrors.test.ts`. |
 | `npm run test:e2e` | The slow end-to-end tests (`test/*.e2e.test.ts`: the solver on real plans, both ladder sweeps of 104 items (102, and 2 photon-fed ones), multi-station and proliferator plans), several minutes. |
 | `npm run test:all` | Both of the above. |
 | `npm run test:sweep-deep` | The deep ladder sweeps (the 39 items of more than 12 stages: 37, and 2 photon-fed ones; plain and with Mk.III; hours). Failures are the known limitations in section 9. |
