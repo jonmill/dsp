@@ -247,10 +247,11 @@ extraction run that wrote the file, and `local/extract-report.json`.
 
 **The options worth knowing**
 
-- **Time budget** (default 10 minutes). How long the solver keeps shrinking the layout after the first valid one. The first
-  valid layout is always completed, even if that takes longer than the budget. It also stops early when the footprint has
-  not improved in the last 20 % of the elapsed time (after at least 30 s). It never changes the plan, only how compact the
-  layout is. For these tests 1 to 2 minutes is enough for a compact layout of the small blocks, and a larger footprint matters less than a block that works.
+- **Time budget** (default 10 minutes). How long the solver looks for a layout and keeps shrinking it. A solve that has no
+  valid layout by then stops and says so (see [Known limitations](#known-limitations-of-the-layout-solver): very large plans
+  can take the router longer than any budget). Once there is a layout it keeps shrinking it until the budget runs out, or
+  earlier when the footprint has not improved in the last 20 % of the elapsed time (after at least 30 s). It never changes
+  the plan, only how compact the layout is. For these tests 1 to 2 minutes is enough for a compact layout of the small blocks, and a larger footprint matters less than a block that works.
 - **Proliferator** (None, Mk.I, Mk.II, Mk.III; Extra products or Speed-up). Chosen for each build, before you press Solve.
   It changes the plan (machine counts, power) and the block: spray coaters on the belts of proliferated stages, one raised
   feed belt that reaches all coaters, and a station slot for the proliferator. **You must put that proliferator into the
@@ -639,6 +640,34 @@ The two research documents list the gaps in full: `docs/research/blueprint-forma
 - The game's tick order, pile sorter behaviour, the power coverage formulas, the exact latitude limit for pasting, and the
   vertical reach of sorters are modelled from public sources and are the likely source of any simulator mismatch.
 
+### Known limitations of the layout solver
+
+These are known to fail or to be slow; none is a bug in the plan. The numbers come from the ladder sweeps (every producible
+item planned at 1 per second, the fallback ladder alone; `app/test/ladder-sweep*.e2e.test.ts`, and the deep ones with
+`npm run test:sweep-deep`).
+
+- **Large plans often cannot be routed.** The router cannot always lay out a plan of roughly **400 machines or more** (about
+  **200 or more** with a proliferator, whose feed belt must reach every spray coater); some plans of that size do route (Small
+  Carrier Rocket, 472 machines). The solver then tries the six rungs of its ladder, which can take longer than the time budget;
+  at the budget it stops with **no layout** and a message that names the size of the plan ("No valid layout found within the
+  time budget. This plan has N machines; plans over ~400 machines (or ~200 with proliferator) often cannot be routed yet. Try a
+  lower rate, or split the build."). Lower the rate, or plan the build in parts. There is no router rewrite planned.
+- **The items this hits** at 1 per second (machines in brackets). Plain: Mini Fusion Power Plant (391), Interstellar Logistics
+  Vessel (400), Advanced Mining Machine (834; its one routable rung reads 0.95 per second, the others leave 1 to 7 routing
+  conflicts), Energy Exchanger (856), Interstellar Logistics Station (975), Miniature Particle Collider (1162), Artificial Star
+  (1334), Vertical Launching Silo (2749). With Mk.III: Destroyer (343), Advanced Mining Machine (365), Artificial Star (590) and
+  Vertical Launching Silo (1205), which fail at the proliferator feed belt or at routing. The other items of more than 12 stages
+  pass the deep sweep, except the one below.
+- **Quantum Chemical Plant with Mk.III proliferator (208 machines) gives no layout.** Some rungs route, but the simulated
+  block reaches 0.96 to 0.99 per second instead of 1. Cause: Graphene (advanced) makes Hydrogen as a by-product for Deuterium
+  and Casimir Crystal, on six dead-end belts that are each planned exactly balanced, with 69 machines for 67.9 needed. A
+  Deuterium machine whose product is not drawn idles, the Hydrogen belt it feeds backs up, and the Graphene machines on that
+  belt block for 37 % of the time: about 5 % of all Graphene machine time, three times the spare, so the other belts are short
+  of Hydrogen and the Deuterium and Casimir Crystal stages run 4 % short. Neither the calculator's rates nor the simulator's
+  machine speed are wrong (a machine that is 100 % busy makes exactly its theoretical maximum). Raising the **machine
+  headroom** (Options) to 2 % (210 machines instead of 208: one more Graphene machine) gives a block that passes at 1.04 per
+  second.
+
 ## 10. Command reference
 
 From `app/` (`cd app`):
@@ -650,6 +679,7 @@ From `app/` (`cd app`):
 | `npm test` | The unit tests (about 20 s), including `test/regression.test.ts` and `test/mirrors.test.ts`. |
 | `npm run test:e2e` | The slow end-to-end tests (`test/*.e2e.test.ts`: the solver on real plans, both 102-item ladder sweeps, multi-station and proliferator plans), several minutes. |
 | `npm run test:all` | Both of the above. |
+| `npm run test:sweep-deep` | The deep ladder sweeps (the 37 items of more than 12 stages, plain and with Mk.III; hours). Failures are the known limitations in section 9. |
 | `npm run lint`, `npm run check` | ESLint, and `svelte-check` (types). |
 | `npm run emit:test-bp` | Writes `local/test-blueprints/m0-smelter-row.txt`. |
 | `npm run bench -- --budget 30 --plans processor` | The solver benchmark; it appends a row to `docs/benchmarks.md` (add `--no-write` to only print it). |

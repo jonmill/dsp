@@ -18,6 +18,7 @@ npm run dev     # dev server
 npm run check   # svelte-check
 npm run test:e2e   # slow end-to-end tests (the solver on real plans, two 102-item ladder sweeps; 3 to 7 minutes); `npm test` leaves them out
 npm run test:all   # both
+npm run test:sweep-deep   # the deep ladder sweeps (the 37 items of more than 12 stages, plain and with Mk.III); hours, not part of `test:e2e`
 npm run emit:test-bp   # hand-made in-game test blueprint -> local/test-blueprints/m0-smelter-row.txt
 npm run bench -- --budget 60 --plans processor,quantum-chip,circuit-board,smelter-row   # solver benchmark; appends rows to docs/benchmarks.md
 ```
@@ -29,6 +30,17 @@ python3 -m venv tools/extract/.venv && tools/extract/.venv/bin/pip install -e 't
 ```
 
 The `game` extra (`pip install -e 'tools/extract[game]'`) adds UnityPy and TypeTreeGeneratorAPI, which are only needed to run the extraction against a real game install.
+
+## Known limitations
+
+- **Large plans may get no layout.** The router cannot lay out every plan of roughly **400 machines or more** (about **200 or
+  more** with a proliferator). The solver stops at its time budget (Options, default 10 minutes), shows no layout and says how
+  big the plan is; lower the rate or split the build. Mini Fusion Power Plant, Interstellar Logistics Vessel and Station,
+  Advanced Mining Machine, Energy Exchanger, Miniature Particle Collider, Artificial Star and Vertical Launching Silo are such
+  plans at 1 per second.
+- **Quantum Chemical Plant with Mk.III proliferator** has a valid plan (208 machines) but no layout that holds 1 per second:
+  by-product Hydrogen is stranded on dead-end belts. Raising the machine headroom (Options) to 2 % works around it.
+- The list, the causes and the numbers are in [docs/TESTING-ON-NOBARA.md](docs/TESTING-ON-NOBARA.md) (section 9, Known limitations).
 
 ## Quick start on Nobara (Dyson Sphere Program under Proton)
 
