@@ -15,11 +15,13 @@
 // sources.
 //
 // A belt that nothing drains (Task 30b). The machines are rounded up and run at full speed, so the producers of an item can make more
-// than the stages use. For an item in `plan.surplus` (calc/surplus.ts: several stages make it) every taps-sourced net that has a
+// than the stages use. `plan.surplus` lists the candidates (calc/surplus.ts: several stages make the item), and a candidate has a sink
+// only if the plan also has an export slot for it (`planWithSurplusSinks`): the layout solver builds the netlist without, as for any
+// plan, and with the slots only for the rungs after a validation found a deadlock. Then every taps-sourced net of the item that has a
 // producer ends at a station port as well, whatever else it does: the producers never block on it, and the surplus goes to an export
-// slot like a by-product's. The sink has no rate on the rate axis (it takes what
-// reaches the end of the belt), so the cuts, the taps and the supply of the nets are as they were. An item that is imported as well
-// is pooled instead (below) and an exported one ends at its station already.
+// slot like a by-product's. The sink has no rate on the rate axis (it takes what reaches the end of the belt), so the cuts, the taps
+// and the supply of the nets are as they were. An item that is imported as well is pooled instead (below) and an exported one ends
+// at its station already.
 //
 // The proliferator (Task 28). Its import has no flows: spray coaters take it, not stages. When the plan spends any
 // (`proliferatorPerSecond`), the netlist adds one more net, last: `proliferator: true`, starting at the station that
@@ -281,8 +283,9 @@ interface NetSpec {
   /** Items/s that end at the station. */
   exportRate: number;
   /**
-   * The item is in `plan.surplus`: every net of it that has a producer also ends at a station port, for what its machines can make
-   * beyond what is used. No rate of its own: the sink takes whatever reaches the end of the belt.
+   * The item is a candidate in `plan.surplus` and the plan has an export slot for it: every net of it that has a producer also ends at a
+   * station port, for what its machines can make beyond what is used. No rate of its own: the sink takes whatever reaches the end of
+   * the belt.
    */
   surplusSink: boolean;
 }
@@ -325,9 +328,10 @@ function collectSpecs(plan: ProductionPlan): NetSpec[] {
     spec.consumers.clear();
     spec.exportRate = [...spec.producers.values()].reduce((n, r) => n + r, 0);
   }
-  // An item made and used on site whose belt must end at a station for its surplus (`plan.surplus`). Not one that is imported as well
-  // (the nets of an imported and made item end at the station already) or exported.
-  const surplusIds = new Set((plan.surplus ?? []).map((s) => s.itemId));
+  // An item made and used on site whose belt must end at a station for its surplus: a candidate (`plan.surplus`) that the plan gave an
+  // export slot. Not one that is imported as well (the nets of an imported and made item end at the station already) or exported.
+  const exportSlots = new Set(plan.stationSlots.filter((slot) => slot.role === 'export').map((slot) => slot.itemId));
+  const surplusIds = new Set((plan.surplus ?? []).map((s) => s.itemId).filter((itemId) => exportSlots.has(itemId)));
   for (const spec of specs.values()) {
     if (!spec.stationSourced && surplusIds.has(spec.itemId) && spec.exportRate <= EPS && !specs.has(`${spec.itemId}/true`)) spec.surplusSink = true;
   }

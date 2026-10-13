@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { compatibleFacilities, plannableProducers, surplusExportsIn } from '../calc';
 import type { ProductionPlan } from '../calc';
 import type { Layout, PlacedBuilding } from '../geometry';
 import { LayoutKit, compositeLayout } from '../validate/testkit';
@@ -1008,6 +1009,139 @@ describe('solve', () => {
       expect(result.stoppedBy).toBe('budget');
       expect(result.failures.some((f) => /no valid layout within/.test(f))).toBe(false); // there is one
     }, 120_000);
+  });
+
+  describe('surplus sinks (Task 30b): the ladder switches them on only when a validation finds a deadlock', () => {
+    /** Deuteron Fuel Rod with Mk.III proliferator at 1/s, the default headroom: hydrogen is made by two stages, so it is a candidate. */
+    const deuteronPlan = async (): Promise<ProductionPlan> => {
+      const item = data.data.items.find((i) => i.name === 'Deuteron Fuel Rod')!;
+      const facility = compatibleFacilities(plannableProducers(item.id, data, effects)[0], data).find((b) => effects.availableBuildings.has(b.itemId))!;
+      const raw = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031];
+      return planFor({
+        targetItemId: item.id,
+        finalFacilityItemId: facility.itemId,
+        suppliedItemIds: new Set(raw),
+        proliferator: { tier: 3, mode: 'extra' },
+        machineHeadroom: undefined,
+      });
+    };
+    const HYDROGEN = data.data.items.find((i) => i.name === 'Hydrogen')!.id;
+    const deadlock: ValidationReport = {
+      pass: false,
+      violations: [
+        { code: 'SIM_OUTPUT_LOW', entities: [], message: 'none' },
+        { code: 'SIM_DEADLOCK', entities: [], message: 'nothing moved' },
+      ],
+      checkedAt: '',
+      stage: 'simulation',
+    };
+    const passed: ValidationReport = { pass: true, violations: [], checkedAt: '', stage: 'simulation' };
+
+    /** A validator that answers `verdicts[n]` to the n-th validation and records the plan and the layout it was given. */
+    function recording(verdicts: ValidationReport[]) {
+      const seen: { plan: ProductionPlan; layout: Layout }[] = [];
+      const fn = ((layout, plan) => {
+        seen.push({ plan, layout });
+        return verdicts[Math.min(seen.length - 1, verdicts.length - 1)];
+      }) as typeof validateLayout;
+      return { fn, seen };
+    }
+    const hasHydrogenExport = (plan: ProductionPlan): boolean => plan.stationSlots.some((s) => s.itemId === HYDROGEN && s.role === 'export');
+    const solveWith = (plan: ProductionPlan, v: typeof validateLayout, phases: string[] = []) => {
+      const fake = fakeClock(1);
+      return solve(
+        plan, data, effects, { ...DEFAULT_SOLVE_OPTIONS, ...SIM, timeBudgetMs: 1, now: fake.now },
+        (p) => fake.onProgress(p, (q) => phases.push(q.phase)), () => {}, () => false, v,
+      );
+    };
+
+    it('the plan has the candidate and no slot for it, so the first netlist has no sink', async () => {
+      const plan = await deuteronPlan();
+      expect(plan.surplus?.map((x) => x.itemId)).toEqual([HYDROGEN]);
+      expect(hasHydrogenExport(plan)).toBe(false);
+    });
+
+    it('a deadlock on rung 1 switches the sinks on for the retry of that rung and for the rungs after it, and the labels say so', async () => {
+      const plan = await deuteronPlan();
+      const v = recording([deadlock, rejection, passed]); // rung 1 deadlocks, its retry is turned down, margin 4 passes
+      const phases: string[] = [];
+      const result = solveWith(plan, v.fn, phases);
+      expect(v.seen.length).toBe(3);
+      expect(v.seen.map((x) => hasHydrogenExport(x.plan))).toEqual([false, true, true]);
+      expect(v.seen.map((x) => surplusExportsIn(x.layout, plan).length)).toEqual([0, 1, 1]); // the layouts have the slot too
+      expect(phases.filter((p) => p.startsWith('ladder:'))).toEqual([
+        'ladder: margin 3 deadlocked; Hydrogen gets a surplus export from here on',
+        'ladder: margin 3 (surplus export) rejected',
+        'ladder: margin 4 (surplus export)',
+      ]);
+      expect(result.layout).not.toBeNull();
+      expect(result.report).toBe(passed);
+      expect(surplusExportsIn(result.layout!, plan).map((x) => x.itemId)).toEqual([HYDROGEN]);
+      expect(result.failures.map((f) => f.split(':')[0])).toEqual(['margin 3', 'margin 3', 'margin 3 (surplus export)']);
+    }, 300_000);
+
+    it('the exact rungs after a switch are labelled with both: a ladder that deadlocks first and then fails on every rung', async () => {
+      const plan = await deuteronPlan();
+      const v = recording([deadlock, rejection]);
+      const phases: string[] = [];
+      const result = solveWith(plan, v.fn, phases);
+      expect(result.layout).toBeNull();
+      expect(result.stoppedBy).toBe('exhausted');
+      const labels = phases.filter((p) => p.startsWith('ladder:'));
+      expect(labels[0]).toBe('ladder: margin 3 deadlocked; Hydrogen gets a surplus export from here on');
+      expect(labels.slice(1).every((p) => p.includes('(surplus export)') || p.includes('surplus export)'))).toBe(true);
+      expect(labels.some((p) => p.includes('exact routes, surplus export'))).toBe(true);
+      expect(v.seen.slice(1).every((x) => hasHydrogenExport(x.plan))).toBe(true);
+    }, 300_000);
+
+    it('a ladder with no deadlock never uses the sinks: every layout is built without them, and the labels say nothing of them', async () => {
+      const plan = await deuteronPlan();
+      const v = recording([rejection]); // every rung that gets as far as the validator is turned down for a stage, not a deadlock
+      const phases: string[] = [];
+      const result = solveWith(plan, v.fn, phases);
+      expect(result.layout).toBeNull();
+      expect(result.stoppedBy).toBe('exhausted');
+      expect(v.seen.length).toBeGreaterThanOrEqual(2);
+      for (const x of v.seen) {
+        expect(hasHydrogenExport(x.plan)).toBe(false);
+        expect(surplusExportsIn(x.layout, plan)).toEqual([]);
+      }
+      expect(phases.some((p) => p.includes('surplus'))).toBe(false);
+      expect(result.failures.some((f) => f.includes('surplus'))).toBe(false);
+    }, 300_000);
+
+    it('a pass without a deadlock leaves the layout without sinks, and the improvement loop keeps to the same netlist', async () => {
+      const plan = await deuteronPlan();
+      const v = recording([passed]);
+      const result = solveWith(plan, v.fn);
+      expect(result.layout).not.toBeNull();
+      expect(surplusExportsIn(result.layout!, plan)).toEqual([]);
+      expect(v.seen.map((x) => hasHydrogenExport(x.plan))).toEqual([false]);
+    }, 300_000);
+
+    it('a deadlock on a plan without candidates changes nothing: the next rung is the next margin, as before', async () => {
+      const plan = await ingotPlan();
+      expect(plan.surplus).toBeUndefined();
+      const v = recording([deadlock, passed]);
+      const phases: string[] = [];
+      const result = solveWith(plan, v.fn, phases);
+      expect(result.layout).not.toBeNull();
+      expect(phases.filter((p) => p.startsWith('ladder:'))).toEqual(['ladder: margin 3 rejected', 'ladder: margin 4']);
+      expect(result.failures.every((f) => f.startsWith('margin 3: '))).toBe(true);
+    }, 120_000);
+
+    it('a deadlock after a layout has passed over the longer window does not switch: the improvement loop would mix two netlists', async () => {
+      const plan = await deuteronPlan();
+      // rung 1: a near miss, then the doubled window passes; rung 2 deadlocks; rung 3 is turned down; the exact rungs are not tried
+      const v = recording([nearMiss(0.985), longerWindowPass, deadlock, rejection]);
+      const phases: string[] = [];
+      const result = solveWith(plan, v.fn, phases);
+      expect(phases.some((p) => p.includes('surplus'))).toBe(false);
+      expect(v.seen.every((x) => !hasHydrogenExport(x.plan))).toBe(true);
+      expect(result.layout).not.toBeNull();
+      expect(result.report).toBe(longerWindowPass);
+      expect(surplusExportsIn(result.layout!, plan)).toEqual([]);
+    }, 300_000);
   });
 
   it('a plain Processor/s plan on default facilities (a slow chain) is accepted only if plain validateLayout accepts it', async () => {

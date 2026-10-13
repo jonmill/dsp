@@ -117,6 +117,32 @@ function slowest(buildings: Building[]): Building | undefined {
   return best;
 }
 
+
+/** Stations the item slots alone need (a slot-based lower bound), or null if GameData has no station of the kind. */
+function stationsNeededFor(slots: number, kind: PlanRequest['stationKind'], data: GameDataIndex): number | null {
+  const wantStellar = kind === 'interstellar';
+  const station = data.data.buildings.find((b) => b.station !== undefined && b.station.isStellar === wantStellar);
+  if (!station?.station) return null;
+  return Math.max(1, Math.ceil(slots / station.station.maxItemKinds));
+}
+
+/**
+ * `plan` with the station slots of its surplus candidates (`plan.surplus`, calc/surplus.ts) switched `on` or off, and the stations
+ * and the power that follow from the slots. The planner's own plan is the one with them off: the layout solver builds its netlist
+ * without sinks, and switches them on only when the validator finds a deadlock (layout/solver.ts). A candidate is never imported or
+ * exported, so any export slot it has is its sink's. A plan without candidates is returned as it is.
+ */
+export function planWithSurplusSinks(plan: ProductionPlan, on: boolean, data: GameDataIndex, effects: TechEffects): ProductionPlan {
+  const candidates = plan.surplus ?? [];
+  if (candidates.length === 0) return plan;
+  const ids = new Set(candidates.map((c) => c.itemId));
+  const rest = plan.stationSlots.filter((slot) => !ids.has(slot.itemId));
+  const stationSlots = on ? [...rest, ...candidates.map((c): StationSlotDemand => ({ itemId: c.itemId, role: 'export' }))] : rest;
+  const stationsNeeded = stationsNeededFor(stationSlots.length, plan.request.stationKind, data) ?? plan.stationsNeeded;
+  const changed: ProductionPlan = { ...plan, stationSlots, stationsNeeded };
+  return { ...changed, power: estimatePower(changed, data, effects) };
+}
+
 /** One candidate recipe with the facility and proliferator it would run with. */
 interface Node {
   recipe: Recipe;
@@ -432,12 +458,13 @@ class Planner {
       else imports.push({ itemId: sprayItemId, perSecond: proliferatorPerSecond });
     }
     const flows = this.flows(stages, importRate, exportRate);
-    // what the machines can make beyond what is used needs a way out for the belts that would deadlock without one (surplus.ts)
+    // the items whose belts could be given a way out for what the machines make beyond what is used (surplus.ts): candidates only,
+    // so the slots, the stations and the power here are those of a plan without any (`planWithSurplusSinks` adds them)
     const surplus = surplusSinks(stages, flows, new Set(importRate.keys()), new Set(exportRate.keys()));
     const stationSlots = this.stationSlots(
       materials.map((m) => m.itemId),
       sprayItemId,
-      [...exports, ...surplus].map((e) => e.itemId),
+      exports.map((e) => e.itemId),
     );
 
     const withoutPower = {
@@ -567,12 +594,11 @@ class Planner {
 
   /** Slot-based lower bound: the netlist may need more stations once belt ports are counted. */
   private stationsNeeded(slots: number): number {
-    const wantStellar = this.req.stationKind === 'interstellar';
-    const station = this.data.data.buildings.find((b) => b.station !== undefined && b.station.isStellar === wantStellar);
-    if (!station?.station) {
+    const needed = stationsNeededFor(slots, this.req.stationKind, this.data);
+    if (needed === null) {
       throw new PlanFailure({ kind: 'infeasible', message: `GameData has no ${this.req.stationKind} logistics station.` });
     }
-    return Math.max(1, Math.ceil(slots / station.station.maxItemKinds));
+    return needed;
   }
 
   private validate(): void {

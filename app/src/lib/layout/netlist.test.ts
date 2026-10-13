@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { planProduction } from '../calc';
+import { planProduction, planWithSurplusSinks } from '../calc';
 import type { Flow, ItemRate, PlanRequest, ProductionPlan, Stage, StationSlotDemand } from '../calc';
 import { allTechs, computeTechEffects, GameDataIndex } from '../data';
 import type { TechEffects } from '../data';
@@ -1307,8 +1307,23 @@ describe('buildNetlist: a belt that nothing drains (Task 30b)', () => {
   /** An independent statement of the rule, from the nets alone: an item that several stages make needs its belts to end at a station. */
   const mustEndAtStation = (nl: Netlist, itemId: number): boolean => producersOf(nl, itemId).size >= 2;
 
-  it('Deuteron Fuel Rod with Mk.III proliferator: every hydrogen net with a producer ends at a station port, in an export slot', async () => {
+  /** The plan of the ladder sweeps with the sinks of its surplus candidates switched on (the planner's own plan has them off). */
+  const withSinks = async (name: string, tier: 0 | 3): Promise<ProductionPlan> => planWithSurplusSinks(await sweepPlan(name, tier), true, data, allEffects);
+
+  it('a candidate has no sink until the plan has an export slot for it: the planner\'s plan builds the netlist of a plan without any (Deuteron Fuel Rod, Mk.III)', async () => {
     const plan = await sweepPlan('Deuteron Fuel Rod', 3);
+    expect(plan.surplus?.map((s) => s.itemId)).toEqual([HYDROGEN]); // a candidate...
+    expect(plan.stationSlots.some((s) => s.itemId === HYDROGEN)).toBe(false); // ...and no slot
+    const nl = buildNetlist(plan, data, allEffects);
+    for (const net of nl.nets.filter((n) => n.itemId === HYDROGEN)) expect(net.sink.kind, `net ${net.id}`).toBe('deadEnd');
+    expect(nl.stations.some((st) => st.slots.some((slot) => slot.itemId === HYDROGEN))).toBe(false);
+    // the same as the plan without its candidates at all
+    const bare = { ...plan, surplus: undefined };
+    expect(JSON.stringify(buildNetlist(bare, data, allEffects))).toBe(JSON.stringify(nl));
+  });
+
+  it('Deuteron Fuel Rod with Mk.III proliferator, with the sinks on: every hydrogen net with a producer ends at a station port, in an export slot', async () => {
+    const plan = await withSinks('Deuteron Fuel Rod', 3);
     const nl = buildNetlist(plan, data, allEffects);
     const hydrogen = nl.nets.filter((n) => n.itemId === HYDROGEN);
     expect(hydrogen.length).toBeGreaterThan(0);
@@ -1323,9 +1338,9 @@ describe('buildNetlist: a belt that nothing drains (Task 30b)', () => {
     expect(plan.exports.map((e) => e.itemId)).not.toContain(HYDROGEN);
   });
 
-  it('no net of an item that several stages make lacks a way out: Deuteron Fuel Rod and Crystal Explosive Unit, plain and with Mk.III', async () => {
+  it('with the sinks on, no net of an item that several stages make lacks a way out: Deuteron Fuel Rod and Crystal Explosive Unit, plain and with Mk.III', async () => {
     for (const [name, tier] of [['Deuteron Fuel Rod', 0], ['Deuteron Fuel Rod', 3], ['Crystal Explosive Unit', 0], ['Crystal Explosive Unit', 3]] as const) {
-      const nl = buildNetlist(await sweepPlan(name, tier), data, allEffects);
+      const nl = buildNetlist(await withSinks(name, tier), data, allEffects);
       const items = new Set(nl.nets.filter((n) => !n.proliferator && n.source.kind === 'taps').map((n) => n.itemId));
       let checked = 0;
       for (const itemId of items) {
@@ -1360,8 +1375,8 @@ describe('buildNetlist: a belt that nothing drains (Task 30b)', () => {
     expect(ending.map((n) => n.itemId)).toEqual([PROCESSOR]);
   });
 
-  it('the station slots of the plan, the surplus ones included, are what the netlist hands out', async () => {
-    const plan = await sweepPlan('Deuteron Fuel Rod', 3);
+  it('the station slots of the plan with the sinks on, the surplus ones included, are what the netlist hands out', async () => {
+    const plan = await withSinks('Deuteron Fuel Rod', 3);
     const nl = buildNetlist(plan, data, allEffects);
     const slots = new Set(nl.stations.flatMap((s) => s.slots.map((x) => x.itemId)));
     for (const slot of plan.stationSlots) expect(slots.has(slot.itemId), `item ${slot.itemId}`).toBe(true);

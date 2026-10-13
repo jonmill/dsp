@@ -18,6 +18,12 @@
 // ends the ladder with that layout, and emits it: a stop returns the best layout found. And when all three fail, the same margins are
 // tried again with the exact router (`ladderRungs`): the simulated output of a plan with no slack swings by up to 10 %
 // between two routings of one placement, and three layouts of one kind can fail together (Conveyor Belt MK.II).
+// Surplus sinks (Task 30b). The ladder builds its netlists without them, as for any plan. A plan that has candidates
+// (`plan.surplus`, calc/surplus.ts: belts that two or more stages make) gets them only if a rung's validation reports
+// SIM_DEADLOCK: that rung is built again with the sinks (`planWithSurplusSinks`: an export slot at a station, where the belts end), as
+// are the rungs after it, their labels say "surplus export", and the improvement loop keeps to the variant that passed. A
+// ladder that fails without a deadlock never switches them on. Deuteron Fuel Rod with Mk.III deadlocks without them and
+// passes with them; Gravity Missile Set and Plane Filter with Mk.III pass without them and fail with them.
 //
 // Improvement loop. Until a stop condition holds: pick a margin from {1, 2} ({1, 2, 3} with a proliferator net, whose
 // feed wants the room of a wider placement), anneal the placement of the best layout
@@ -69,6 +75,7 @@
 //
 // Steps. `solveSteps` is `solve` as a generator that yields between candidates, so a worker can look at its messages
 // (a stop request) in between. `solve` runs it to the end.
+import { planWithSurplusSinks } from '../calc';
 import type { ProductionPlan } from '../calc';
 import type { GameDataIndex, TechEffects } from '../data';
 import { buildingDef, buildingOBBs, coaterBuildings, LayoutIndex, sorterEnds } from '../geometry';
@@ -545,7 +552,7 @@ const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.m
  * `validate` is the full validator (`validateLayout`; a parameter for tests).
  */
 export function* solveSteps(
-  plan: ProductionPlan,
+  givenPlan: ProductionPlan,
   data: GameDataIndex,
   effects: TechEffects,
   opts: SolveOptions,
@@ -560,7 +567,6 @@ export function* solveSteps(
   const sim: SimSettings = { simulate: opts.simulate, warmupTicks: opts.simWarmupTicks, measureTicks: opts.simMeasureTicks };
   const weights = DEFAULT_PLACEMENT_WEIGHTS;
 
-  const net: Netlist = buildNetlist(plan, data, effects);
   /** The constructive placements of `netlist` by margin, made when first asked for. */
   const constructiveOf = (netlist: Netlist): ((margin: number) => Placement) => {
     const cache = new Map<number, Placement>();
@@ -573,7 +579,19 @@ export function* solveSteps(
       return p;
     };
   };
-  const constructive = constructiveOf(net);
+  // The plan and netlist of the search: without surplus sinks, until a rung of the ladder deadlocks (see the ladder below).
+  let plan: ProductionPlan = planWithSurplusSinks(givenPlan, false, data, effects);
+  let net: Netlist = buildNetlist(plan, data, effects);
+  let constructive = constructiveOf(net);
+  /** The items whose belts can be given a sink, and whether they have been. */
+  const surplusCandidates = givenPlan.surplus ?? [];
+  let sinksOn = false;
+  const switchOnSinks = (): void => {
+    sinksOn = true;
+    plan = planWithSurplusSinks(givenPlan, true, data, effects);
+    net = buildNetlist(plan, data, effects);
+    constructive = constructiveOf(net);
+  };
 
   let attempts = 0;
   let validated = 0;
@@ -680,17 +698,19 @@ export function* solveSteps(
     abort: () => boolean,
     warmupCap?: number,
     nearMissRetry = true,
-  ): { best: Best } | { failures: string[] } | { stopped: true } => {
+  ): { best: Best } | { failures: string[]; deadlock: boolean } | { stopped: true } => {
     let report: ValidationReport;
     let longerWindow: boolean;
     try {
       ({ report, longerWindow } = validateGated(built.layout, plan, data, effects, { ...sim, shouldAbort: abort, warmupCapTicks: warmupCap, nearMissRetry }, validate));
     } catch (err) {
       if (err instanceof SimulationAborted) return { stopped: true };
-      if (err instanceof WarmupNotSettled) return { failures: [`SIM_OUTPUT_LOW: ${err.message} (the improvement loop waits twice as long as the best layout did)`] };
-      return { failures: [`internal error: ${err instanceof Error ? err.message : String(err)}`] };
+      if (err instanceof WarmupNotSettled) {
+        return { failures: [`SIM_OUTPUT_LOW: ${err.message} (the improvement loop waits twice as long as the best layout did)`], deadlock: false };
+      }
+      return { failures: [`internal error: ${err instanceof Error ? err.message : String(err)}`], deadlock: false };
     }
-    if (!report.pass) return { failures: violationMessages(report) };
+    if (!report.pass) return { failures: violationMessages(report), deadlock: report.violations.some((v) => v.code === 'SIM_DEADLOCK') };
     return { best: { ...placed, layout: built.layout, report, footprint: built.footprint, longerWindow } };
   };
 
@@ -735,11 +755,17 @@ export function* solveSteps(
     }
     return result('budget');
   };
-  for (const [i, rung] of rungs.entries()) {
+  /** `margin 3`, `margin 3 (exact routes)`, and `surplus export` among the brackets once the sinks are on. */
+  const tagOf = (rung: Rung): string => {
+    const notes = [...(rung.exact ? ['exact routes'] : []), ...(sinksOn ? ['surplus export'] : [])];
+    return `margin ${rung.margin}${notes.length > 0 ? ` (${notes.join(', ')})` : ''}`;
+  };
+  for (let i = 0; i < rungs.length; i++) {
+    const rung = rungs[i];
     // the exact rungs are a second chance for a ladder that found nothing: a layout over the doubled window is enough
     if (provisional && i === LADDER_MARGINS.length) break;
     const { margin } = rung;
-    const tag = rung.exact ? `margin ${margin} (exact routes)` : `margin ${margin}`;
+    const tag = tagOf(rung);
     yield;
     if (ladderStop()) return endLadder();
     const placed: MarginPlacement = { placement: constructive(margin), margin };
@@ -771,6 +797,14 @@ export function* solveSteps(
     const tagged = accepted.failures.map((f) => `${tag}: ${f}`);
     failures.push(...tagged);
     lastFailure = tagged[0];
+    // a deadlock is what the sinks are for (not when a layout is in hand already: the improvement loop would then mix two netlists)
+    if (accepted.deadlock && surplusCandidates.length > 0 && !sinksOn && !provisional) {
+      switchOnSinks();
+      const names = surplusCandidates.map((c) => data.item(c.itemId).name).join(', ');
+      progress(`ladder: ${tag} deadlocked; ${names} gets a surplus export from here on`);
+      i--; // the same rung again, with the sinks
+      continue;
+    }
     progress(`ladder: ${tag} rejected`);
   }
   takeProvisional();

@@ -7,10 +7,12 @@ export {
   isPlannableRecipe,
   machinesFor,
   planProduction,
+  planWithSurplusSinks,
   plannableProducers,
 } from './plan';
 export { coaterPowerW, estimatePower, layoutStations, withLayout } from './power';
 export type { LayoutStation } from './power';
+export { surplusExportsIn } from './surplus';
 export { canUseExtra, effectFor, proliferatorItemId, spraysPerItem } from './proliferator';
 export type { ProliferatorEffect } from './proliferator';
 export type {

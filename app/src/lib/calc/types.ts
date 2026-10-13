@@ -98,10 +98,11 @@ export interface ProductionPlan {
   /** The target comes first, then by-products nothing consumes. */
   exports: ItemRate[];
   /**
-   * Items that several stages make and the stages use, whose belts must also end at a station port (an export slot) for what the
-   * machines can make beyond what is used: producers that share a belt that nothing drains fill it, block, and stop what else they
-   * make (`calc/surplus.ts`). The rate is the spare capacity of the producers. They are not exports (the plan's flows do not change)
-   * but they have a slot in `stationSlots`. Absent: none.
+   * Candidates for a surplus sink: items that several stages make and the stages use, whose belts could also end at a station port (an
+   * export slot) for what the machines can make beyond what is used, as producers that share a belt that nothing drains fill it and
+   * block (`calc/surplus.ts`). The rate is the spare capacity of the producers. Only candidates: the plan's `stationSlots`,
+   * `stationsNeeded` and `power` are those of a plan without the sinks, and the layout solver switches them on (`planWithSurplusSinks`)
+   * only for a layout whose validation found a deadlock. They are not exports (the flows do not change). Absent: none.
    */
   surplus?: ItemRate[];
   actualTargetRate: number;
