@@ -8,6 +8,7 @@
     "build": "vite build",
     "test": "vitest run",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
+    "test:sweep-deep": "vitest run --config vitest.sweep-deep.config.ts",
     "test:all": "npm test && npm run test:e2e",
     "lint": "eslint .",
     "check": "svelte-check --tsconfig ./tsconfig.json",

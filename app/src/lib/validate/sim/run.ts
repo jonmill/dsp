@@ -53,11 +53,12 @@ export interface SimOptions {
   warmupCapTicks?: number;
   /**
    * Whether a result needs no more waiting (for `validateLayout`: that it passes). Asked once, after the measurement that
-   * follows the adaptive warm-up. When it says no and the block is still filling, the run warms up on (no verdict in between)
+   * follows the adaptive warm-up. When it says no and the block is still starting up, the run warms up on (no verdict in between)
    * until it is not or `MAX_FILL_WARMUP_TICKS` (or a `warmupCapTicks` below `MAX_WARMUP_TICKS`, if less) is reached, and then measures again as it did
-   * the first time: that measurement is the result. A block is still filling if the total of what its belts and machines
-   * hold grew in each of the last two windows of 36000 ticks by more than its jitter allows (see `stillFilling`). Omitted: the
-   * first measurement stands. Ignored when `warmupTicks` is given.
+   * the first time: that measurement is the result. A block is still starting up if the total of what its belts and machines
+   * hold grew in each of the last two windows by more than its jitter allows (`stillFilling`), or if that total, or the rate at
+   * which the target reaches the stations, has been rising across the last six windows since the normal warm-up ended, by more
+   * than its own noise (`stillRising`). Omitted: the first measurement stands. Ignored when `warmupTicks` is given.
    */
   acceptable?: (result: SimResult) => boolean;
 }
@@ -162,6 +163,22 @@ const STORED_SAMPLE_TICKS = 600;
 const FILL_WINDOW_TICKS = [36000, 144000, 576000] as const;
 /** A run with `acceptable` that waits for a start-up to end looks again after this many ticks (10 game minutes). */
 const FILL_STEP_TICKS = 36000;
+/**
+ * `stillRising` fits a straight line through this many windows in a row, of the total stored and of the target's deliveries...
+ */
+const TREND_WINDOWS = 6;
+/**
+ * ...each 36000 or 144000 ticks long (10 or 40 game minutes: the longer a window, the less the deliveries of a bursty block
+ * swing from one to the next), or a sixth of what the run has seen since its normal warm-up if that is less, but at least...
+ */
+const TREND_WINDOW_TICKS = [36000, 144000] as const;
+/** ...this many samples (3600 ticks, the window of the normal warm-up). */
+const TREND_MIN_SAMPLES = 6;
+/** A series rises if the line climbs by more than this many standard errors of its slope (what the line leaves over is the noise)... */
+const TREND_SIGMAS = 2;
+/** ...and, for the target's deliveries, by this share of the plan rate (and `TREND_MIN_ITEMS` items) from the first window to the last: less cannot change a verdict that allows 1 % */
+const TREND_MIN_RATE_SHARE = 0.02;
+const TREND_MIN_ITEMS = 2;
 /** A window counts as having filled if the total grew by more than this many times the jitter of the total (what a straight line fitted to the window leaves over)... */
 const FILL_SIGMAS = 1.5;
 /** ...and by at least this much (cargo and items): the smallest plans swing by 5, a fill of fewer than 10 in 10 game minutes is none that matters. */
@@ -293,12 +310,17 @@ export function runSimulation(
     return sum;
   };
   const stored: number[] | undefined = opts.acceptable && opts.warmupTicks === undefined ? [] : undefined;
+  /** The target items that have reached the stations, at the same samples. */
+  const delivered: number[] = [];
   /** `n` ticks, asking `shouldAbort` now and then. */
   const runTicks = (n: number): void => {
     for (let t = 0; t < n; t++) {
       if (shouldAbort && t % ABORT_CHECK_TICKS === 0 && shouldAbort()) throw new SimulationAborted();
       world.tick();
-      if (stored && world.ticks % STORED_SAMPLE_TICKS === 0) stored.push(storedNow());
+      if (stored && world.ticks % STORED_SAMPLE_TICKS === 0) {
+        stored.push(storedNow());
+        delivered.push(received(targetItem));
+      }
     }
   };
 
@@ -390,17 +412,22 @@ export function runSimulation(
   const acceptable = opts.acceptable;
   if (stored && acceptable && !acceptable(measured)) {
     // A start-up still going on has not been judged. The window just measured was warm-up as far as the next one is concerned;
-    // the run warms up on, a window at a time, while the total stored in belts and machines keeps growing and the limit allows,
+    // the run warms up on, a window at a time, while the block is still starting up (what its belts and machines hold keeps
+    // growing, or that or the target's deliveries keep rising across the last windows: `stillStartingUp`) and the limit allows,
     // and then measures as it did the first time. That measurement is the result: no window in between is looked at.
     // A cap of MAX_WARMUP_TICKS or more is no cap here either (see `SimOptions.warmupCapTicks`).
     const cap = opts.warmupCapTicks !== undefined && opts.warmupCapTicks < MAX_WARMUP_TICKS ? opts.warmupCapTicks : Infinity;
     const limit = Math.min(MAX_FILL_WARMUP_TICKS, cap);
+    // the rises are looked for after the normal warm-up: the cold start of the first minutes is a rise of its own
+    const since = Math.floor(warmupTicksUsed / STORED_SAMPLE_TICKS);
+    const planPerSample = (provisionedRate(plan) * STORED_SAMPLE_TICKS) / tps;
+    const startingUp = (): boolean => stillStartingUp(stored, delivered, planPerSample, since);
     let used = warmupTicksUsed + measureTicks;
-    if (stillFilling(stored) && used + FILL_STEP_TICKS <= limit) {
+    if (startingUp() && used + FILL_STEP_TICKS <= limit) {
       do {
         runTicks(FILL_STEP_TICKS);
         used += FILL_STEP_TICKS;
-      } while (stillFilling(stored) && used + FILL_STEP_TICKS <= limit);
+      } while (startingUp() && used + FILL_STEP_TICKS <= limit);
       warmupTicksUsed = used;
       measured = measure();
     }
@@ -429,8 +456,56 @@ export function stillFilling(stored: readonly number[]): boolean {
   return false;
 }
 
+/**
+ * Whether the block is still starting up: it is still filling (`stillFilling`), or what it holds or delivers is rising
+ * (`stillRising`). `stored` and `delivered` are sampled together every `STORED_SAMPLE_TICKS`; `planPerSample` is the plan's target
+ * rate in items per sample; the rises are looked for from sample `since` on.
+ */
+export function stillStartingUp(stored: readonly number[], delivered: readonly number[], planPerSample: number, since = 0): boolean {
+  return stillFilling(stored) || stillRising(stored, delivered, planPerSample, since);
+}
+
+/**
+ * Whether the total stored, or the target's deliveries, rise across the last `TREND_WINDOWS` windows: the straight line through
+ * the six values (the total at the end of each window; the items delivered in it) climbs by more than `TREND_SIGMAS` standard errors
+ * of its slope, and by more than a floor (`FILL_MIN` for the total; for the deliveries 2 % of the plan rate, and 2 items a window).
+ * That is the start-up the fill signal cannot see: a deep chain whose belts are full while its stages start one after another, its
+ * rate sitting on a level and then climbing for hours. (A level before a step cannot be told from a level for good: a run that
+ * stands on one is not waited for.) The windows are 36000 and 144000 ticks long (shortened to a sixth of what there is since sample `since` if that is less, so a
+ * run that rose after its normal warm-up looks at the whole rise until its baseline has slid past it) and never reach back
+ * before `since`, the end of the normal warm-up, whose cold start is a rise of its own.
+ */
+export function stillRising(stored: readonly number[], delivered: readonly number[], planPerSample: number, since = 0): boolean {
+  const last = Math.min(stored.length, delivered.length) - 1;
+  const seen = new Set<number>();
+  for (const ticks of TREND_WINDOW_TICKS) {
+    const w = Math.min(ticks / STORED_SAMPLE_TICKS, Math.floor((last - since) / TREND_WINDOWS));
+    if (w < TREND_MIN_SAMPLES || seen.has(w)) continue;
+    seen.add(w);
+    const ends = Array.from({ length: TREND_WINDOWS }, (_, k) => last - (TREND_WINDOWS - 1 - k) * w);
+    if (rises(ends.map((e) => stored[e]), FILL_MIN)) return true;
+    if (rises(ends.map((e) => delivered[e] - delivered[e - w]), Math.max(TREND_MIN_ITEMS, TREND_MIN_RATE_SHARE * planPerSample * w))) return true;
+  }
+  return false;
+}
+
+/** Whether the straight line through `values` climbs from the first to the last by more than `minRise` and by more than `TREND_SIGMAS` standard errors of its slope. */
+function rises(values: readonly number[], minRise: number): boolean {
+  const { slope, slopeError } = lineFit(values, 0, values.length - 1);
+  const rise = slope * (values.length - 1);
+  return rise > Math.max(minRise, TREND_SIGMAS * slopeError * (values.length - 1));
+}
+
 /** The standard deviation of `values[from..to]` about the least-squares straight line through them. */
 function lineResidual(values: readonly number[], from: number, to: number): number {
+  return lineFit(values, from, to).residual;
+}
+
+/**
+ * The least-squares straight line through `values[from..to]` (at x = 0, 1, ...): its `slope` per step, the `residual` standard
+ * deviation of the points about it, and the standard error of the slope, `residual / sqrt(sum of (x - mean)^2)`.
+ */
+function lineFit(values: readonly number[], from: number, to: number): { slope: number; residual: number; slopeError: number } {
   const n = to - from + 1;
   let mean = 0;
   for (let i = from; i <= to; i++) mean += values[i];
@@ -445,7 +520,8 @@ function lineResidual(values: readonly number[], from: number, to: number): numb
   const slope = sxy / sxx;
   let sumSquares = 0;
   for (let i = 0; i < n; i++) sumSquares += (values[from + i] - mean - slope * (i - centre)) ** 2;
-  return Math.sqrt(sumSquares / Math.max(1, n - 2));
+  const residual = Math.sqrt(sumSquares / Math.max(1, n - 2));
+  return { slope, residual, slopeError: residual / Math.sqrt(sxx) };
 }
 
 /** One tick's power demand, in J/tick, and the part of it that is idle draw. Reports to the world as it is added. */

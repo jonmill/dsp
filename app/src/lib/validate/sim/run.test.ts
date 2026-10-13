@@ -3,7 +3,7 @@ import { GameDataIndex } from '../../data';
 import type { Layout } from '../../geometry';
 import { checkSimulation } from '../report';
 import { codesOf, fixtureData, fixtureEffects, ITEM, LayoutKit, line, only, onNode, onSlot, planOf, refineryLayout, smelterRowLayout, stationConfig, stationPairLayout } from '../testkit';
-import { ABORT_CHECK_TICKS, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, runSimulation, SimulationAborted, stillFilling, WarmupNotSettled } from './run';
+import { ABORT_CHECK_TICKS, MAX_FILL_WARMUP_TICKS, MAX_WARMUP_TICKS, runSimulation, SimulationAborted, stillFilling, stillRising, stillStartingUp, WarmupNotSettled } from './run';
 import type { SimOptions, SimResult } from './run';
 
 const TPS = 60;
@@ -273,6 +273,60 @@ describe('runSimulation: a start-up that is still going on', () => {
     // too little history to compare two windows
     expect(stillFilling(ramp(5, 10))).toBe(false);
     expect(stillFilling([])).toBe(false);
+  });
+
+  /** One sample per 600 ticks (10 s): the stored total, a level of 1000 plus `per` a sample, with swings of `noise`. */
+  const storedSeries = (n: number, per: number, noise = 0): number[] => Array.from({ length: n }, (_, i) => 1000 + per * i + noise * Math.sin(i * 1.7));
+  /** The same samples of the cumulative count of target items delivered, at `rateAt(i)` items per second. */
+  const deliveredSeries = (n: number, rateAt: (i: number) => number): number[] => {
+    let sum = 0;
+    return Array.from({ length: n }, (_, i) => (sum += rateAt(i) * 10));
+  };
+  const swing = (i: number): number => 0.15 * Math.sin(i * 1.3);
+  /** The plan rate in items per sample: 1 item/s, 10 items in 10 s. */
+  const PLAN = 10;
+
+  it('stillRising: the target rate or the stored total keeps rising across the last six windows beyond its own noise, and not a level, a swing, or a drift under the floor', () => {
+    const flat = storedSeries(720, 0, 3);
+    // the target rate: a level with swings, and a climb under the same swings
+    expect(stillRising(flat, deliveredSeries(720, (i) => 1 + swing(i)), PLAN)).toBe(false);
+    expect(stillRising(flat, deliveredSeries(720, (i) => 0.3 + (0.7 * i) / 720 + swing(i)), PLAN)).toBe(true);
+    // a swing of period two windows is no trend either
+    expect(stillRising(flat, deliveredSeries(720, (i) => 1 + 0.3 * Math.sign(Math.sin((i * Math.PI) / 60))), PLAN)).toBe(false);
+    // a climb of 1 % of the plan rate over the baseline is under the floor (2 %), and so is a rate of nothing
+    expect(stillRising(flat, deliveredSeries(720, (i) => 1 + (0.01 * i) / 720), PLAN)).toBe(false);
+    expect(stillRising(flat, deliveredSeries(720, () => 0), PLAN)).toBe(false);
+    // the stored total: a creep of 0.12 a sample (7 a window) under swings of 3 is a rise, a level under the same swings is not, and neither is a creep of 0.01 (6 over the baseline, under the floor of 10)
+    const level = deliveredSeries(720, () => 1);
+    expect(stillRising(storedSeries(720, 0.12, 3), level, PLAN)).toBe(true);
+    expect(stillRising(flat, level, PLAN)).toBe(false);
+    expect(stillRising(storedSeries(720, 0.01, 1), level, PLAN)).toBe(false);
+    // too little history for six windows of 6 samples
+    expect(stillRising(storedSeries(30, 5), deliveredSeries(30, (i) => i / 30), PLAN)).toBe(false);
+    expect(stillRising([], [], PLAN)).toBe(false);
+  });
+
+  it('stillRising: a climb that is over still counts until the baseline has slid past it, and `since` keeps the baseline off the cold start', () => {
+    // the rate climbs from 0.4 to 1/s over 300 samples (50 game minutes) and then holds
+    const climbed = (n: number): number[] => deliveredSeries(n, (i) => (i < 300 ? 0.4 + (0.6 * i) / 300 : 1) + swing(i));
+    const flat = (n: number): number[] => storedSeries(n, 0, 3);
+    expect(stillRising(flat(800), climbed(800), PLAN)).toBe(true); // the six windows of 133 samples still hold the climb
+    expect(stillRising(flat(2000), climbed(2000), PLAN)).toBe(false); // the six windows of 240 samples (144000 ticks) lie past it
+    expect(stillRising(flat(800), climbed(800), PLAN, 300)).toBe(false); // the baseline starts where the climb ends
+    // the same for the stored total, which the fill signal no longer sees once the fill is over
+    const filled = (n: number): number[] => Array.from({ length: n }, (_, i) => 1000 + 3 * Math.min(i, 400) + 3 * Math.sin(i * 1.7));
+    const level = deliveredSeries(800, () => 1);
+    expect(stillFilling(filled(800))).toBe(false);
+    expect(stillRising(filled(800), level, PLAN)).toBe(true);
+    expect(stillRising(filled(2000), deliveredSeries(2000, () => 1), PLAN)).toBe(false);
+    expect(stillRising(filled(800), level, PLAN, 400)).toBe(false);
+  });
+
+  it('stillStartingUp: either the fill (stillFilling) or a rise across the last windows', () => {
+    const none = deliveredSeries(130, () => 1);
+    expect(stillStartingUp(storedSeries(130, 1), none, PLAN)).toBe(true); // +60 a window: the fill alone
+    expect(stillStartingUp(storedSeries(720, 0.12, 3), deliveredSeries(720, () => 1), PLAN)).toBe(true); // the rise alone
+    expect(stillStartingUp(storedSeries(720, 0, 3), deliveredSeries(720, (i) => 1 + swing(i)), PLAN)).toBe(false); // neither
   });
 
   it('a cap below MAX_WARMUP_TICKS limits the extension of a block that is still filling; MAX_WARMUP_TICKS or more is no cap', () => {
