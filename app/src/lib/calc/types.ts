@@ -97,6 +97,13 @@ export interface ProductionPlan {
   imports: ItemRate[];
   /** The target comes first, then by-products nothing consumes. */
   exports: ItemRate[];
+  /**
+   * Items that several stages make and the stages use, whose belts must also end at a station port (an export slot) for what the
+   * machines can make beyond what is used: producers that share a belt that nothing drains fill it, block, and stop what else they
+   * make (`calc/surplus.ts`). The rate is the spare capacity of the producers. They are not exports (the plan's flows do not change)
+   * but they have a slot in `stationSlots`. Absent: none.
+   */
+  surplus?: ItemRate[];
   actualTargetRate: number;
   /** One slot per item id; an item with several roles keeps export over proliferator over import. */
   stationSlots: StationSlotDemand[];

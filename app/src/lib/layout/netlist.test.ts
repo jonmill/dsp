@@ -1284,3 +1284,87 @@ describe('buildNetlist: what a station takes in of an imported and made item, it
     expect(multi).toBeGreaterThan(20);
   });
 });
+
+describe('buildNetlist: a belt that nothing drains (Task 30b)', () => {
+  const RAW_ITEMS = [1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1011, 1012, 1013, 1014, 1015, 1016, 1030, 1031];
+  /** The plan of the ladder sweeps: `name` at 1/s, everything unlocked, the raw items supplied, the default headroom. */
+  async function sweepPlan(name: string, tier: 0 | 3): Promise<ProductionPlan> {
+    const item = data.data.items.find((i) => i.name === name)!;
+    const recipe = data.recipesProducing(item.id).filter((r) => allEffects.unlockedRecipes.has(r.id))[0];
+    const facility = data.data.buildings.find((b) => b.production?.recipeType === recipe.type && allEffects.availableBuildings.has(b.itemId))!;
+    return planOf(
+      request({
+        targetItemId: item.id,
+        finalFacilityItemId: facility.itemId,
+        suppliedItemIds: new Set(RAW_ITEMS),
+        proliferator: { tier, mode: 'extra' },
+      }),
+    );
+  }
+  const producersOf = (nl: Netlist, itemId: number): Set<number> =>
+    new Set(nl.nets.filter((n) => n.itemId === itemId).flatMap((n) => n.taps.filter((t) => t.dir === 'out').map((t) => nl.machines[t.machineId - 1].stageIndex)));
+
+  /** An independent statement of the rule, from the nets alone: an item that several stages make needs its belts to end at a station. */
+  const mustEndAtStation = (nl: Netlist, itemId: number): boolean => producersOf(nl, itemId).size >= 2;
+
+  it('Deuteron Fuel Rod with Mk.III proliferator: every hydrogen net with a producer ends at a station port, in an export slot', async () => {
+    const plan = await sweepPlan('Deuteron Fuel Rod', 3);
+    const nl = buildNetlist(plan, data, allEffects);
+    const hydrogen = nl.nets.filter((n) => n.itemId === HYDROGEN);
+    expect(hydrogen.length).toBeGreaterThan(0);
+    expect(producersOf(nl, HYDROGEN).size).toBeGreaterThanOrEqual(2); // Plasma Refining and Graphene (advanced) share the belt
+    for (const net of hydrogen) {
+      expect(net.taps.some((t) => t.dir === 'out')).toBe(true);
+      expect(net.sink.kind, `net ${net.id}`).toBe('station');
+      const sink = net.sink as { kind: 'station'; stationIdx: number };
+      const slot = nl.stations[sink.stationIdx].slots.find((s) => s.itemId === HYDROGEN);
+      expect(slot?.localLogic).toBe(1); // an export slot: drained from outside, not drawn from
+    }
+    expect(plan.exports.map((e) => e.itemId)).not.toContain(HYDROGEN);
+  });
+
+  it('no net of an item that several stages make lacks a way out: Deuteron Fuel Rod and Crystal Explosive Unit, plain and with Mk.III', async () => {
+    for (const [name, tier] of [['Deuteron Fuel Rod', 0], ['Deuteron Fuel Rod', 3], ['Crystal Explosive Unit', 0], ['Crystal Explosive Unit', 3]] as const) {
+      const nl = buildNetlist(await sweepPlan(name, tier), data, allEffects);
+      const items = new Set(nl.nets.filter((n) => !n.proliferator && n.source.kind === 'taps').map((n) => n.itemId));
+      let checked = 0;
+      for (const itemId of items) {
+        const needs = mustEndAtStation(nl, itemId);
+        for (const net of nl.nets.filter((n) => n.itemId === itemId && !n.proliferator && n.source.kind === 'taps' && n.taps.some((t) => t.dir === 'out'))) {
+          if (needs) {
+            expect(net.sink.kind, `${name} ${tier}: net ${net.id} of item ${itemId}`).toBe('station');
+            checked++;
+          }
+        }
+      }
+      expect(checked, `${name} ${tier}`).toBeGreaterThan(0);
+    }
+  });
+
+  it('leaves the pooled rule alone: an item that is imported and made keeps its station-sourced consumers, and no station takes in more than it gives out', async () => {
+    const nl = buildNetlist(await planOf(quantumRequest()), data, allEffects);
+    expect(pooledImbalances(nl)).toEqual([]);
+    const plan = await planOf(quantumRequest());
+    expect(plan.surplus ?? []).not.toContainEqual(expect.objectContaining({ itemId: HYDROGEN })); // imported and made: the pool has it
+    // no net has both producers and consumers of the imported item
+    for (const net of nl.nets.filter((n) => n.itemId === HYDROGEN)) {
+      expect(net.taps.some((t) => t.dir === 'out') && net.taps.some((t) => t.dir === 'in')).toBe(false);
+    }
+  });
+
+  it('adds nothing to a plan that has no such belt: the Processor chain has the nets it had, and none ends at a station but its export', async () => {
+    const plan = await planOf(processorRequest());
+    expect(plan.surplus).toBeUndefined();
+    const nl = buildNetlist(plan, data, allEffects);
+    const ending = nl.nets.filter((n) => n.sink.kind === 'station');
+    expect(ending.map((n) => n.itemId)).toEqual([PROCESSOR]);
+  });
+
+  it('the station slots of the plan, the surplus ones included, are what the netlist hands out', async () => {
+    const plan = await sweepPlan('Deuteron Fuel Rod', 3);
+    const nl = buildNetlist(plan, data, allEffects);
+    const slots = new Set(nl.stations.flatMap((s) => s.slots.map((x) => x.itemId)));
+    for (const slot of plan.stationSlots) expect(slots.has(slot.itemId), `item ${slot.itemId}`).toBe(true);
+    expect(nl.warnings.filter((w) => w.includes('stations, the plan predicted'))).toEqual([]);
+  });
+});

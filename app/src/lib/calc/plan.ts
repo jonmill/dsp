@@ -11,6 +11,7 @@ import { solveLP } from './lp';
 import type { LPConstraint, LPVariable } from './lp';
 import { estimatePower } from './power';
 import { canUseExtra, effectFor, proliferatorItemId, spraysPerItem } from './proliferator';
+import { surplusSinks } from './surplus';
 import type { ProliferatorEffect } from './proliferator';
 import type {
   Flow,
@@ -430,18 +431,22 @@ class Planner {
       if (existing) existing.perSecond += proliferatorPerSecond;
       else imports.push({ itemId: sprayItemId, perSecond: proliferatorPerSecond });
     }
+    const flows = this.flows(stages, importRate, exportRate);
+    // what the machines can make beyond what is used needs a way out for the belts that would deadlock without one (surplus.ts)
+    const surplus = surplusSinks(stages, flows, new Set(importRate.keys()), new Set(exportRate.keys()));
     const stationSlots = this.stationSlots(
       materials.map((m) => m.itemId),
       sprayItemId,
-      exports.map((e) => e.itemId),
+      [...exports, ...surplus].map((e) => e.itemId),
     );
 
     const withoutPower = {
       request: req,
       stages,
-      flows: this.flows(stages, importRate, exportRate),
+      flows,
       imports,
       exports,
+      ...(surplus.length > 0 ? { surplus } : {}),
       actualTargetRate: Math.max(required, this.targetCapacity(stageNodes, stages)),
       stationSlots,
       stationsNeeded: this.stationsNeeded(stationSlots.length),
